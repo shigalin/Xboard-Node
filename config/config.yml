@@ -1,5 +1,6 @@
 # Xboard Node Configuration
 # Copy this file to config.yml and modify as needed
+# Top-level settings are inherited by all instances. Instance overrides take precedence.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MINIMAL CONFIGURATION (Recommended)
@@ -23,6 +24,8 @@ kernel:
   config_dir: "/etc/xboard-node"
   # Kernel log level: debug/info/warn/error (default: warn, can be overridden by panel)
   log_level: "warn"
+  # Device-limit cooldown in seconds: 0 = default (60s), -1 = disabled (kick only)
+  # device_limit_cooldown: 60
 
 # TLS certificate settings (optional, can be managed by panel)
 # cert_mode: "http" | "dns" | "self" | "file" | "none"
@@ -61,22 +64,30 @@ log:
   output: "stdout"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ADVANCED / MULTI-NODE MODE
-# Run multiple nodes with one configuration file.
-# Each node gets its own isolated working directory.
+# ADVANCED / MULTI-INSTANCE MODE
+# Bind multiple panel nodes or machines in one process.
+# Each instance may override the top-level kernel, certificate and log settings.
 # ══════════════════════════════════════════════════════════════════════════════
-# When `nodes:` is present, the top-level `panel.node_id` is ignored.
+# When `instances:` is present, the top-level panel binding is not used as a separate instance.
 #
-# nodes:
-#   - node_id: 1
+# instances:
+#   - panel:
+#       url: "https://panel.example.com"
+#       token: "api-key-1"
+#       node_id: 1
 #
-#   - node_id: 2
-#     # Optional overrides per node
-#     kernel_type: "xray"
-#     cert:
-#       auto_tls: true
-#       domain: "node2.example.com"
+#   - panel:
+#       url: "https://panel.example.com"
+#     machine:
+#       machine_id: 2
+#       token: "machine-token-2"
+#     log:
+#       level: "debug"
 #
-#   - node_id: 3
+#   - panel:
+#       url: "https://another-panel.example.com"
+#       token: "api-key-3"
+#       node_id: 3
 #     kernel:
+#       type: "xray"
 #       config_dir: "/etc/xboard-node/custom-node-3"
