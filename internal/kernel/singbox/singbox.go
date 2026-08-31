@@ -24,6 +24,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
+const defaultDeviceLimitCooldown = 60 * time.Second
+
 // drainTimeout is how long stop() waits for in-flight connections to finish
 // naturally after closing all listen sockets, before hard-killing them.
 const drainTimeout = 5 * time.Second
@@ -647,16 +649,12 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 }
 
 // deviceLimitCooldown resolves the configured device-limit punishment window.
-// 0 means "use the default", a negative value disables the window.
+// 0 means "use the default". Negative values are rejected during config load.
 func deviceLimitCooldown(cfg config.KernelConfig) time.Duration {
-	switch {
-	case cfg.DeviceLimitCooldown < 0:
-		return 0
-	case cfg.DeviceLimitCooldown == 0:
-		return 60 * time.Second
-	default:
-		return time.Duration(cfg.DeviceLimitCooldown) * time.Second
+	if cfg.DeviceLimitCooldown == 0 {
+		return defaultDeviceLimitCooldown
 	}
+	return time.Duration(cfg.DeviceLimitCooldown) * time.Second
 }
 
 // buildUserMap creates a UUID→userID mapping used by ConnTracker to attribute

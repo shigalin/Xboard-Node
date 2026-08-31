@@ -159,7 +159,8 @@ type ConnTracker struct {
 	deviceLimitFunc atomic.Pointer[func(uuid string) (int, bool)]
 
 	// deviceLimitCooldown is the punishment window (nanoseconds) applied after
-	// a device-limit breach. 0 disables it.
+	// a device-limit breach. Always positive: it defaults to
+	// defaultDeviceLimitCooldown and cannot be disabled.
 	deviceLimitCooldown atomic.Int64
 
 	// Multi-node device state from panel
@@ -170,12 +171,14 @@ type ConnTracker struct {
 
 // NewConnTracker creates a tracker.
 func NewConnTracker(_ int) *ConnTracker {
-	return &ConnTracker{
+	t := &ConnTracker{
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
 		connMap:       make(map[string]connRef),
 		globalDevices: make(map[int]map[string]bool),
 	}
+	t.deviceLimitCooldown.Store(int64(defaultDeviceLimitCooldown))
+	return t
 }
 
 // SetSpeedLimitFunc configures the per-user speed limit lookup.
@@ -189,10 +192,11 @@ func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 }
 
 // SetDeviceLimitCooldown sets the punishment window applied after a device
-// limit breach. A non-positive duration disables the window (kick only).
+// limit breach. Non-positive durations are ignored so the window stays
+// positive; mapping "0 → default" is owned by deviceLimitCooldown().
 func (t *ConnTracker) SetDeviceLimitCooldown(d time.Duration) {
-	if d < 0 {
-		d = 0
+	if d <= 0 {
+		return
 	}
 	t.deviceLimitCooldown.Store(int64(d))
 }
@@ -379,10 +383,10 @@ func (t *ConnTracker) admitConn(uuid, sourceIP, network string) (uid int, us *us
 // success, records the connection (IP refcount + conn count) in the SAME
 // critical section — so two IPs racing for the last slot can never both win.
 //
-// Policy: strict. An IP already holding a slot (locally, or globally on
-// another node while the panel state is fresh) is always allowed. A new IP is
-// admitted only while the merged IP set is strictly below the limit; the set
-// can therefore never exceed the limit.
+// Policy: strict. If the merged local and fresh global IP set already exceeds
+// the limit, every connection is rejected so the caller can kick the user and
+// let the panel state drain. Otherwise, an IP already holding a slot is allowed
+// and a new IP is admitted only while the merged set is below the limit.
 func (t *ConnTracker) admitDevice(us *userStats, userID int, sourceIP string, limit int) bool {
 	// Snapshot global (multi-node) state first to keep lock scopes disjoint.
 	t.globalMu.RLock()
@@ -394,23 +398,32 @@ func (t *ConnTracker) admitDevice(us *userStats, userID int, sourceIP string, li
 	us.mu.Lock()
 	defer us.mu.Unlock()
 
-	admitted := false
-	if _, known := us.ips[sourceIP]; known {
-		// Already holds a local slot.
-		admitted = true
-	} else if globalFresh && globalIPs[sourceIP] {
-		// Already holds a slot in the global set (established on another node).
-		admitted = true
-	} else {
+	// An IP already holding a slot (locally, or globally on another node)
+	// needs no extra one; a new IP claims one more.
+	need := 1
+	if _, known := us.ips[sourceIP]; known || (globalFresh && globalIPs[sourceIP]) {
+		need = 0
+	}
+
+	// admitted ⇔ merged distinct-IP count + need <= limit. Bound checks come
+	// first: iterating globalIPs under us.mu costs O(panel-reported IPs) per
+	// admission, so only merge when the set sizes alone cannot decide.
+	var admitted bool
+	switch {
+	case !globalFresh:
+		admitted = len(us.ips)+need <= limit
+	case len(us.ips) > limit || len(globalIPs) > limit:
+		admitted = false // either set alone already exceeds the limit
+	case len(us.ips)+len(globalIPs)+need <= limit:
+		admitted = true // even fully disjoint sets stay within the limit
+	default:
 		total := len(us.ips)
-		if globalFresh {
-			for ip := range globalIPs {
-				if _, dup := us.ips[ip]; !dup {
-					total++
-				}
+		for ip := range globalIPs {
+			if _, dup := us.ips[ip]; !dup {
+				total++
 			}
 		}
-		admitted = total < limit
+		admitted = total+need <= limit
 	}
 
 	if admitted {
@@ -436,11 +449,11 @@ func (t *ConnTracker) registerConn(us *userStats, userID int, epoch uint64, conn
 	return true
 }
 
-// kickUser applies the device-limit punishment: arms the cooldown window (if
-// configured) and force-closes every tracked connection of the user.
+// kickUser applies the device-limit punishment: arms the cooldown window and
+// force-closes every tracked connection of the user.
 func (t *ConnTracker) kickUser(us *userStats, userID int) {
-	cooldown := time.Duration(t.deviceLimitCooldown.Load())
-	if us != nil && cooldown > 0 {
+	if us != nil {
+		cooldown := time.Duration(t.deviceLimitCooldown.Load())
 		us.banUntil.Store(time.Now().Add(cooldown).UnixNano())
 	}
 	t.closeUserConns(us, userID)
@@ -483,7 +496,7 @@ func (t *ConnTracker) closeUserConns(us *userStats, userID int) {
 // sweepUserConns snapshots connMap and closes every connection of userID that
 // was admitted before cutoff. A connection whose epoch is >= cutoff was
 // admitted after the kick being served and must survive (e.g. an immediate
-// reconnect after CloseByUUID or a cooldown-disabled kick).
+// reconnect after CloseByUUID, which does not arm the cooldown window).
 func (t *ConnTracker) sweepUserConns(userID int, cutoff uint64) {
 	t.usersMu.RLock()
 	victims := make([]io.Closer, 0, len(t.connMap))

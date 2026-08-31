@@ -134,7 +134,7 @@ type KernelConfig struct {
 	// connections are force-closed and every new connection is refused until
 	// the window expires.
 	//   0  → use the default (60)
-	//   -1 → disabled (kick only, immediate reconnect allowed)
+	// Maximum 86400 (one day); larger values are rejected at load.
 	// sing-box kernel only; xray ignores it.
 	DeviceLimitCooldown int `yaml:"device_limit_cooldown"`
 
@@ -744,6 +744,9 @@ func (c *Config) validate() error {
 	}
 	if c.Node.PullInterval < 0 {
 		return fmt.Errorf("node.pull_interval must not be negative")
+	}
+	if c.Kernel.DeviceLimitCooldown < 0 || c.Kernel.DeviceLimitCooldown > 86400 {
+		return fmt.Errorf("kernel.device_limit_cooldown must be between 0 and 86400 seconds")
 	}
 	return nil
 }
