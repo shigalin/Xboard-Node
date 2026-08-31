@@ -142,6 +142,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	// Fresh tracker on full restart.
 	s.connTracker = NewConnTracker(0)
 	s.connTracker.SetUserMap(buildUserMap(users))
+	s.connTracker.SetDeviceLimitCooldown(deviceLimitCooldown(s.cfg))
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
 	}
@@ -643,6 +644,19 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 	}
 	ct.CloseByUUID(uuid)
 	return nil
+}
+
+// deviceLimitCooldown resolves the configured device-limit punishment window.
+// 0 means "use the default", a negative value disables the window.
+func deviceLimitCooldown(cfg config.KernelConfig) time.Duration {
+	switch {
+	case cfg.DeviceLimitCooldown < 0:
+		return 0
+	case cfg.DeviceLimitCooldown == 0:
+		return 60 * time.Second
+	default:
+		return time.Duration(cfg.DeviceLimitCooldown) * time.Second
+	}
 }
 
 // buildUserMap creates a UUID→userID mapping used by ConnTracker to attribute

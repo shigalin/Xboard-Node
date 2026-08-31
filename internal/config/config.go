@@ -19,14 +19,14 @@ import (
 )
 
 type Config struct {
-	InstanceID string `yaml:"-"`
-	Panel   PanelConfig   `yaml:"panel"`
-	Node    NodeConfig    `yaml:"node"`
-	Kernel  KernelConfig  `yaml:"kernel"`
-	Cert    CertConfig    `yaml:"cert"`
-	Log     LogConfig     `yaml:"log"`
-	Runtime RuntimeConfig `yaml:"runtime"`
-	WS      WSConfig      `yaml:"ws"`
+	InstanceID string        `yaml:"-"`
+	Panel      PanelConfig   `yaml:"panel"`
+	Node       NodeConfig    `yaml:"node"`
+	Kernel     KernelConfig  `yaml:"kernel"`
+	Cert       CertConfig    `yaml:"cert"`
+	Log        LogConfig     `yaml:"log"`
+	Runtime    RuntimeConfig `yaml:"runtime"`
+	WS         WSConfig      `yaml:"ws"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
@@ -128,6 +128,15 @@ type KernelConfig struct {
 	// Defaults to config_dir when empty. You only need to set this if your
 	// geo database files live somewhere other than config_dir.
 	GeoDataDir string `yaml:"geo_data_dir"`
+
+	// DeviceLimitCooldown is the punishment window, in seconds, applied after a
+	// user breaches the device (distinct source IP) limit: all of that user's
+	// connections are force-closed and every new connection is refused until
+	// the window expires.
+	//   0  → use the default (60)
+	//   -1 → disabled (kick only, immediate reconnect allowed)
+	// sing-box kernel only; xray ignores it.
+	DeviceLimitCooldown int `yaml:"device_limit_cooldown"`
 
 	// CustomOutbound adds outbound entries to the generated kernel config.
 	// Each item is a raw kernel-native outbound object (sing-box or xray format).
@@ -497,6 +506,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	// Kernel (NOT config_dir — each instance needs unique dir)
 	if c.Kernel.Type == "" {
 		c.Kernel.Type = parent.Kernel.Type
+	}
+	if c.Kernel.DeviceLimitCooldown == 0 {
+		c.Kernel.DeviceLimitCooldown = parent.Kernel.DeviceLimitCooldown
 	}
 	if c.Kernel.LogLevel == "" {
 		c.Kernel.LogLevel = parent.Kernel.LogLevel

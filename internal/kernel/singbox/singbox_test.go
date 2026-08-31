@@ -142,23 +142,25 @@ func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T)
 	}
 }
 
-func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
+func TestConnTrackerAdmitDeviceMergesFreshGlobalDevices(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	us := tracker.users[1]
 	us.addConn("1.1.1.1")
 	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
 
-	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 2) {
-		t.Fatal("expected lexicographically earlier candidate to remain allowed")
+	// Local {1.1.1.1} + global {9.9.9.9} already fills limit=2, so any new IP
+	// is rejected no matter how it sorts.
+	if tracker.admitDevice(us, 1, "2.2.2.2", 2) {
+		t.Fatal("expected third device to be rejected once local+global fills the limit")
 	}
-	if !tracker.checkDeviceGate(us, 1, "99.99.99.99", 2) {
-		t.Fatal("expected merged local+global device state to reject lexicographically later third device")
+	if tracker.admitDevice(us, 1, "99.99.99.99", 2) {
+		t.Fatal("expected merged local+global device state to reject third device")
 	}
-	if tracker.checkDeviceGate(us, 1, "1.1.1.1", 2) {
+	if !tracker.admitDevice(us, 1, "1.1.1.1", 2) {
 		t.Fatal("existing local IP should still be allowed")
 	}
-	if tracker.checkDeviceGate(us, 1, "9.9.9.9", 2) {
+	if !tracker.admitDevice(us, 1, "9.9.9.9", 2) {
 		t.Fatal("existing global IP should still be allowed")
 	}
 }
