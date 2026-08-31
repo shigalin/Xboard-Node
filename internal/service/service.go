@@ -576,7 +576,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if s.nodeLog == nil {
 			s.nodeLog = nlog.ForNode(event.Config.Protocol, event.Config.ServerPort)
 		}
-		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(event.Users)))
+		s.nodeLog.Info("config update received")
 		s.metricsMu.Lock()
 		s.lastConfig = event.Config
 		s.metricsMu.Unlock()
@@ -805,7 +805,14 @@ func (s *Service) ensureRunning() bool {
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if !s.ensureRunning() {
+	if !s.kernel.IsRunning() {
+		prevUsers, prevHash := s.prepareUserState(users)
+		if len(users) == 0 || s.lastConfig == nil {
+			return
+		}
+		if !s.startKernel(s.lastConfig, users) {
+			s.restoreUserState(prevUsers, prevHash)
+		}
 		return
 	}
 
