@@ -6,6 +6,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
@@ -49,19 +50,36 @@ type Tracker struct {
 	// Readers load this pointer without any lock.
 	live atomic.Pointer[snapshot]
 
-	// aliveIPsBuf is a reusable buffer for FlushAliveIPs output.
-	// Avoids allocating a new map+slice every 60s.
-	aliveIPsBuf map[int][]string
-
 	// lastAliveIPsHash detects changes to avoid duplicate reports.
 	lastAliveIPsHash string
+
+	// lastAliveFlush is when FlushAliveIPs last returned a snapshot. Unchanged
+	// snapshots are still resent once aliveResendInterval elapses so the
+	// panel-side device TTL keeps being refreshed.
+	lastAliveFlush time.Time
+
+	// lastAliveUsers is the set of users included in the last flushed
+	// snapshot. A user present here but absent from the current snapshot gets
+	// an explicit empty entry (tombstone): the REST panel handler only
+	// processes users it receives and never deletes absent ones, so without
+	// the tombstone a fully-offline user would linger until the panel TTL.
+	lastAliveUsers map[int]struct{}
+
+	// forceAliveReport makes the next FlushAliveIPs return the snapshot even
+	// when unchanged. Set after a failed/possibly-lost report so it is retried.
+	forceAliveReport bool
 }
+
+// aliveResendInterval bounds how long an unchanged snapshot may go unreported.
+// The panel keeps device entries under a 300s TTL that is refreshed only by
+// incoming reports, so the full snapshot must be resent well within that
+// window or long-lived devices expire out of the global device state.
+const aliveResendInterval = 120 * time.Second
 
 func New() *Tracker {
 	t := &Tracker{
 		lastSeen:       make(map[int][2]int64),
 		pendingTraffic: make(map[int][2]int64),
-		aliveIPsBuf:    make(map[int][]string),
 	}
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
@@ -159,43 +177,96 @@ func (t *Tracker) HasTraffic() bool {
 	return len(t.pendingTraffic) > 0
 }
 
-// FlushAliveIPs returns per-user alive IPs.
-// Reuses internal buffer. Returns nil if unchanged.
+// FlushAliveIPs returns per-user alive IPs as a fresh snapshot, or nil if
+// unchanged since the last flush. An unchanged snapshot is still returned
+// once aliveResendInterval elapses (panel TTL refresh) or after a forced
+// resend (failed report). Users that vanished since the last flush are
+// included as empty tombstone entries. This is the REST report path; the WS
+// path uses SnapshotAliveIPs, which has no deduplication state.
 func (t *Tracker) FlushAliveIPs() map[int][]string {
-	s := t.live.Load()
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// Load under mu: Process publishes the snapshot while holding mu, so this
+	// cannot observe a stale snapshot after a concurrent Process completes.
+	s := t.live.Load()
 
 	// Calculate hash of current aliveIPs
 	currentHash := calcAliveIPsHash(s.aliveIPs)
 
 	// If no changes, return nil to avoid duplicate reporting
-	if currentHash == t.lastAliveIPsHash {
+	if !t.forceAliveReport && currentHash == t.lastAliveIPsHash &&
+		time.Since(t.lastAliveFlush) < aliveResendInterval {
 		return nil
 	}
 
+	t.forceAliveReport = false
 	t.lastAliveIPsHash = currentHash
+	t.lastAliveFlush = time.Now()
 
-	// Clear old buffer entries.
-	for k := range t.aliveIPsBuf {
-		delete(t.aliveIPsBuf, k)
-	}
-
-	// Fill buffer from snapshot.
+	// Build a fresh snapshot: callers hand it to async senders, so returning
+	// a shared buffer would race with the next flush.
+	out := make(map[int][]string, len(s.aliveIPs))
 	for uid, ips := range s.aliveIPs {
-		buf := t.aliveIPsBuf[uid]
-		if buf == nil {
-			buf = make([]string, 0, len(ips))
-		}
-		buf = buf[:0]
+		list := make([]string, 0, len(ips))
 		for ip := range ips {
-			buf = append(buf, ip)
+			list = append(list, ip)
 		}
-		t.aliveIPsBuf[uid] = buf
+		out[uid] = list
 	}
 
-	return t.aliveIPsBuf
+	// Tombstones for users that dropped out of the snapshot entirely.
+	for uid := range t.lastAliveUsers {
+		if _, ok := out[uid]; !ok {
+			out[uid] = []string{}
+		}
+	}
+
+	// Record the real (non-tombstone) users of this flush.
+	t.lastAliveUsers = make(map[int]struct{}, len(s.aliveIPs))
+	for uid := range s.aliveIPs {
+		t.lastAliveUsers[uid] = struct{}{}
+	}
+
+	return out
+}
+
+// SnapshotAliveIPs returns the full current alive-IPs snapshot,
+// unconditionally and without touching the flush cursor. The WS report path
+// sends this every tick: the panel's WS handler diffs against its own state
+// (so tombstones are unnecessary), each report refreshes the panel TTL, and
+// peer nodes converge within one report interval. A lost report is simply
+// superseded by the next tick.
+func (t *Tracker) SnapshotAliveIPs() map[int][]string {
+	s := t.live.Load()
+	out := make(map[int][]string, len(s.aliveIPs))
+	for uid, ips := range s.aliveIPs {
+		list := make([]string, 0, len(ips))
+		for ip := range ips {
+			list = append(list, ip)
+		}
+		out[uid] = list
+	}
+	return out
+}
+
+// SeedAliveUsers marks users whose device state may still exist on the panel.
+// The next REST flush emits empty tombstones for seeded users that are absent
+// from the current kernel snapshot. This is used once when entering REST mode
+// so a restarted node can clear state left by its previous process.
+func (t *Tracker) SeedAliveUsers(userIDs []int) {
+	if len(userIDs) == 0 {
+		return
+	}
+	t.mu.Lock()
+	if t.lastAliveUsers == nil {
+		t.lastAliveUsers = make(map[int]struct{}, len(userIDs))
+	}
+	for _, uid := range userIDs {
+		t.lastAliveUsers[uid] = struct{}{}
+	}
+	t.forceAliveReport = true
+	t.mu.Unlock()
 }
 
 // calcAliveIPsHash computes a deterministic hash for change detection.
@@ -243,28 +314,20 @@ func (t *Tracker) CurrentOnline() map[int]int {
 	return cp
 }
 
-// RestoreAliveIPs merges alive IPs back in (used when push to panel fails).
-// Note: this operates on the buffer, which will be overwritten next Process().
+// RestoreAliveIPs marks a failed push for retry (used when push to panel
+// fails). FlushAliveIPs always returns the complete current snapshot, so no
+// IPs need merging back — but every user of the failed payload is re-added to
+// lastAliveUsers so its tombstone is re-emitted on the retry, and the force
+// flag makes the next flush bypass the unchanged-hash short-circuit.
 func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for uid, ipList := range data {
-		ips := t.aliveIPsBuf[uid]
-		if ips == nil {
-			ips = make([]string, 0, len(ipList))
-		}
-		// Use map for O(n) dedup instead of O(n²) linear search
-		existMap := make(map[string]struct{}, len(ips)+len(ipList))
-		for _, existing := range ips {
-			existMap[existing] = struct{}{}
-		}
-		for _, ip := range ipList {
-			if _, exists := existMap[ip]; !exists {
-				ips = append(ips, ip)
-				existMap[ip] = struct{}{}
-			}
-		}
-		t.aliveIPsBuf[uid] = ips
+	t.forceAliveReport = true
+	if t.lastAliveUsers == nil {
+		t.lastAliveUsers = make(map[int]struct{}, len(data))
+	}
+	for uid := range data {
+		t.lastAliveUsers[uid] = struct{}{}
 	}
 }
 

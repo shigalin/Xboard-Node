@@ -64,10 +64,16 @@ type Service struct {
 	wsUserRevision uint64     // increments when a WS user update is applied
 	pullBackoff    apiBackoff // backoff for panel pull failures
 	pushBackoff    apiBackoff // backoff for panel push failures
+	deviceBackoff  apiBackoff // backoff for REST device-report failures
 
-	// pushActive prevents overlapping push/pull goroutines.
-	pushActive atomic.Bool
-	pullActive atomic.Bool
+	// Active flags prevent overlapping goroutines for each independent report.
+	pushActive       atomic.Bool
+	devicePushActive atomic.Bool
+	pullActive       atomic.Bool
+	// restDevicesSeeded is reset while WS is active. The first REST device
+	// report after startup or a WS-to-REST transition seeds tombstones for the
+	// current user set so stale state from an earlier process is removed.
+	restDevicesSeeded atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -218,6 +224,11 @@ func (s *Service) Run(ctx context.Context) error {
 	defer wsDiscoveryTicker.Stop()
 
 	s.startWSClient(ctx)
+	// REST-only nodes clear any device state left by an earlier process without
+	// waiting for the first device-report tick. The request is asynchronous.
+	if s.wsClient == nil {
+		s.reportDevices()
+	}
 
 	for {
 		select {
@@ -481,7 +492,10 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 			nlog.Core().Info("ws connected")
 		}
 		// After reconnect, proactively pull once to ensure we haven't missed
-		// any updates during the disconnection window.
+		// any updates during the disconnection window. Device state needs no
+		// special handling here: the WS path sends the full snapshot every
+		// tick, so the panel (which cleared this node's devices on disconnect)
+		// converges within one report interval.
 		s.pullViaAPIAsync(ctx)
 	} else {
 		s.metricsMu.Lock()
@@ -1020,7 +1034,6 @@ func (s *Service) pushReportAsync() {
 	}
 
 	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
@@ -1028,13 +1041,10 @@ func (s *Service) pushReportAsync() {
 
 	go func() {
 		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
 			if len(traffic) > 0 {
 				s.tracker.RestoreTraffic(traffic)
-			}
-			if len(aliveIPs) > 0 {
-				s.tracker.RestoreAliveIPs(aliveIPs)
 			}
 			s.pushBackoff.onFailure()
 			return
@@ -1044,13 +1054,63 @@ func (s *Service) pushReportAsync() {
 	}()
 }
 
+// pushAliveReportAsync sends the REST device snapshot on its own bounded
+// schedule. It deliberately does not share the normal status-report gate or
+// backoff, so a slow/rare push_interval cannot let panel device state expire.
+func (s *Service) pushAliveReportAsync() {
+	if !s.sink.SupportsReporting() {
+		return
+	}
+	if !s.devicePushActive.CompareAndSwap(false, true) {
+		nlog.Core().Debug("device report already in progress, skipping")
+		return
+	}
+	if s.deviceBackoff.shouldSkip() {
+		nlog.Core().Debug("skipping device report due to backoff")
+		s.devicePushActive.Store(false)
+		return
+	}
+
+	aliveIPs := s.tracker.FlushAliveIPs()
+	if aliveIPs == nil {
+		s.devicePushActive.Store(false)
+		return
+	}
+
+	go func() {
+		defer s.devicePushActive.Store(false)
+		if err := s.sink.ReportAlive(aliveIPs); err != nil {
+			nlog.Core().Warn("failed to push device report", "error", err)
+			s.tracker.RestoreAliveIPs(aliveIPs)
+			s.deviceBackoff.onFailure()
+			return
+		}
+		s.deviceBackoff.onSuccess()
+		nlog.Core().Debug("REST device snapshot sent", "users", len(aliveIPs))
+	}()
+}
+
+// flushAliveIPsForHTTP flushes the alive-IPs snapshot for the HTTP report,
+// unless the WS report.devices path is active: while connected, WS delivers
+// the full snapshot every tick, so an HTTP report would be redundant load on
+// the panel. The flush cursor is used only by this HTTP path (WS keeps no
+// dedup state), so the IsConnected check racing a reconnect costs at most one
+// redundant or deferred HTTP report — the aliveResendInterval resend and the
+// per-tick WS snapshot both bound the drift.
+func (s *Service) flushAliveIPsForHTTP() map[int][]string {
+	if s.sink.SupportsDeviceReports() && s.wsClient != nil && s.wsClient.IsConnected() {
+		return nil
+	}
+	return s.tracker.FlushAliveIPs()
+}
+
 // pushReportSync is used only during shutdown to ensure final data is sent.
 func (s *Service) pushReportSync() {
 	if !s.sink.SupportsReporting() {
 		return
 	}
 	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
+	aliveIPs := s.flushAliveIPsForHTTP()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
@@ -1178,19 +1238,44 @@ func (s *Service) sendDeviceBatch() {
 		return
 	}
 
-	devices := s.tracker.FlushAliveIPs()
-	// FlushAliveIPs returns nil if no changes since last flush
-	if devices == nil {
-		nlog.Core().Debug("device snapshot unchanged, skipping")
+	// Send the full snapshot every tick, with no change-detection: the panel's
+	// WS handler diffs against its own state, each report refreshes the
+	// panel-side device TTL, and peer nodes receive the resulting sync.devices
+	// within one report interval — which is what keeps the strict multi-node
+	// device limit converging. A report lost in flight (queue full, connection
+	// dying) is simply superseded by the next tick.
+	devices := s.tracker.SnapshotAliveIPs()
+	if !s.sink.ReportDevices(s.wsClient, devices) {
+		nlog.Core().Warn("device snapshot not sent, next tick resends", "users", len(devices))
 		return
 	}
-	s.sink.ReportDevices(s.wsClient, devices)
 	nlog.Core().Debug("device snapshot sent", "users", len(devices))
 }
 
-// reportDevices periodically reports device snapshot to panel.
+// reportDevices periodically reports the device snapshot over WS when it is
+// connected, otherwise through the REST report endpoint on the same bounded
+// device_report_interval schedule.
 func (s *Service) reportDevices() {
-	s.sendDeviceBatch()
+	if !s.sink.SupportsReporting() {
+		return
+	}
+	if s.sink.SupportsDeviceReports() && s.wsClient != nil && s.wsClient.IsConnected() {
+		s.restDevicesSeeded.Store(false)
+		s.sendDeviceBatch()
+		return
+	}
+
+	if s.restDevicesSeeded.CompareAndSwap(false, true) {
+		s.metricsMu.RLock()
+		users := append([]model.UserSpec(nil), s.lastUsers...)
+		s.metricsMu.RUnlock()
+		userIDs := make([]int, 0, len(users))
+		for _, user := range users {
+			userIDs = append(userIDs, user.ID)
+		}
+		s.tracker.SeedAliveUsers(userIDs)
+	}
+	s.pushAliveReportAsync()
 }
 
 // ─── Runtime validation ─────────────────────────────────────────────────

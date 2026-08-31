@@ -395,9 +395,9 @@ func (p *machineNodePush) IsConnected() bool {
 	return p.ws != nil && p.ws.IsConnected()
 }
 
-func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
+func (p *machineNodePush) SendDeviceReport(devices map[int][]string) bool {
 	if p.ws == nil {
-		return
+		return false
 	}
 	payload := map[string]interface{}{
 		"node_id": p.nodeID,
@@ -408,6 +408,9 @@ func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
 		strDevices[fmt.Sprintf("%d", uid)] = ips
 	}
 	payload["devices"] = strDevices
-	data, _ := json.Marshal(payload)
-	p.ws.SendRaw(panel.WSEventReportDevices, data)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	return p.ws.SendRaw(panel.WSEventReportDevices, data)
 }

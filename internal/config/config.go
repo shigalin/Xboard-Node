@@ -105,7 +105,7 @@ type NodeConfig struct {
 	PushInterval         int `yaml:"push_interval"`
 	PullInterval         int `yaml:"pull_interval"`
 	TrackInterval        int `yaml:"track_interval"`         // sec, default 10
-	DeviceReportInterval int `yaml:"device_report_interval"` // sec, default 30
+	DeviceReportInterval int `yaml:"device_report_interval"` // sec, default 30, max 120
 }
 
 // WSConfig holds WebSocket client tuning options.
@@ -747,6 +747,12 @@ func (c *Config) validate() error {
 	}
 	if c.Kernel.DeviceLimitCooldown < 0 || c.Kernel.DeviceLimitCooldown > 86400 {
 		return fmt.Errorf("kernel.device_limit_cooldown must be between 0 and 86400 seconds")
+	}
+	// The panel expires device entries 300s after the last report; cap the
+	// interval so at least two reports fit in that window (0 → default 30).
+	// Standalone mode has no panel-side device state to refresh.
+	if !c.IsStandalone() && (c.Node.DeviceReportInterval < 0 || c.Node.DeviceReportInterval > 120) {
+		return fmt.Errorf("node.device_report_interval must be between 0 and 120 seconds (panel device state expires after 300)")
 	}
 	return nil
 }

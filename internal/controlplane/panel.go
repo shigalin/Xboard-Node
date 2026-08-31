@@ -109,10 +109,12 @@ func (p *PanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics)
 }
 
-func (p *PanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) {
-	if push != nil {
-		push.SendDeviceReport(devices)
-	}
+func (p *PanelControlPlane) ReportAlive(alive map[int][]string) error {
+	return p.client.PushAlive(alive)
+}
+
+func (p *PanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) bool {
+	return push != nil && push.SendDeviceReport(devices)
 }
 
 func (p *PanelControlPlane) Metrics() APIMetrics {
@@ -179,6 +181,6 @@ func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, err
 
 func (p *panelPushClient) Run(ctx context.Context) { p.inner.Run(ctx) }
 func (p *panelPushClient) IsConnected() bool       { return p.inner.IsConnected() }
-func (p *panelPushClient) SendDeviceReport(devices map[int][]string) {
-	p.inner.SendDeviceReport(devices)
+func (p *panelPushClient) SendDeviceReport(devices map[int][]string) bool {
+	return p.inner.SendDeviceReport(devices)
 }

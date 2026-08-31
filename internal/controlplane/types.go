@@ -62,7 +62,9 @@ type ReportPayload struct {
 type PushClient interface {
 	Run(ctx context.Context)
 	IsConnected() bool
-	SendDeviceReport(devices map[int][]string)
+	// SendDeviceReport queues a device snapshot for the panel.
+	// Returns false if it could not be queued (caller should retry later).
+	SendDeviceReport(devices map[int][]string) bool
 }
 
 type Source interface {
@@ -76,7 +78,12 @@ type Source interface {
 
 type Sink interface {
 	Report(payload ReportPayload) error
-	ReportDevices(push PushClient, devices map[int][]string)
+	// ReportAlive sends only the REST alive-device payload, without changing
+	// the panel's independently scheduled node status report.
+	ReportAlive(alive map[int][]string) error
+	// ReportDevices sends a device snapshot via the push client.
+	// Returns false if the report was not queued (caller should retry later).
+	ReportDevices(push PushClient, devices map[int][]string) bool
 	SupportsReporting() bool
 	SupportsDeviceReports() bool
 }

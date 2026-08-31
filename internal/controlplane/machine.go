@@ -133,10 +133,12 @@ func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
 	)
 }
 
-func (p *MachinePanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) {
-	if push != nil {
-		push.SendDeviceReport(devices)
-	}
+func (p *MachinePanelControlPlane) ReportAlive(alive map[int][]string) error {
+	return p.client.PushAlive(alive)
+}
+
+func (p *MachinePanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) bool {
+	return push != nil && push.SendDeviceReport(devices)
 }
 
 func (p *MachinePanelControlPlane) Metrics() APIMetrics {

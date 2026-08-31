@@ -109,8 +109,21 @@ type WSClient struct {
 	connected atomic.Bool
 
 	// writeCh allows sending messages from outside the connect loop.
-	// It is set in connect() and cleared on disconnect.
-	writeCh chan wsMessage
+	// Installed in connect() before connected is published and cleared on
+	// disconnect; accessed atomically because senders run on other goroutines.
+	writeCh atomic.Pointer[chan wsMessage]
+}
+
+// sendQueue returns the current write channel, or nil when disconnected.
+// Best-effort: a message enqueued just as the connection exits lands in a
+// retired queue with no consumer, so a true return means "queued", not
+// "delivered". Callers tolerate this — device state is a full snapshot
+// resent every report interval, so any single lost message is superseded.
+func (w *WSClient) sendQueue() chan wsMessage {
+	if ch := w.writeCh.Load(); ch != nil {
+		return *ch
+	}
+	return nil
 }
 
 // NewWSClient creates a new WebSocket client.
@@ -240,6 +253,13 @@ func (w *WSClient) connect(ctx context.Context) error {
 		return fmt.Errorf("auth failed: %s", errData.Message)
 	}
 
+	// writeCh decouples data collection from network I/O. Install it before
+	// publishing connected=true so senders never observe a connected client
+	// without a send queue.
+	writeCh := make(chan wsMessage, 16)
+	w.writeCh.Store(&writeCh)
+	defer w.writeCh.Store(nil)
+
 	if firstMsg.Event != "auth.success" {
 		// It might be a data event already (server pushed sync before auth.success)
 		// Process it and continue
@@ -255,11 +275,6 @@ func (w *WSClient) connect(ctx context.Context) error {
 	// We also use this timer to trigger periodic status pushes.
 	reportTicker := time.NewTicker(w.cfg.StatusInterval)
 	defer reportTicker.Stop()
-
-	// writeCh decouples data collection from network I/O.
-	writeCh := make(chan wsMessage, 16)
-	w.writeCh = writeCh
-	defer func() { w.writeCh = nil }()
 
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -443,15 +458,17 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 }
 
 // SendDeviceReport sends local device snapshot to panel via WS.
-func (w *WSClient) SendDeviceReport(devices map[int][]string) {
-	w.SendDeviceReportForNode(0, devices)
+// Returns false if the report could not be queued (caller should retry later).
+func (w *WSClient) SendDeviceReport(devices map[int][]string) bool {
+	return w.SendDeviceReportForNode(0, devices)
 }
 
 // SendDeviceReportForNode sends a device report tagged with a specific node_id.
 // nodeID == 0 omits the field (legacy single-node mode).
-func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) {
+// Returns false if the report could not be queued (caller should retry later).
+func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) bool {
 	if !w.connected.Load() {
-		return
+		return false
 	}
 
 	var payload interface{}
@@ -463,7 +480,7 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 
 	d, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return false
 	}
 	msg := wsMessage{
 		Event:     WSEventReportDevices,
@@ -471,10 +488,16 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 		Timestamp: time.Now().Unix(),
 	}
 
+	ch := w.sendQueue()
+	if ch == nil {
+		return false
+	}
 	select {
-	case w.writeCh <- msg:
+	case ch <- msg:
+		return true
 	default:
 		nlog.Core().Warn("ws write channel full, skipping device report")
+		return false
 	}
 }
 
@@ -492,17 +515,22 @@ func (w *WSClient) SendNodeStatus(nodeID int, stats map[string]interface{}) {
 		Data:      data,
 		Timestamp: time.Now().Unix(),
 	}
+	ch := w.sendQueue()
+	if ch == nil {
+		return
+	}
 	select {
-	case w.writeCh <- msg:
+	case ch <- msg:
 	default:
 		nlog.Core().Warn("ws write channel full, skipping node status")
 	}
 }
 
 // SendRaw sends a raw message to the panel via WebSocket.
-func (w *WSClient) SendRaw(event string, data json.RawMessage) {
+// Returns false if the message could not be queued.
+func (w *WSClient) SendRaw(event string, data json.RawMessage) bool {
 	if !w.connected.Load() {
-		return
+		return false
 	}
 
 	msg := wsMessage{
@@ -511,9 +539,15 @@ func (w *WSClient) SendRaw(event string, data json.RawMessage) {
 		Timestamp: time.Now().Unix(),
 	}
 
+	ch := w.sendQueue()
+	if ch == nil {
+		return false
+	}
 	select {
-	case w.writeCh <- msg:
+	case ch <- msg:
+		return true
 	default:
 		nlog.Core().Warn("ws write channel full, skipping raw message", "event", event)
+		return false
 	}
 }
