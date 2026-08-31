@@ -393,10 +393,6 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
-		if len(p.Users) == 0 {
-			nlog.Core().Warn("ws: users payload empty")
-			return
-		}
 		event.Users = p.Users
 		event.NodeID = p.NodeID
 

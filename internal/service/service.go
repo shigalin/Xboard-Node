@@ -28,6 +28,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/tracker"
 )
 
+const defaultWSReconcileInterval = 5 * time.Minute
+
 type Service struct {
 	cfg          *config.Config
 	source       controlplane.Source
@@ -53,9 +55,13 @@ type Service struct {
 
 	pushInterval int // seconds
 	pullInterval int // seconds
+	// wsReconcileInterval is the minimum REST reconciliation interval while
+	// WebSocket is connected. Disconnected polling still uses pullInterval.
+	wsReconcileInterval time.Duration
 
 	lastUserHash   string     // hash of user list for change detection
 	lastConfigHash string     // hash of full config for change detection
+	wsUserRevision uint64     // increments when a WS user update is applied
 	pullBackoff    apiBackoff // backoff for panel pull failures
 	pushBackoff    apiBackoff // backoff for panel push failures
 
@@ -80,11 +86,12 @@ type Service struct {
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
 type pullResult struct {
-	config      *model.NodeSpec
-	users       []model.UserSpec
-	configHash  string
-	userHash    string
-	certChanged bool
+	config         *model.NodeSpec
+	users          []model.UserSpec
+	configHash     string
+	userHash       string
+	wsUserRevision uint64
+	certChanged    bool
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -154,17 +161,18 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	st := limiter.NewSpeedTracker(l)
 
 	return &Service{
-		cfg:          cfg,
-		source:       cp,
-		sink:         cp,
-		kernel:       k,
-		tracker:      tracker.New(),
-		limiter:      l,
-		speedTracker: st,
-		cert:         certMgr,
-		wsEvents:     make(chan controlplane.Event, 16),
-		wsStatusCh:   make(chan controlplane.StatusChange, 4),
-		pullResults:  make(chan pullResult, 1),
+		cfg:                 cfg,
+		source:              cp,
+		sink:                cp,
+		kernel:              k,
+		tracker:             tracker.New(),
+		limiter:             l,
+		speedTracker:        st,
+		cert:                certMgr,
+		wsEvents:            make(chan controlplane.Event, 16),
+		wsStatusCh:          make(chan controlplane.StatusChange, 4),
+		pullResults:         make(chan pullResult, 1),
+		wsReconcileInterval: defaultWSReconcileInterval,
 	}
 }
 
@@ -185,8 +193,16 @@ func (s *Service) Run(ctx context.Context) error {
 	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
 	pushInterval := time.Duration(math.Max(float64(s.pushInterval), 5)) * time.Second
 	pullInterval := time.Duration(s.pullInterval) * time.Second
+	wsReconcileInterval := s.wsReconcileInterval
+	if wsReconcileInterval <= 0 {
+		wsReconcileInterval = defaultWSReconcileInterval
+	}
+	if pullInterval > wsReconcileInterval {
+		wsReconcileInterval = pullInterval
+	}
 	reportTicker := time.NewTicker(pushInterval)
 	pullTicker := time.NewTicker(pullInterval)
+	wsReconcileTicker := time.NewTicker(wsReconcileInterval)
 	deviceReportTicker := time.NewTicker(time.Duration(s.cfg.Node.DeviceReportInterval) * time.Second)
 
 	// WS discovery: when in REST-only mode, periodically re-handshake to check
@@ -197,6 +213,7 @@ func (s *Service) Run(ctx context.Context) error {
 	defer trackTicker.Stop()
 	defer reportTicker.Stop()
 	defer pullTicker.Stop()
+	defer wsReconcileTicker.Stop()
 	defer deviceReportTicker.Stop()
 	defer wsDiscoveryTicker.Stop()
 
@@ -218,12 +235,20 @@ func (s *Service) Run(ctx context.Context) error {
 			s.reportDevices()
 
 		case <-pullTicker.C:
-			// When WebSocket is connected, skip REST polling entirely.
-			// Config/user updates arrive via WS push.
 			if s.wsClient != nil && s.wsClient.IsConnected() {
 				continue
 			}
 			nlog.Core().Debug("polling from API (ws not connected)")
+			s.pullViaAPIAsync(ctx)
+
+		case <-wsReconcileTicker.C:
+			if s.wsClient == nil || !s.wsClient.IsConnected() {
+				continue
+			}
+			// Reconcile periodically even with a healthy WebSocket. This removes
+			// users that become unavailable solely because time passes and repairs
+			// state after a missed push event without polling the panel every minute.
+			nlog.Core().Debug("periodic API reconciliation (ws connected)")
 			s.pullViaAPIAsync(ctx)
 
 		case result := <-s.pullResults:
@@ -570,6 +595,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if s.nodeLog != nil {
 			s.nodeLog.Info(fmt.Sprintf("users updated, %d users", len(event.Users)))
 		}
+		s.wsUserRevision++
 		s.applyUserUpdate(ctx, event.Users, newHash)
 
 	case controlplane.EventSyncUserDelta:
@@ -579,6 +605,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if s.nodeLog != nil {
 			s.nodeLog.Info(fmt.Sprintf("users delta: %s, %d users", event.DeltaAction, len(event.DeltaUsers)))
 		}
+		s.wsUserRevision++
 		s.applyUserDelta(ctx, event.DeltaAction, event.DeltaUsers)
 
 	case controlplane.EventSyncDevices:
@@ -609,6 +636,7 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 	}
 
 	currentConfigHash := s.lastConfigHash
+	currentWSUserRevision := s.wsUserRevision
 	certChanged := s.cert.CertRenewed()
 
 	go func() {
@@ -621,7 +649,10 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		}
 		s.pullBackoff.onSuccess()
 
-		result := pullResult{certChanged: certChanged}
+		result := pullResult{
+			certChanged:    certChanged,
+			wsUserRevision: currentWSUserRevision,
+		}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
@@ -673,12 +704,18 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	}
 
 	if result.users != nil {
-		usersChanged := result.userHash != s.lastUserHash
+		if result.wsUserRevision != s.wsUserRevision {
+			nlog.Core().Debug("discarding stale polled users after websocket update",
+				"poll_revision", result.wsUserRevision,
+				"current_revision", s.wsUserRevision)
+		} else {
+			usersChanged := result.userHash != s.lastUserHash
 
-		if usersChanged && !configChanged {
-			s.applyUserUpdate(ctx, result.users, result.userHash)
-		} else if usersChanged {
-			s.updateUserState(result.users)
+			if usersChanged && !configChanged {
+				s.applyUserUpdate(ctx, result.users, result.userHash)
+			} else if usersChanged {
+				s.updateUserState(result.users)
+			}
 		}
 	}
 
