@@ -395,12 +395,13 @@ func (p *machineNodePush) IsConnected() bool {
 	return p.ws != nil && p.ws.IsConnected()
 }
 
-func (p *machineNodePush) SendDeviceReport(devices map[int][]string) bool {
+func (p *machineNodePush) SendDeviceReport(devices map[int][]string, sequence int64) bool {
 	if p.ws == nil {
 		return false
 	}
 	payload := map[string]interface{}{
-		"node_id": p.nodeID,
+		"node_id":         p.nodeID,
+		"device_sequence": sequence,
 	}
 	// Flatten into the standard format with node_id wrapper.
 	strDevices := make(map[string][]string, len(devices))

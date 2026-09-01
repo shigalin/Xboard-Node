@@ -41,6 +41,9 @@ type Client struct {
 
 	apiSuccess atomic.Uint64
 	apiFailure atomic.Uint64
+	// The first successful handshake reserves a panel-issued sequence block.
+	// Later discovery handshakes must not reserve a new block for the same process.
+	sequenceHandshakeDone atomic.Bool
 }
 
 // NewClient creates a new panel API client.
@@ -84,19 +87,42 @@ func (c *Client) ResetConfigETag() {
 
 // Handshake calls the new v2 API to get WS config + initial data in one shot.
 func (c *Client) Handshake() (*HandshakeResponse, error) {
-	resp, err := c.doRequest("POST", "/api/v2/server/handshake", nil, "")
+	return c.handshake(false)
+}
+
+// HandshakeWithDeviceSequence reserves one process-specific sequence block.
+// It is only valid for node-scoped handshakes; machine handshakes have no node_info.
+func (c *Client) HandshakeWithDeviceSequence() (*HandshakeResponse, error) {
+	return c.handshake(true)
+}
+
+func (c *Client) handshake(requestSequence bool) (*HandshakeResponse, error) {
+	reserveSequence := requestSequence && c.sequenceHandshakeDone.CompareAndSwap(false, true)
+	payload := map[string]interface{}{"device_sequence_v1": reserveSequence}
+	c.injectAuth(payload)
+	body, _ := json.Marshal(payload)
+	resp, err := c.doRequest("POST", "/api/v2/server/handshake", body, "")
 	if err != nil {
+		if reserveSequence {
+			c.sequenceHandshakeDone.Store(false)
+		}
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
+		if reserveSequence {
+			c.sequenceHandshakeDone.Store(false)
+		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("handshake status %d: %s", resp.StatusCode, body)
 	}
 
 	var hs HandshakeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&hs); err != nil {
+		if reserveSequence {
+			c.sequenceHandshakeDone.Store(false)
+		}
 		return nil, fmt.Errorf("decode handshake: %w", err)
 	}
 	return &hs, nil
@@ -280,6 +306,32 @@ func (c *Client) GetUsers() ([]User, error) {
 	return usersResp.Users, nil
 }
 
+// GetDevices fetches the global device IP sets for users available on this node.
+func (c *Client) GetDevices() (map[int][]string, error) {
+	resp, err := c.doRequest("GET", "/api/v2/server/devices", nil, "")
+	if err != nil {
+		return nil, fmt.Errorf("get devices: %w", err)
+	}
+	defer drainAndClose(resp.Body)
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil // panel version predates the REST global-device endpoint
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+	}
+
+	var devices DevicesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&devices); err != nil {
+		return nil, fmt.Errorf("decode devices: %w", err)
+	}
+	if devices.Users == nil {
+		devices.Users = map[int][]string{}
+	}
+	return devices.Users, nil
+}
+
 // PushTraffic submits per-user traffic data
 func (c *Client) PushTraffic(data map[int][2]int64) error {
 	if len(data) == 0 {
@@ -292,7 +344,27 @@ func (c *Client) PushTraffic(data map[int][2]int64) error {
 	return c.postJSON("/api/v1/server/UniProxy/push", payload)
 }
 
-// PushAlive submits online user IPs
+// ReportAlive sends only the nested alive-device map to POST /api/v2/server/report.
+// Auth stays at the top level (server.v2). Delta callers include empty-array
+// tombstones; a full snapshot also removes users omitted from `alive`.
+// Status/traffic/metrics are omitted so the independent status schedule is unchanged.
+func (c *Client) ReportAlive(data map[int][]string, sequence int64, fullSnapshot bool) error {
+	alive := make(map[string][]string, len(data))
+	for uid, ips := range data {
+		if ips == nil {
+			ips = []string{}
+		}
+		alive[strconv.Itoa(uid)] = ips
+	}
+	return c.postJSON("/api/v2/server/report", map[string]interface{}{
+		"alive":                alive,
+		"device_sequence":      sequence,
+		"device_full_snapshot": fullSnapshot,
+	})
+}
+
+// PushAlive preserves the legacy v1 client API for external callers. Runtime
+// device reporting uses ReportAlive so auth and tombstones follow server.v2.
 func (c *Client) PushAlive(data map[int][]string) error {
 	if len(data) == 0 {
 		return nil

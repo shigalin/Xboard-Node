@@ -108,17 +108,13 @@ type WSClient struct {
 
 	connected atomic.Bool
 
-	// writeCh allows sending messages from outside the connect loop.
-	// Installed in connect() before connected is published and cleared on
-	// disconnect; accessed atomically because senders run on other goroutines.
+	// writeCh is installed before connected=true so senders never see a
+	// connected client without a queue. Cleared on disconnect.
 	writeCh atomic.Pointer[chan wsMessage]
 }
 
 // sendQueue returns the current write channel, or nil when disconnected.
-// Best-effort: a message enqueued just as the connection exits lands in a
-// retired queue with no consumer, so a true return means "queued", not
-// "delivered". Callers tolerate this — device state is a full snapshot
-// resent every report interval, so any single lost message is superseded.
+// True means queued, not delivered; a full snapshot on the next tick supersedes a lost send.
 func (w *WSClient) sendQueue() chan wsMessage {
 	if ch := w.writeCh.Load(); ch != nil {
 		return *ch
@@ -253,9 +249,6 @@ func (w *WSClient) connect(ctx context.Context) error {
 		return fmt.Errorf("auth failed: %s", errData.Message)
 	}
 
-	// writeCh decouples data collection from network I/O. Install it before
-	// publishing connected=true so senders never observe a connected client
-	// without a send queue.
 	writeCh := make(chan wsMessage, 16)
 	w.writeCh.Store(&writeCh)
 	defer w.writeCh.Store(nil)
@@ -459,23 +452,24 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 // SendDeviceReport sends local device snapshot to panel via WS.
 // Returns false if the report could not be queued (caller should retry later).
-func (w *WSClient) SendDeviceReport(devices map[int][]string) bool {
-	return w.SendDeviceReportForNode(0, devices)
+func (w *WSClient) SendDeviceReport(devices map[int][]string, sequence int64) bool {
+	return w.SendDeviceReportForNode(0, devices, sequence)
 }
 
 // SendDeviceReportForNode sends a device report tagged with a specific node_id.
 // nodeID == 0 omits the field (legacy single-node mode).
 // Returns false if the report could not be queued (caller should retry later).
-func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) bool {
+func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string, sequence int64) bool {
 	if !w.connected.Load() {
 		return false
 	}
 
-	var payload interface{}
+	payload := map[string]interface{}{
+		"devices":         devices,
+		"device_sequence": sequence,
+	}
 	if nodeID > 0 {
-		payload = map[string]interface{}{"node_id": nodeID, "devices": devices}
-	} else {
-		payload = devices
+		payload["node_id"] = nodeID
 	}
 
 	d, err := json.Marshal(payload)

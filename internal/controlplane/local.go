@@ -55,12 +55,12 @@ func (l *LocalControlPlane) Discover(ctx context.Context, _ func() map[string]in
 }
 
 func (l *LocalControlPlane) Report(payload ReportPayload) error { _ = payload; return nil }
-func (l *LocalControlPlane) ReportAlive(alive map[int][]string) error {
-	_ = alive
+func (l *LocalControlPlane) ReportAlive(alive map[int][]string, sequence int64, fullSnapshot bool) error {
+	_, _, _ = alive, sequence, fullSnapshot
 	return nil
 }
-func (l *LocalControlPlane) ReportDevices(push PushClient, devices map[int][]string) bool {
-	_, _ = push, devices
+func (l *LocalControlPlane) ReportDevices(push PushClient, devices map[int][]string, sequence int64) bool {
+	_, _, _ = push, devices, sequence
 	return true // no panel to report to; nothing to retry
 }
 func (l *LocalControlPlane) Metrics() APIMetrics { return APIMetrics{} }

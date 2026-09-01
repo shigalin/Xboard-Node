@@ -390,7 +390,10 @@ func (t *ConnTracker) admitConn(uuid, sourceIP, network string) (uid int, us *us
 func (t *ConnTracker) admitDevice(us *userStats, userID int, sourceIP string, limit int) bool {
 	// Snapshot global (multi-node) state first to keep lock scopes disjoint.
 	t.globalMu.RLock()
-	globalStale := time.Since(t.globalLastUpdate) > 60*time.Second
+	// Panel device entries expire after 300s. WS updates arrive on device report
+	// events and REST fallback polls them, so keep the last snapshot usable for
+	// the same bounded window before degrading to local-only admission.
+	globalStale := time.Since(t.globalLastUpdate) > 300*time.Second
 	globalIPs := t.globalDevices[userID]
 	t.globalMu.RUnlock()
 	globalFresh := !globalStale && globalIPs != nil

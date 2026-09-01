@@ -35,17 +35,20 @@ type APIMetrics struct {
 }
 
 type Bootstrap struct {
-	PushInterval int
-	PullInterval int
-	Push         PushClient
-	Config       *model.NodeSpec
-	Users        []model.UserSpec
-	Mailbox      *NodeMailbox
+	PushInterval       int
+	PullInterval       int
+	DeviceSequenceBase int64
+	Push               PushClient
+	Config             *model.NodeSpec
+	Users              []model.UserSpec
+	DeviceUsers        map[int][]string
+	Mailbox            *NodeMailbox
 }
 
 type Snapshot struct {
-	Config *model.NodeSpec
-	Users  []model.UserSpec
+	Config      *model.NodeSpec
+	Users       []model.UserSpec
+	DeviceUsers map[int][]string
 }
 
 type ReportPayload struct {
@@ -64,7 +67,7 @@ type PushClient interface {
 	IsConnected() bool
 	// SendDeviceReport queues a device snapshot for the panel.
 	// Returns false if it could not be queued (caller should retry later).
-	SendDeviceReport(devices map[int][]string) bool
+	SendDeviceReport(devices map[int][]string, sequence int64) bool
 }
 
 type Source interface {
@@ -76,14 +79,21 @@ type Source interface {
 	SupportsDiscovery() bool
 }
 
+// DeviceSnapshotSource provides a lightweight REST refresh for global device
+// state. It is intentionally optional so standalone and third-party control
+// planes do not need to implement an endpoint they cannot use.
+type DeviceSnapshotSource interface {
+	FetchDevices(ctx context.Context) (map[int][]string, error)
+}
+
 type Sink interface {
 	Report(payload ReportPayload) error
 	// ReportAlive sends only the REST alive-device payload, without changing
 	// the panel's independently scheduled node status report.
-	ReportAlive(alive map[int][]string) error
+	ReportAlive(alive map[int][]string, sequence int64, fullSnapshot bool) error
 	// ReportDevices sends a device snapshot via the push client.
 	// Returns false if the report was not queued (caller should retry later).
-	ReportDevices(push PushClient, devices map[int][]string) bool
+	ReportDevices(push PushClient, devices map[int][]string, sequence int64) bool
 	SupportsReporting() bool
 	SupportsDeviceReports() bool
 }

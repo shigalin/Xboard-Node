@@ -751,7 +751,10 @@ func (c *Config) validate() error {
 	// The panel expires device entries 300s after the last report; cap the
 	// interval so at least two reports fit in that window (0 → default 30).
 	// Standalone mode has no panel-side device state to refresh.
-	if !c.IsStandalone() && (c.Node.DeviceReportInterval < 0 || c.Node.DeviceReportInterval > 120) {
+	if c.Node.DeviceReportInterval < 0 {
+		return fmt.Errorf("node.device_report_interval cannot be negative")
+	}
+	if !c.IsStandalone() && c.Node.DeviceReportInterval > 120 {
 		return fmt.Errorf("node.device_report_interval must be between 0 and 120 seconds (panel device state expires after 300)")
 	}
 	return nil

@@ -37,12 +37,16 @@ func (p *PanelControlPlane) SupportsReporting() bool     { return true }
 func (p *PanelControlPlane) SupportsDeviceReports() bool { return true }
 
 func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (Bootstrap, error) {
-	hs, err := p.client.Handshake()
+	hs, err := p.client.HandshakeWithDeviceSequence()
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("handshake: %w", err)
 	}
 
-	bootstrap := Bootstrap{PushInterval: hs.Settings.PushInterval, PullInterval: hs.Settings.PullInterval}
+	bootstrap := Bootstrap{
+		PushInterval:       hs.Settings.PushInterval,
+		PullInterval:       hs.Settings.PullInterval,
+		DeviceSequenceBase: hs.DeviceSequenceBase,
+	}
 	if hs.WebSocket.Enabled && hs.WebSocket.WSURL != "" {
 		bootstrap.Push = p.newPushClient(metricsFn, events, statuses, hs.WebSocket.WSURL)
 		return bootstrap, nil
@@ -65,6 +69,10 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 		return Bootstrap{}, fmt.Errorf("initial config normalize: %w", err)
 	}
 	bootstrap.Users = model.UserSpecsFromPanel(users)
+	bootstrap.DeviceUsers, err = p.client.GetDevices()
+	if err != nil {
+		return Bootstrap{}, fmt.Errorf("initial devices fetch: %w", err)
+	}
 	return bootstrap, nil
 }
 
@@ -89,6 +97,15 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
 }
 
+func (p *PanelControlPlane) FetchDevices(ctx context.Context) (map[int][]string, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	return p.client.GetDevices()
+}
+
 func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {
 	hs, err := p.client.Handshake()
 	if err != nil {
@@ -109,12 +126,12 @@ func (p *PanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics)
 }
 
-func (p *PanelControlPlane) ReportAlive(alive map[int][]string) error {
-	return p.client.PushAlive(alive)
+func (p *PanelControlPlane) ReportAlive(alive map[int][]string, sequence int64, fullSnapshot bool) error {
+	return p.client.ReportAlive(alive, sequence, fullSnapshot)
 }
 
-func (p *PanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) bool {
-	return push != nil && push.SendDeviceReport(devices)
+func (p *PanelControlPlane) ReportDevices(push PushClient, devices map[int][]string, sequence int64) bool {
+	return push != nil && push.SendDeviceReport(devices, sequence)
 }
 
 func (p *PanelControlPlane) Metrics() APIMetrics {
@@ -181,6 +198,6 @@ func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, err
 
 func (p *panelPushClient) Run(ctx context.Context) { p.inner.Run(ctx) }
 func (p *panelPushClient) IsConnected() bool       { return p.inner.IsConnected() }
-func (p *panelPushClient) SendDeviceReport(devices map[int][]string) bool {
-	return p.inner.SendDeviceReport(devices)
+func (p *panelPushClient) SendDeviceReport(devices map[int][]string, sequence int64) bool {
+	return p.inner.SendDeviceReport(devices, sequence)
 }

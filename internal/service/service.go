@@ -28,7 +28,11 @@ import (
 	"github.com/cedar2025/xboard-node/internal/tracker"
 )
 
-const defaultWSReconcileInterval = 5 * time.Minute
+const (
+	defaultWSReconcileInterval  = 5 * time.Minute
+	globalDeviceRefreshInterval = 120 * time.Second
+	globalDeviceRetryInterval   = 30 * time.Second
+)
 
 type Service struct {
 	cfg          *config.Config
@@ -59,23 +63,47 @@ type Service struct {
 	// WebSocket is connected. Disconnected polling still uses pullInterval.
 	wsReconcileInterval time.Duration
 
-	lastUserHash   string     // hash of user list for change detection
-	lastConfigHash string     // hash of full config for change detection
-	wsUserRevision uint64     // increments when a WS user update is applied
-	pullBackoff    apiBackoff // backoff for panel pull failures
-	pushBackoff    apiBackoff // backoff for panel push failures
-	deviceBackoff  apiBackoff // backoff for REST device-report failures
+	lastUserHash     string // hash of user list for change detection
+	lastConfigHash   string // hash of full config for change detection
+	wsUserRevision   uint64 // increments when a WS user update is applied
+	wsDeviceRevision uint64 // increments when a WS device snapshot is applied
+	// restDeviceFetchRevision orders overlapping REST global-device snapshots.
+	// Results are applied monotonically, while deviceFetchFloor fences reads that
+	// began before a completed device report.
+	restDeviceFetchRevision    atomic.Uint64
+	deviceFetchFloor           atomic.Uint64
+	appliedDeviceFetchRevision uint64
+	pullBackoff                apiBackoff // backoff for panel pull failures
+	pushBackoff                apiBackoff // backoff for panel push failures
+	deviceBackoff              apiBackoff // backoff for REST device-report failures
 
 	// Active flags prevent overlapping goroutines for each independent report.
-	pushActive       atomic.Bool
-	devicePushActive atomic.Bool
-	pullActive       atomic.Bool
+	pushActive              atomic.Bool
+	devicePushActive        atomic.Bool
+	deviceFetchActive       atomic.Bool
+	deviceFetchPending      atomic.Bool
+	pendingDeviceWSRevision atomic.Uint64
+	nextDeviceFetchAt       atomic.Int64
+	pullActive              atomic.Bool
+	// deviceSequence is shared by REST and WS reports. New panels reserve a
+	// process-specific block; old panels fall back to a wall-clock seed.
+	deviceSequence atomic.Int64
+	// deviceWSResyncPending is set when a WS snapshot must wait for an
+	// in-flight REST device report. Waiting for its response prevents an older
+	// REST snapshot from arriving after and overwriting the reconnect snapshot.
+	deviceWSResyncPending atomic.Bool
 	// restDevicesSeeded is reset while WS is active. The first REST device
-	// report after startup or a WS-to-REST transition seeds tombstones for the
-	// current user set so stale state from an earlier process is removed.
+	// report after startup or a WS-to-REST transition is a full snapshot so
+	// stale state from an earlier process is removed, including an empty node.
 	restDevicesSeeded atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
+	// deviceReportDone wakes the main loop after a REST device report finishes,
+	// so any deferred WS snapshot is sent in transport order.
+	deviceReportDone chan struct{}
+	// deviceSnapshotResults delivers the lightweight global-device refresh that
+	// follows each successful REST device report back to the main goroutine.
+	deviceSnapshotResults chan deviceSnapshotResult
 
 	wsClient         controlplane.PushClient        // Push client (nil if push is not enabled)
 	wsEvents         chan controlplane.Event        // receives data events from push transport
@@ -83,6 +111,7 @@ type Service struct {
 	wsCancel         context.CancelFunc             // cancels the WS client goroutine
 	wsDisconnectAt   time.Time                      // when WS last disconnected (zero if connected)
 	wsResyncPending  atomic.Bool
+	globalDevices    map[int][]string
 	machineMailbox   *controlplane.NodeMailbox
 	machineMailboxCh <-chan struct{}
 
@@ -92,18 +121,28 @@ type Service struct {
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
 type pullResult struct {
-	config         *model.NodeSpec
-	users          []model.UserSpec
-	configHash     string
-	userHash       string
-	wsUserRevision uint64
-	certChanged    bool
+	config              *model.NodeSpec
+	users               []model.UserSpec
+	configHash          string
+	userHash            string
+	wsUserRevision      uint64
+	wsDeviceRevision    uint64
+	deviceFetchRevision uint64
+	deviceUsers         map[int][]string
+	certChanged         bool
+}
+
+type deviceSnapshotResult struct {
+	users               map[int][]string
+	wsDeviceRevision    uint64
+	deviceFetchRevision uint64
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
 type apiBackoff struct {
 	mu            sync.Mutex
 	skipRemaining int
+	maxSkip       int // 0 = default cap 8; <0 = no extra skips
 }
 
 func (b *apiBackoff) shouldSkip() bool {
@@ -125,10 +164,54 @@ func (b *apiBackoff) onSuccess() {
 func (b *apiBackoff) onFailure() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.maxSkip < 0 {
+		return
+	}
+	cap := b.maxSkip
+	if cap == 0 {
+		cap = 8
+	}
 	if b.skipRemaining <= 0 {
 		b.skipRemaining = 1
-	} else if b.skipRemaining < 8 {
+		return
+	}
+	if b.skipRemaining < cap {
 		b.skipRemaining *= 2
+		if b.skipRemaining > cap {
+			b.skipRemaining = cap
+		}
+	}
+}
+
+// deviceBackoffForInterval caps skip ticks so retries stay well under the
+// panel's 300s device TTL. maxSkip < 0 means retry every tick.
+func deviceBackoffForInterval(intervalSec int) apiBackoff {
+	const maxGapSec = 90
+	if intervalSec <= 0 {
+		return apiBackoff{}
+	}
+	maxSkip := maxGapSec / intervalSec
+	if maxSkip > 8 {
+		maxSkip = 8
+	}
+	if maxSkip < 1 {
+		return apiBackoff{maxSkip: -1}
+	}
+	return apiBackoff{maxSkip: maxSkip}
+}
+
+func (s *Service) nextDeviceSequence() int64 {
+	for {
+		current := s.deviceSequence.Load()
+		next := current + 1
+		if current == 0 {
+			// Backward-compatible fallback for panels that do not yet reserve a
+			// sequence block during handshake.
+			next = time.Now().UnixNano()
+		}
+		if s.deviceSequence.CompareAndSwap(current, next) {
+			return next
+		}
 	}
 }
 
@@ -167,18 +250,21 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	st := limiter.NewSpeedTracker(l)
 
 	return &Service{
-		cfg:                 cfg,
-		source:              cp,
-		sink:                cp,
-		kernel:              k,
-		tracker:             tracker.New(),
-		limiter:             l,
-		speedTracker:        st,
-		cert:                certMgr,
-		wsEvents:            make(chan controlplane.Event, 16),
-		wsStatusCh:          make(chan controlplane.StatusChange, 4),
-		pullResults:         make(chan pullResult, 1),
-		wsReconcileInterval: defaultWSReconcileInterval,
+		cfg:                   cfg,
+		source:                cp,
+		sink:                  cp,
+		kernel:                k,
+		tracker:               tracker.New(),
+		limiter:               l,
+		speedTracker:          st,
+		cert:                  certMgr,
+		wsEvents:              make(chan controlplane.Event, 16),
+		wsStatusCh:            make(chan controlplane.StatusChange, 4),
+		pullResults:           make(chan pullResult, 1),
+		deviceReportDone:      make(chan struct{}, 1),
+		deviceSnapshotResults: make(chan deviceSnapshotResult, 1),
+		wsReconcileInterval:   defaultWSReconcileInterval,
+		deviceBackoff:         deviceBackoffForInterval(cfg.Node.DeviceReportInterval),
 	}
 }
 
@@ -227,7 +313,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// REST-only nodes clear any device state left by an earlier process without
 	// waiting for the first device-report tick. The request is asynchronous.
 	if s.wsClient == nil {
-		s.reportDevices()
+		s.reportDevices(ctx)
 	}
 
 	for {
@@ -243,7 +329,7 @@ func (s *Service) Run(ctx context.Context) error {
 			s.pushReportAsync()
 
 		case <-deviceReportTicker.C:
-			s.reportDevices()
+			s.reportDevices(ctx)
 
 		case <-pullTicker.C:
 			if s.wsClient != nil && s.wsClient.IsConnected() {
@@ -264,6 +350,21 @@ func (s *Service) Run(ctx context.Context) error {
 
 		case result := <-s.pullResults:
 			s.applyPullResult(ctx, result)
+
+		case <-s.deviceReportDone:
+			if s.deviceWSResyncPending.Swap(false) {
+				s.reportDevices(ctx)
+			}
+
+		case result := <-s.deviceSnapshotResults:
+			if result.wsDeviceRevision == s.wsDeviceRevision &&
+				result.deviceFetchRevision >= s.deviceFetchFloor.Load() &&
+				result.deviceFetchRevision > s.appliedDeviceFetchRevision {
+				s.applyGlobalDevices(result.users)
+				s.appliedDeviceFetchRevision = result.deviceFetchRevision
+			} else {
+				nlog.Core().Debug("discarding stale REST device snapshot")
+			}
 
 		case <-wsDiscoveryTicker.C:
 			s.wsDiscovery(ctx)
@@ -288,6 +389,12 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
 	if err != nil {
 		return err
+	}
+	if bootstrap.DeviceSequenceBase > 0 {
+		s.deviceSequence.Store(bootstrap.DeviceSequenceBase)
+	}
+	if bootstrap.DeviceUsers != nil {
+		s.applyGlobalDevices(bootstrap.DeviceUsers)
 	}
 
 	if s.cfg.Node.PushInterval == 0 && bootstrap.PushInterval > 0 {
@@ -474,14 +581,20 @@ func (s *Service) wsMetrics() map[string]interface{} {
 }
 
 // handleWSStatus reacts to WS connectivity changes.
-
-// - On disconnect: record timestamp, immediately REST poll.
-// - On reconnect: clear disconnect timestamp, REST poll to catch missed events.
+//
+//   - On disconnect: record timestamp, REST poll, and immediately re-push devices
+//     (the panel cleared this node's entries on WS close).
+//   - On reconnect: clear disconnect timestamp, REST poll, and immediately WS-push devices.
 func (s *Service) handleWSStatus(ctx context.Context, status controlplane.StatusChange) {
 	if status.NeedsResync {
 		s.requestWSResync(ctx, "drop_detected")
 	}
 	if status.Connected {
+		// Fence every REST global-device read launched while disconnected. The
+		// lightweight refresh below is pending-aware, so reconnect cannot retain
+		// a pre-reconnect response even when an older GET is still in flight.
+		s.wsDeviceRevision++
+		s.refreshGlobalDevicesAsync(ctx, s.wsDeviceRevision, false, true)
 		s.metricsMu.Lock()
 		s.wsDisconnectAt = time.Time{}
 		s.metricsMu.Unlock()
@@ -491,27 +604,31 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		} else {
 			nlog.Core().Info("ws connected")
 		}
-		// After reconnect, proactively pull once to ensure we haven't missed
-		// any updates during the disconnection window. Device state needs no
-		// special handling here: the WS path sends the full snapshot every
-		// tick, so the panel (which cleared this node's devices on disconnect)
-		// converges within one report interval.
-		s.pullViaAPIAsync(ctx)
 	} else {
+		firstDisconnect := false
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
 			s.wsDisconnectAt = time.Now()
+			firstDisconnect = true
 		}
 		s.metricsMu.Unlock()
-		if s.nodeLog != nil {
-			s.nodeLog.Info("ws disconnected")
-		} else {
-			nlog.Core().Info("ws disconnected")
+		if firstDisconnect {
+			if s.nodeLog != nil {
+				s.nodeLog.Info("ws disconnected")
+			} else {
+				nlog.Core().Info("ws disconnected")
+			}
+			s.globalDevices = nil
+			s.kernel.ClearGlobalDevices()
+			// Fence any REST device poll that started before this disconnect; its
+			// snapshot predates the cleared transport state and must not be reapplied.
+			s.wsDeviceRevision++
 		}
-		// Clear global device state on disconnect
-		s.kernel.ClearGlobalDevices()
-		s.pullViaAPIAsync(ctx)
 	}
+	s.pullViaAPIAsync(ctx)
+	// Panel clears this node's devices on WS close; re-push immediately so
+	// global device limits do not wait for the next report tick.
+	s.reportDevices(ctx)
 }
 
 // wsDiscovery periodically checks WS availability:
@@ -625,7 +742,8 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 	case controlplane.EventSyncDevices:
 		// Sync global device state
 		if event.DeviceUsers != nil {
-			s.kernel.UpdateGlobalDevices(event.DeviceUsers)
+			s.wsDeviceRevision++
+			s.applyGlobalDevices(event.DeviceUsers)
 		}
 
 	default:
@@ -651,6 +769,8 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 
 	currentConfigHash := s.lastConfigHash
 	currentWSUserRevision := s.wsUserRevision
+	currentWSDeviceRevision := s.wsDeviceRevision
+	currentDeviceFetchRevision := s.restDeviceFetchRevision.Add(1)
 	certChanged := s.cert.CertRenewed()
 
 	go func() {
@@ -664,8 +784,11 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		s.pullBackoff.onSuccess()
 
 		result := pullResult{
-			certChanged:    certChanged,
-			wsUserRevision: currentWSUserRevision,
+			certChanged:         certChanged,
+			wsUserRevision:      currentWSUserRevision,
+			wsDeviceRevision:    currentWSDeviceRevision,
+			deviceFetchRevision: currentDeviceFetchRevision,
+			deviceUsers:         snapshot.DeviceUsers,
 		}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
@@ -690,6 +813,16 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	s.wsResyncPending.Store(false)
 	configChanged := false
+	if result.deviceUsers != nil {
+		if result.wsDeviceRevision == s.wsDeviceRevision &&
+			result.deviceFetchRevision >= s.deviceFetchFloor.Load() &&
+			result.deviceFetchRevision > s.appliedDeviceFetchRevision {
+			s.applyGlobalDevices(result.deviceUsers)
+			s.appliedDeviceFetchRevision = result.deviceFetchRevision
+		} else {
+			nlog.Core().Debug("discarding stale polled devices")
+		}
+	}
 
 	if result.certChanged {
 		nlog.Core().Info("certificate renewed, kernel restart needed")
@@ -779,6 +912,15 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 	s.lastUserHash = hash
 }
 
+func (s *Service) applyGlobalDevices(users map[int][]string) {
+	copyUsers := make(map[int][]string, len(users))
+	for userID, ips := range users {
+		copyUsers[userID] = append([]string(nil), ips...)
+	}
+	s.globalDevices = copyUsers
+	s.kernel.UpdateGlobalDevices(copyUsers)
+}
+
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
@@ -789,6 +931,9 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
+	if s.globalDevices != nil {
+		s.kernel.UpdateGlobalDevices(s.globalDevices)
+	}
 
 	// Initialize node logger on first successful start
 	if s.nodeLog == nil {
@@ -1057,51 +1202,147 @@ func (s *Service) pushReportAsync() {
 // pushAliveReportAsync sends the REST device snapshot on its own bounded
 // schedule. It deliberately does not share the normal status-report gate or
 // backoff, so a slow/rare push_interval cannot let panel device state expire.
-func (s *Service) pushAliveReportAsync() {
+func (s *Service) pushAliveReportAsync(fullSnapshot bool) bool {
 	if !s.sink.SupportsReporting() {
-		return
+		return false
 	}
 	if !s.devicePushActive.CompareAndSwap(false, true) {
 		nlog.Core().Debug("device report already in progress, skipping")
-		return
+		return false
 	}
 	if s.deviceBackoff.shouldSkip() {
 		nlog.Core().Debug("skipping device report due to backoff")
 		s.devicePushActive.Store(false)
-		return
+		return false
 	}
 
-	aliveIPs := s.tracker.FlushAliveIPs()
+	var aliveIPs map[int][]string
+	if fullSnapshot {
+		aliveIPs = s.tracker.SnapshotAliveIPs()
+	} else {
+		aliveIPs = s.tracker.FlushAliveIPs()
+	}
 	if aliveIPs == nil {
 		s.devicePushActive.Store(false)
-		return
+		return false
 	}
+	sequence := s.nextDeviceSequence()
+	wsDeviceRevision := s.wsDeviceRevision
 
 	go func() {
-		defer s.devicePushActive.Store(false)
-		if err := s.sink.ReportAlive(aliveIPs); err != nil {
+		defer func() {
+			s.devicePushActive.Store(false)
+			select {
+			case s.deviceReportDone <- struct{}{}:
+			default:
+			}
+		}()
+		// Global-device reads run on every REST device tick, including failed
+		// or skipped delta cycles. When a report is sent, start the read only
+		// after its response so this node cannot re-apply its pre-report state.
+		defer s.refreshGlobalDevicesAsync(context.Background(), wsDeviceRevision, true, true)
+		if err := s.sink.ReportAlive(aliveIPs, sequence, fullSnapshot); err != nil {
 			nlog.Core().Warn("failed to push device report", "error", err)
-			s.tracker.RestoreAliveIPs(aliveIPs)
+			if fullSnapshot {
+				s.restDevicesSeeded.Store(false)
+			} else {
+				s.tracker.RestoreAliveIPs(aliveIPs)
+			}
 			s.deviceBackoff.onFailure()
 			return
+		}
+		if fullSnapshot {
+			s.tracker.CommitAliveIPsSnapshot(aliveIPs)
 		}
 		s.deviceBackoff.onSuccess()
 		nlog.Core().Debug("REST device snapshot sent", "users", len(aliveIPs))
 	}()
+	return true
 }
 
-// flushAliveIPsForHTTP flushes the alive-IPs snapshot for the HTTP report,
-// unless the WS report.devices path is active: while connected, WS delivers
-// the full snapshot every tick, so an HTTP report would be redundant load on
-// the panel. The flush cursor is used only by this HTTP path (WS keeps no
-// dedup state), so the IsConnected check racing a reconnect costs at most one
-// redundant or deferred HTTP report — the aliveResendInterval resend and the
-// per-tick WS snapshot both bound the drift.
-func (s *Service) flushAliveIPsForHTTP() map[int][]string {
-	if s.sink.SupportsDeviceReports() && s.wsClient != nil && s.wsClient.IsConnected() {
-		return nil
+func (s *Service) refreshGlobalDevicesAsync(
+	ctx context.Context,
+	wsDeviceRevision uint64,
+	fenceOlder bool,
+	force bool,
+) {
+	deviceSource, ok := s.source.(controlplane.DeviceSnapshotSource)
+	if !ok {
+		return
 	}
-	return s.tracker.FlushAliveIPs()
+	now := time.Now()
+	if force {
+		s.nextDeviceFetchAt.Store(now.Add(globalDeviceRefreshInterval).UnixNano())
+	} else {
+		nowUnixNano := now.UnixNano()
+		for {
+			nextFetchAt := s.nextDeviceFetchAt.Load()
+			if nextFetchAt > nowUnixNano {
+				return
+			}
+			if s.nextDeviceFetchAt.CompareAndSwap(
+				nextFetchAt,
+				now.Add(globalDeviceRefreshInterval).UnixNano(),
+			) {
+				break
+			}
+		}
+	}
+	deviceFetchRevision := s.restDeviceFetchRevision.Add(1)
+	if fenceOlder {
+		for {
+			floor := s.deviceFetchFloor.Load()
+			if floor >= deviceFetchRevision || s.deviceFetchFloor.CompareAndSwap(floor, deviceFetchRevision) {
+				break
+			}
+		}
+	}
+	s.pendingDeviceWSRevision.Store(wsDeviceRevision)
+	if !s.deviceFetchActive.CompareAndSwap(false, true) {
+		s.deviceFetchPending.Store(true)
+		return
+	}
+
+	go func() {
+		defer func() {
+			s.deviceFetchActive.Store(false)
+			if s.deviceFetchPending.Swap(false) {
+				s.refreshGlobalDevicesAsync(
+					context.Background(),
+					s.pendingDeviceWSRevision.Load(),
+					false,
+					true,
+				)
+			}
+		}()
+		users, err := deviceSource.FetchDevices(ctx)
+		if err != nil {
+			s.nextDeviceFetchAt.Store(time.Now().Add(globalDeviceRetryInterval).UnixNano())
+			nlog.Core().Warn("failed to refresh global devices", "error", err)
+			return
+		}
+		s.nextDeviceFetchAt.Store(time.Now().Add(globalDeviceRefreshInterval).UnixNano())
+		if users == nil {
+			return
+		}
+		result := deviceSnapshotResult{
+			users:               users,
+			wsDeviceRevision:    wsDeviceRevision,
+			deviceFetchRevision: deviceFetchRevision,
+		}
+		select {
+		case s.deviceSnapshotResults <- result:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// shutdownAliveIPsForHTTP returns a sequenced empty full snapshot for every
+// panel-backed service. This removes the stopped node immediately instead of
+// refreshing its devices for another TTL window. It is also required in machine
+// mode, where stopping one node does not close the shared WebSocket.
+func (s *Service) shutdownAliveIPsForHTTP() map[int][]string {
+	return map[int][]string{}
 }
 
 // pushReportSync is used only during shutdown to ensure final data is sent.
@@ -1110,14 +1351,19 @@ func (s *Service) pushReportSync() {
 		return
 	}
 	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.flushAliveIPsForHTTP()
+	aliveIPs := s.shutdownAliveIPsForHTTP()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
 
-	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 		nlog.Core().Warn("failed to push final report", "error", err)
+	}
+	if aliveIPs != nil {
+		if err := s.sink.ReportAlive(aliveIPs, s.nextDeviceSequence(), true); err != nil {
+			nlog.Core().Warn("failed to push final device report", "error", err)
+		}
 	}
 }
 
@@ -1238,14 +1484,11 @@ func (s *Service) sendDeviceBatch() {
 		return
 	}
 
-	// Send the full snapshot every tick, with no change-detection: the panel's
-	// WS handler diffs against its own state, each report refreshes the
-	// panel-side device TTL, and peer nodes receive the resulting sync.devices
-	// within one report interval — which is what keeps the strict multi-node
-	// device limit converging. A report lost in flight (queue full, connection
-	// dying) is simply superseded by the next tick.
+	// Full snapshot every tick. The panel diffs and refreshes the 300s TTL;
+	// a lost report is superseded by the next tick.
 	devices := s.tracker.SnapshotAliveIPs()
-	if !s.sink.ReportDevices(s.wsClient, devices) {
+	sequence := s.nextDeviceSequence()
+	if !s.sink.ReportDevices(s.wsClient, devices, sequence) {
 		nlog.Core().Warn("device snapshot not sent, next tick resends", "users", len(devices))
 		return
 	}
@@ -1255,27 +1498,31 @@ func (s *Service) sendDeviceBatch() {
 // reportDevices periodically reports the device snapshot over WS when it is
 // connected, otherwise through the REST report endpoint on the same bounded
 // device_report_interval schedule.
-func (s *Service) reportDevices() {
+func (s *Service) reportDevices(ctx context.Context) {
 	if !s.sink.SupportsReporting() {
 		return
 	}
 	if s.sink.SupportsDeviceReports() && s.wsClient != nil && s.wsClient.IsConnected() {
 		s.restDevicesSeeded.Store(false)
+		if s.devicePushActive.Load() {
+			s.deviceWSResyncPending.Store(true)
+			nlog.Core().Debug("deferring WS device snapshot until REST report completes")
+			return
+		}
+		s.deviceWSResyncPending.Store(false)
 		s.sendDeviceBatch()
 		return
 	}
 
 	if s.restDevicesSeeded.CompareAndSwap(false, true) {
-		s.metricsMu.RLock()
-		users := append([]model.UserSpec(nil), s.lastUsers...)
-		s.metricsMu.RUnlock()
-		userIDs := make([]int, 0, len(users))
-		for _, user := range users {
-			userIDs = append(userIDs, user.ID)
+		if !s.pushAliveReportAsync(true) && !s.devicePushActive.Load() {
+			s.refreshGlobalDevicesAsync(ctx, s.wsDeviceRevision, false, false)
 		}
-		s.tracker.SeedAliveUsers(userIDs)
+		return
 	}
-	s.pushAliveReportAsync()
+	if !s.pushAliveReportAsync(false) && !s.devicePushActive.Load() {
+		s.refreshGlobalDevicesAsync(ctx, s.wsDeviceRevision, false, false)
+	}
 }
 
 // ─── Runtime validation ─────────────────────────────────────────────────

@@ -54,7 +54,7 @@ func (p *MachinePanelControlPlane) Initial(
 	// In machine mode the orchestrator handles the shared WS handshake, but each
 	// node service still needs one initial REST snapshot so newly discovered nodes
 	// can start immediately instead of waiting for a subsequent WS full-sync.
-	hs, err := p.client.Handshake()
+	hs, err := p.client.HandshakeWithDeviceSequence()
 	if err != nil {
 		nlog.Core().Debug("machine node handshake skipped, using REST", "error", err)
 	}
@@ -63,6 +63,7 @@ func (p *MachinePanelControlPlane) Initial(
 	if hs != nil {
 		bootstrap.PushInterval = hs.Settings.PushInterval
 		bootstrap.PullInterval = hs.Settings.PullInterval
+		bootstrap.DeviceSequenceBase = hs.DeviceSequenceBase
 	}
 
 	configSnapshot, err := p.client.GetConfig()
@@ -81,6 +82,10 @@ func (p *MachinePanelControlPlane) Initial(
 		return Bootstrap{}, fmt.Errorf("machine initial config normalize: %w", err)
 	}
 	bootstrap.Users = model.UserSpecsFromPanel(users)
+	bootstrap.DeviceUsers, err = p.client.GetDevices()
+	if err != nil {
+		return Bootstrap{}, fmt.Errorf("machine initial devices: %w", err)
+	}
 
 	// Register mailbox access after the initial snapshot is prepared, so the
 	// Service can start the kernel immediately and only then drain coalesced WS
@@ -116,6 +121,15 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
 }
 
+func (p *MachinePanelControlPlane) FetchDevices(ctx context.Context) (map[int][]string, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	return p.client.GetDevices()
+}
+
 func (p *MachinePanelControlPlane) Discover(
 	ctx context.Context,
 	metricsFn func() map[string]interface{},
@@ -133,12 +147,12 @@ func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
 	)
 }
 
-func (p *MachinePanelControlPlane) ReportAlive(alive map[int][]string) error {
-	return p.client.PushAlive(alive)
+func (p *MachinePanelControlPlane) ReportAlive(alive map[int][]string, sequence int64, fullSnapshot bool) error {
+	return p.client.ReportAlive(alive, sequence, fullSnapshot)
 }
 
-func (p *MachinePanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) bool {
-	return push != nil && push.SendDeviceReport(devices)
+func (p *MachinePanelControlPlane) ReportDevices(push PushClient, devices map[int][]string, sequence int64) bool {
+	return push != nil && push.SendDeviceReport(devices, sequence)
 }
 
 func (p *MachinePanelControlPlane) Metrics() APIMetrics {
