@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/buf"
 	singM "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -329,6 +330,17 @@ func (t *ConnTracker) RoutedPacketConnection(
 	}
 
 	return tpc
+}
+
+// RoutedFlow is called for flows that sing-box offloads in the tun pre-match
+// path. Panel nodes only run proxy inbounds, which go through
+// RoutedConnection and RoutedPacketConnection, so there is nothing to track.
+func (t *ConnTracker) RoutedFlow(
+	_ context.Context,
+	_ adapter.InboundContext,
+	_ adapter.Rule, _ adapter.Outbound,
+) tun.FlowTracker {
+	return nil
 }
 
 // admitConn is the single admission path shared by the TCP and UDP trackers.
