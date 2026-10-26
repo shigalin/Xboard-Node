@@ -26,7 +26,7 @@
 #       level: "debug"   # override for this instance only
 
 # ── Device (IP) limit ──
-# Enforced by the sing-box kernel: a user may use at most `device_limit`
+# Shared by sing-box and Xray: a user may use at most `device_limit`
 # distinct source IPs (pushed per user by the panel). When the limit is
 # breached, ALL of that user's connections are force-closed and every new
 # connection is refused for `device_limit_cooldown` seconds.

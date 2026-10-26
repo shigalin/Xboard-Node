@@ -15,9 +15,9 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -32,8 +32,9 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
@@ -68,6 +69,9 @@ type Xray struct {
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
 	speedLimitFunc  func(string) *rate.Limiter
+	deviceLimitFunc func(string) (int, bool)
+	globalDevices   map[int][]string
+	globalDevicesAt time.Time // when globalDevices was received from the panel
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -89,8 +93,8 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 		DeviceLimit:          true,
 		BuiltInTrafficStats:  true,
 		AliveIPTracking:      true,
-		ForceCloseConnection: false,
-		ForceCloseUser:       false,
+		ForceCloseConnection: true,
+		ForceCloseUser:       true,
 	}
 }
 
@@ -136,6 +140,8 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	if err != nil {
 		return fmt.Errorf("create xray: %w", err)
 	}
+	// Configure admission before listeners can accept their first connection.
+	x.configureDispatcher(ld, users)
 
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
 	if err := startWithTimeout(inst, startTimeout); err != nil {
@@ -223,8 +229,8 @@ func tlsEqual(a, b kernel.TLSCert) bool {
 
 // GetUserTraffic returns per-user cumulative traffic from xray's built-in
 // stats pipeline and connection state from the admission dispatcher when
-// available. The dispatcher intentionally no longer wraps transport links,
-// so traffic accounting must come from xray-core itself.
+// available. Admission tracks session lifetimes; byte accounting continues to
+// use xray-core's built-in counters.
 func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
 	if !x.running.Load() {
 		return nil, nil, 0, nil
@@ -244,14 +250,28 @@ func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliv
 	return traffic, aliveIPs, connCount, nil
 }
 
-func (x *Xray) CloseConnection(_ context.Context, _ string) error {
-	// No-op: xray doesn't support force-closing individual connections.
-	// User removal goes through RemoveUsers which removes the inbound user.
+func (x *Xray) CloseConnection(_ context.Context, id string) error {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld != nil {
+		ld.devices.CloseByID(id)
+	}
 	return nil
 }
 
-func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
-	// No-op: handled by RemoveUsers at the xray core level.
+func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld != nil {
+		ld.mu.RLock()
+		uid := ld.emailToUID[uuid]
+		ld.mu.RUnlock()
+		if uid != 0 {
+			ld.devices.CloseUser(uid)
+		}
+	}
 	return nil
 }
 
@@ -265,15 +285,38 @@ func (x *Xray) SetSpeedLimitFunc(fn func(string) *rate.Limiter) {
 	x.updateBandwidthLimits(nil)
 }
 
-// SetDeviceLimitFunc is a no-op for xray — device limits are already
-// gate-kept by LimitDispatcher.checkDeviceLimit at Dispatch time.
-func (x *Xray) SetDeviceLimitFunc(_ func(string) (int, bool)) {}
+func (x *Xray) SetDeviceLimitFunc(fn func(string) (int, bool)) {
+	x.mu.Lock()
+	x.deviceLimitFunc = fn
+	users := append([]model.UserSpec(nil), x.users...)
+	x.mu.Unlock()
+	x.updateDispatcherLimits(users)
+}
 
-// UpdateGlobalDevices is a no-op for xray — xray handles device limits differently.
-func (x *Xray) UpdateGlobalDevices(_ map[int][]string) {}
+func (x *Xray) UpdateGlobalDevices(users map[int][]string) {
+	copyUsers := make(map[int][]string, len(users))
+	for uid, ips := range users {
+		copyUsers[uid] = append([]string(nil), ips...)
+	}
+	at := time.Now()
+	x.mu.Lock()
+	x.globalDevices, x.globalDevicesAt = copyUsers, at
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld != nil {
+		ld.devices.UpdateGlobalDevicesAt(copyUsers, at)
+	}
+}
 
-// ClearGlobalDevices is a no-op for xray.
-func (x *Xray) ClearGlobalDevices() {}
+func (x *Xray) ClearGlobalDevices() {
+	x.mu.Lock()
+	x.globalDevices, x.globalDevicesAt = nil, time.Time{}
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld != nil {
+		ld.devices.ClearGlobalDevices()
+	}
+}
 
 // ─── User management (non-disruptive where possible) ────────────────────────
 
@@ -314,7 +357,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
@@ -572,7 +615,13 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 	case "shadowsocks":
 		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
 			// 2022-blake3 multi-user mode
-			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
+			keySize := 32
+			if nc.Cipher == "2022-blake3-aes-128-gcm" {
+				keySize = 16
+			}
+			key := make([]byte, keySize)
+			copy(key, u.UUID)
+			mu.Account = &ss2022.MemoryAccount{Key: key}
 		} else {
 			// Traditional SS — build via getCipher path
 			ct := parseCipherType(nc.Cipher)
@@ -602,7 +651,7 @@ func parseCipherType(cipher string) shadowsocks.CipherType {
 	case "xchacha20-ietf-poly1305", "xchacha20-poly1305":
 		return shadowsocks.CipherType_XCHACHA20_POLY1305
 	case "none", "plain":
-		return shadowsocks.CipherType_NONE
+		return shadowsocks.CipherType_UNKNOWN
 	default:
 		return shadowsocks.CipherType_AES_256_GCM
 	}
@@ -696,7 +745,7 @@ func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if ld.connCount.Load() == 0 {
+		if ld.devices.ActiveCount() == 0 {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -786,20 +835,46 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	if ld == nil {
 		return
 	}
+	x.configureDispatcher(ld, users)
+}
+
+func (x *Xray) configureDispatcher(ld *LimitDispatcher, users []model.UserSpec) {
+	if ld == nil {
+		return
+	}
+	x.mu.Lock()
+	fn, global, globalAt := x.deviceLimitFunc, x.globalDevices, x.globalDevicesAt
+	x.mu.Unlock()
+	cooldown := time.Duration(x.cfg.DeviceLimitCooldown) * time.Second
+	if cooldown <= 0 {
+		cooldown = limiter.DefaultDeviceLimitCooldown
+	}
+	ld.devices.SetCooldown(cooldown)
+	// A cached panel snapshot is reapplied only to a newly created dispatcher,
+	// keeping its receive time so a reload cannot extend its freshness window.
+	ld.mu.RLock()
+	newDispatcher := ld.emailToUID == nil
+	ld.mu.RUnlock()
+	if global != nil && newDispatcher {
+		ld.devices.UpdateGlobalDevicesAt(global, globalAt)
+	}
 
 	emailToUID := make(map[string]int, len(users)*2)
 	deviceLimits := make(map[string]int)
+	uuids := make(map[int]string, len(users))
 
 	for _, u := range users {
 		email := userEmail(u.ID)
 		emailToUID[email] = u.ID
 		emailToUID[u.UUID] = u.ID
+		uuids[u.ID] = u.UUID
 		if u.DeviceLimit > 0 {
 			deviceLimits[email] = u.DeviceLimit
 			deviceLimits[u.UUID] = u.DeviceLimit
 		}
 	}
 
+	ld.SetDeviceLimitFunc(fn, uuids)
 	ld.UpdateLimits(emailToUID, deviceLimits, nil)
 }
 

@@ -95,7 +95,7 @@ type Kernel interface {
 	SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter)
 	// SetDeviceLimitFunc configures per-user device limit gate-keeping.
 	// The function resolves a user UUID to (limit, hasLimit).
-	// Kernels that already gate-keep internally (e.g. xray) may no-op.
+	// Both kernels pass this lookup to the shared online-IP admission logic.
 	SetDeviceLimitFunc(fn func(uuid string) (int, bool))
 	// UpdateGlobalDevices updates the global device state from panel (for multi-node).
 	UpdateGlobalDevices(users map[int][]string)

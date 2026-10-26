@@ -1,9 +1,10 @@
 package xray
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
-	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -12,8 +13,42 @@ import (
 	xrayCore "github.com/xtls/xray-core/core"
 	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	xraystats "github.com/xtls/xray-core/features/stats"
+	ss2022 "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"golang.org/x/time/rate"
 )
+
+func TestToMemoryUserSS2022MatchesInitialConfig(t *testing.T) {
+	user := model.UserSpec{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}
+	for _, cipher := range []string{"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"} {
+		t.Run(cipher, func(t *testing.T) {
+			nc := &model.NodeSpec{Cipher: cipher}
+			inbound := buildShadowsocks(M{}, nc, []model.UserSpec{user})
+			clients := inbound["settings"].(M)["clients"].([]M)
+			initialKey, err := base64.StdEncoding.DecodeString(clients[0]["password"].(string))
+			if err != nil {
+				t.Fatal(err)
+			}
+			memoryUser, err := toMemoryUser("shadowsocks", nc, user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(memoryUser.Account.(*ss2022.MemoryAccount).Key, initialKey) {
+				t.Fatal("dynamic SS2022 user key differs from initial config")
+			}
+		})
+	}
+}
+
+func TestToMemoryUserRejectsRemovedShadowsocksCiphers(t *testing.T) {
+	for _, cipher := range []string{"none", "plain"} {
+		t.Run(cipher, func(t *testing.T) {
+			_, err := toMemoryUser("shadowsocks", &model.NodeSpec{Cipher: cipher}, model.UserSpec{ID: 1, UUID: "test"})
+			if err == nil {
+				t.Fatal("expected removed Shadowsocks cipher to be rejected")
+			}
+		})
+	}
+}
 
 func newStatsManager(t *testing.T) xraystats.Manager {
 	t.Helper()
@@ -63,15 +98,15 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 	email1 := userEmail(1)
 	email2 := userEmail(2)
 	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
-	ld.mu.Lock()
-	ld.limitedIPs[email1] = map[string]int{"1.1.1.1": 1}
-	ld.mu.Unlock()
-	ref := &atomic.Int64{}
-	ref.Store(1)
-	ic := &ipCounter{}
-	ic.ips.Store("2.2.2.2", ref)
-	ld.unlimitedIPs.Store(email2, ic)
-	ld.connCount.Store(7)
+	for i := 0; i < 7; i++ {
+		uid, ip := 1, "1.1.1.1"
+		if i == 6 {
+			uid, ip = 2, "2.2.2.2"
+		}
+		if _, err := ld.devices.Acquire(uid, ip, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	x, mgr := newStatsBackedXray(t, users, ld)
 	up1 := mustRegisterCounter(t, mgr, counterName(1, "uplink"))
@@ -162,18 +197,16 @@ func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
 	}
 }
 
-
 func TestXrayCapabilities(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	caps := x.Capabilities()
 	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking {
 		t.Fatalf("unexpected positive xray capabilities: %+v", caps)
 	}
-	if caps.ForceCloseConnection || caps.ForceCloseUser {
+	if !caps.ForceCloseConnection || !caps.ForceCloseUser {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -189,7 +222,6 @@ func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 		t.Fatal("expected patched bandwidth feature to receive user limiter")
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -213,7 +245,6 @@ func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	}
 }
 
-
 func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 	inst := new(xrayCore.Instance)
 	bm := featurebandwidth.New()
@@ -228,7 +259,6 @@ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 		t.Fatal("expected fallback limiter derived from user speed")
 	}
 }
-
 
 func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})

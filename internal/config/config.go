@@ -135,7 +135,7 @@ type KernelConfig struct {
 	// the window expires.
 	//   0  → use the default (60)
 	// Maximum 86400 (one day); larger values are rejected at load.
-	// sing-box kernel only; xray ignores it.
+	// Shared by the sing-box and xray kernels.
 	DeviceLimitCooldown int `yaml:"device_limit_cooldown"`
 
 	// CustomOutbound adds outbound entries to the generated kernel config.

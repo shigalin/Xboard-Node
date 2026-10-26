@@ -1,235 +1,297 @@
 package xray
 
 import (
-	"sync/atomic"
+	"context"
+	"errors"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/pipe"
 )
 
 func newTestDispatcher() *LimitDispatcher {
-	return &LimitDispatcher{
-		limitedIPs: make(map[string]map[string]int),
-	}
+	return &LimitDispatcher{devices: limiter.NewDeviceManager(0)}
 }
 
 type nopReader struct{}
 
 func (nopReader) ReadMultiBuffer() (buf.MultiBuffer, error) { return nil, nil }
 
-func TestLimitDispatcher_DeviceLimitCheck(t *testing.T) {
-	ld := newTestDispatcher()
+type signalWriter struct {
+	once   sync.Once
+	closed chan struct{}
+}
 
-	users := []model.UserSpec{
-		{ID: 1, UUID: "uuid-1", DeviceLimit: 2, SpeedLimit: 0},
-		{ID: 2, UUID: "uuid-2", DeviceLimit: 0, SpeedLimit: 10},
+func (w *signalWriter) WriteMultiBuffer(mb buf.MultiBuffer) error { buf.ReleaseMulti(mb); return nil }
+func (w *signalWriter) Close() error                              { w.once.Do(func() { close(w.closed) }); return nil }
+func (w *signalWriter) Interrupt()                                { w.Close() }
+
+type testInnerDispatcher struct {
+	link         *transport.Link
+	err          error
+	beforeReturn func()
+	observer     routing.SessionLifecycle
+	onLink       func(context.Context) error
+}
+
+func (d *testInnerDispatcher) Type() interface{} { return nil }
+func (d *testInnerDispatcher) Start() error      { return nil }
+func (d *testInnerDispatcher) Close() error      { return nil }
+func (d *testInnerDispatcher) Dispatch(ctx context.Context, _ net.Destination) (*transport.Link, error) {
+	d.observer = routing.SessionLifecycleFromContext(ctx)
+	if d.beforeReturn != nil {
+		d.beforeReturn()
 	}
-
-	emailToUID := make(map[string]int)
-	deviceLimits := make(map[string]int)
-	speedLimits := make(map[string]int)
-	for _, u := range users {
-		email := userEmail(u.ID)
-		emailToUID[email] = u.ID
-		if u.DeviceLimit > 0 {
-			deviceLimits[email] = u.DeviceLimit
-		}
-		if u.SpeedLimit > 0 {
-			speedLimits[email] = u.SpeedLimit
-		}
+	return d.link, d.err
+}
+func (d *testInnerDispatcher) DispatchLink(ctx context.Context, _ net.Destination, _ *transport.Link) error {
+	if d.onLink != nil {
+		return d.onLink(ctx)
 	}
-	ld.UpdateLimits(emailToUID, deviceLimits, speedLimits)
+	return d.err
+}
 
-	email1 := userEmail(1)
-
-	// First IP should be allowed
-	if ld.checkDeviceLimit(email1, "1.1.1.1", true) {
-		t.Error("first IP should be allowed")
+func userContext(uid int, ip string) context.Context {
+	return session.ContextWithInbound(context.Background(), &session.Inbound{
+		User:   &protocol.MemoryUser{Email: userEmail(uid)},
+		Source: net.TCPDestination(net.ParseAddress(ip), 12345),
+	})
+}
+func target(udp bool) net.Destination {
+	if udp {
+		return net.UDPDestination(net.ParseAddress("8.8.8.8"), 53)
 	}
-
-	// Second IP should be allowed (limit=2)
-	if ld.checkDeviceLimit(email1, "2.2.2.2", true) {
-		t.Error("second IP should be allowed")
-	}
-
-	// Third unique IP should be rejected
-	if !ld.checkDeviceLimit(email1, "3.3.3.3", true) {
-		t.Error("third IP should be rejected (limit=2)")
-	}
-
-	// Same IP as first should be allowed (already connected)
-	if ld.checkDeviceLimit(email1, "1.1.1.1", true) {
-		t.Error("same IP should always be allowed")
-	}
-
-	// User 2 has no device limit — should always be allowed
-	email2 := userEmail(2)
-	for i := 0; i < 10; i++ {
-		ip := "10.0.0." + string(rune('0'+i))
-		if ld.checkDeviceLimit(email2, ip, true) {
-			t.Errorf("user with no device limit should always be allowed (ip=%s)", ip)
-		}
+	return net.TCPDestination(net.ParseAddress("8.8.8.8"), 443)
+}
+func testLink() (*transport.Link, *signalWriter) {
+	reader, _ := pipe.New()
+	writer := &signalWriter{closed: make(chan struct{})}
+	return &transport.Link{Reader: reader, Writer: writer}, writer
+}
+func waitWriter(t *testing.T, writer *signalWriter) {
+	t.Helper()
+	select {
+	case <-writer.closed:
+	case <-time.After(time.Second):
+		t.Fatal("active link was not terminated")
 	}
 }
 
-func TestLimitDispatcher_DelConn(t *testing.T) {
-	ld := newTestDispatcher()
-
-	email := userEmail(1)
-	deviceLimits := map[string]int{email: 2}
-	ld.UpdateLimits(map[string]int{email: 1}, deviceLimits, nil)
-
-	// Add 2 IPs
-	ld.checkDeviceLimit(email, "1.1.1.1", true)
-	ld.checkDeviceLimit(email, "2.2.2.2", true)
-
-	// Third should be rejected
-	if !ld.checkDeviceLimit(email, "3.3.3.3", true) {
-		t.Error("third IP should be rejected")
-	}
-
-	// Remove first IP
-	ld.delConn(email, "1.1.1.1")
-
-	// Now third IP should be allowed
-	if ld.checkDeviceLimit(email, "3.3.3.3", true) {
-		t.Error("after deleting one IP, new IP should be allowed")
-	}
-}
-
-func TestLimitDispatcher_GetConnectionState(t *testing.T) {
-	ld := newTestDispatcher()
-
-	email1 := userEmail(1)
-	email2 := userEmail(2)
-	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
-
-	ic1 := &ipCounter{}
-	r1 := &atomic.Int64{}
-	r1.Store(1)
-	ic1.ips.Store("1.1.1.1", r1)
-	r2 := &atomic.Int64{}
-	r2.Store(1)
-	ic1.ips.Store("2.2.2.2", r2)
-	ld.unlimitedIPs.Store(email1, ic1)
-
-	ic2 := &ipCounter{}
-	r3 := &atomic.Int64{}
-	r3.Store(1)
-	ic2.ips.Store("3.3.3.3", r3)
-	ld.unlimitedIPs.Store(email2, ic2)
-
-	ld.connCount.Store(5)
-
-	aliveIPs, connCount := ld.GetConnectionState()
-
-	if connCount != 5 {
-		t.Errorf("expected connCount=5, got %d", connCount)
-	}
-	if len(aliveIPs[1]) != 2 {
-		t.Errorf("user 1 IPs: got %d, want 2", len(aliveIPs[1]))
-	}
-	if len(aliveIPs[2]) != 1 {
-		t.Errorf("user 2 IPs: got %d, want 1", len(aliveIPs[2]))
-	}
-}
-
-func TestLimitDispatcher_ResetConns(t *testing.T) {
-	ld := newTestDispatcher()
-
-	ld.mu.Lock()
-	ld.limitedIPs["user@1"] = map[string]int{"1.1.1.1": 1}
-	ld.mu.Unlock()
-	ld.connCount.Store(3)
-
-	ld.ResetConns()
-
-	ld.mu.RLock()
-	ipCount := len(ld.limitedIPs)
-	ld.mu.RUnlock()
-	if ipCount != 0 {
-		t.Error("limitedIPs should be empty after reset")
-	}
-
-	if ld.connCount.Load() != 0 {
-		t.Error("connCount should be 0 after reset")
-	}
-}
-
-func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
-	ld := newTestDispatcher()
-
-	email := userEmail(1)
-	// No device limit set for this user
-	ld.UpdateLimits(map[string]int{email: 1}, nil, nil)
-
-	// Should use fast path (sync.Map), no lock needed
-	for i := 0; i < 100; i++ {
-		ip := "10.0.0." + string(rune('0'+i%10))
-		if ld.checkDeviceLimit(email, ip, true) {
-			t.Errorf("unlimited user should always be allowed (ip=%s)", ip)
+func TestLimitDispatcherTCPAndUDPShareStrictAdmission(t *testing.T) {
+	for _, udp := range []bool{false, true} {
+		for _, direct := range []bool{false, true} {
+			name := "tcp"
+			if udp {
+				name = "udp"
+			}
+			if direct {
+				name += "-DispatchLink"
+			}
+			t.Run(name, func(t *testing.T) {
+				ld := newTestDispatcher()
+				ld.UpdateLimits(map[string]int{userEmail(1): 1}, map[string]int{userEmail(1): 1}, nil)
+				link, raw := testLink()
+				reader := link.Reader
+				ld.innerDisp = &testInnerDispatcher{link: link}
+				var err error
+				if direct {
+					err = ld.DispatchLink(userContext(1, "9.9.9.9"), target(udp), link)
+				} else {
+					_, err = ld.Dispatch(userContext(1, "9.9.9.9"), target(udp))
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if link.Reader != reader {
+					t.Fatal("concrete pipe reader was replaced")
+				}
+				ips, count := ld.GetConnectionState()
+				if count != 1 || !ips[1]["9.9.9.9"] {
+					t.Fatalf("source not tracked: %v, %d", ips, count)
+				}
+				if _, err := ld.Dispatch(userContext(1, "1.1.1.1"), target(udp)); !errors.Is(err, limiter.ErrDeviceLimit) {
+					t.Fatal("lower-sorting IP bypassed strict limit")
+				}
+				waitWriter(t, raw)
+				if _, err := ld.Dispatch(userContext(1, "9.9.9.9"), target(udp)); !errors.Is(err, limiter.ErrDeviceLimit) {
+					t.Fatal("old IP bypassed punishment window")
+				}
+			})
 		}
 	}
+}
 
-	// Verify IPs are tracked in unlimitedIPs
-	v, ok := ld.unlimitedIPs.Load(email)
-	if !ok {
-		t.Error("unlimited user should have entry in unlimitedIPs")
+func TestLimitDispatcherLifecycleAndFailureRollback(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.UpdateLimits(map[string]int{userEmail(1): 1}, nil, nil)
+	link, _ := testLink()
+	ld.innerDisp = &testInnerDispatcher{link: link}
+	result, err := ld.Dispatch(userContext(1, "1.1.1.1"), target(false))
+	if err != nil {
+		t.Fatal(err)
 	}
-	ic := v.(*ipCounter)
-	ips := ic.aliveIPs()
-	if len(ips) == 0 {
-		t.Error("should have tracked some IPs")
+	writer := result.Writer.(*closeTrackingWriter)
+	writer.Close()
+	writer.Interrupt()
+	writer.Close()
+	if _, count := ld.GetConnectionState(); count != 1 {
+		t.Fatal("upload half-close released the IP before download completed")
+	}
+	ld.innerDisp.(*testInnerDispatcher).observer.DownlinkClosed()
+	if _, count := ld.GetConnectionState(); count != 0 {
+		t.Fatal("normal close leaked connection state")
+	}
+	for _, direct := range []bool{false, true} {
+		ld.innerDisp = &testInnerDispatcher{err: errors.New("failed")}
+		var err error
+		if direct {
+			link, _ := testLink()
+			err = ld.DispatchLink(userContext(1, "2.2.2.2"), target(false), link)
+		} else {
+			_, err = ld.Dispatch(userContext(1, "2.2.2.2"), target(false))
+		}
+		if err == nil {
+			t.Fatal("expected dispatch failure")
+		}
+		if _, count := ld.GetConnectionState(); count != 0 {
+			t.Fatal("failed dispatch leaked a reservation")
+		}
 	}
 }
 
-
-func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
+func TestDispatchLinkForceCloseCancelsRawProtocolProcessing(t *testing.T) {
 	ld := newTestDispatcher()
-	email := userEmail(1)
-	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
-
-	origReader := nopReader{}
-	origWriter := &closeTrackingWriter{Writer: buf.Discard, onClose: func() {}}
-	link := &transport.Link{Reader: origReader, Writer: origWriter}
-
-	ld.trackLink(link, email, "1.1.1.1", true)
-
-	if link.Reader != origReader {
-		t.Fatal("trackLink must not replace link.Reader")
+	ld.UpdateLimits(map[string]int{userEmail(1): 1}, nil, nil)
+	entered := make(chan struct{})
+	ld.innerDisp = &testInnerDispatcher{onLink: func(ctx context.Context) error {
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	done := make(chan error, 1)
+	go func() {
+		done <- ld.DispatchLink(userContext(1, "1.1.1.1"), target(false), &transport.Link{Reader: nopReader{}, Writer: buf.Discard})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("protocol processing did not start")
 	}
-	if link.Writer == origWriter {
-		t.Fatal("trackLink should wrap link.Writer for lifecycle callbacks")
+	ld.devices.CloseUser(1)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want canceled protocol processing", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("force-close did not cancel a protocol with non-closable readers/writers")
 	}
 }
 
-func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
+func TestLimitDispatcherContextCancellationAndLateBind(t *testing.T) {
 	ld := newTestDispatcher()
-	email := userEmail(1)
-	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
-	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
-		t.Fatal("first connection should be allowed")
+	ld.UpdateLimits(map[string]int{userEmail(1): 1}, nil, nil)
+	link, raw := testLink()
+	ctx, cancel := context.WithCancel(userContext(1, "1.1.1.1"))
+	ld.innerDisp = &testInnerDispatcher{link: link}
+	if _, err := ld.Dispatch(ctx, target(false)); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	waitWriter(t, raw)
+	// The closer can finish just before its Release callback.
+	deadline := time.Now().Add(time.Second)
+	for ld.devices.ActiveCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ld.devices.ActiveCount() != 0 {
+		t.Fatal("cancellation leaked reservation")
 	}
 
-	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
-	ld.trackLink(link, email, "1.1.1.1", true)
+	link, raw = testLink()
+	ld.innerDisp = &testInnerDispatcher{link: link, beforeReturn: func() { ld.devices.CloseUser(1) }}
+	if _, err := ld.Dispatch(userContext(1, "2.2.2.2"), target(false)); err != nil {
+		t.Fatal(err)
+	}
+	waitWriter(t, raw)
+	if ld.devices.ActiveCount() != 0 {
+		t.Fatal("late bind escaped user sweep")
+	}
+}
 
-	if got := ld.connCount.Load(); got != 1 {
-		t.Fatalf("expected connCount=1 after tracking, got %d", got)
+func TestLimitDispatcherRebindChecksIPUserAndOwner(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.UpdateLimits(map[string]int{userEmail(1): 1, userEmail(2): 2}, map[string]int{userEmail(1): 1}, nil)
+	link, raw := testLink()
+	ld.innerDisp = &testInnerDispatcher{link: link}
+	if _, err := ld.Dispatch(userContext(1, "1.1.1.1"), target(true)); err != nil {
+		t.Fatal(err)
 	}
-	cw, ok := link.Writer.(*closeTrackingWriter)
-	if !ok {
-		t.Fatal("expected closeTrackingWriter wrapper")
+	if err := ld.RebindSession(userContext(1, "2.2.2.2"), link); err != nil {
+		t.Fatal(err)
 	}
-	if err := cw.Close(); err != nil {
-		t.Fatalf("closeTrackingWriter.Close() error = %v", err)
+	ips, count := ld.GetConnectionState()
+	if count != 1 || !ips[1]["2.2.2.2"] || ips[1]["1.1.1.1"] {
+		t.Fatalf("bad rebind state: %v", ips)
 	}
-	if got := ld.connCount.Load(); got != 0 {
-		t.Fatalf("expected connCount=0 after close, got %d", got)
+	if err := ld.RebindSession(userContext(2, "2.2.2.2"), link); err == nil || errors.Is(err, routing.ErrSessionNotOwned) {
+		t.Fatalf("other user reused session: %v", err)
 	}
-	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
-		t.Fatal("device slot should be released after writer close")
+	if err := newTestDispatcher().RebindSession(userContext(1, "2.2.2.2"), link); !errors.Is(err, routing.ErrSessionNotOwned) {
+		t.Fatalf("other node instance must report the session as not owned: %v", err)
+	}
+	ld.devices.CloseUser(1)
+	waitWriter(t, raw)
+	if err := ld.RebindSession(userContext(1, "2.2.2.2"), link); err == nil {
+		t.Fatal("kicked XUDP session was reusable")
+	}
+}
+
+func TestXUDPLeaseOutlivesOuterMuxContext(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.UpdateLimits(map[string]int{userEmail(1): 1}, map[string]int{userEmail(1): 1}, nil)
+	link, raw := testLink()
+	ld.innerDisp = &testInnerDispatcher{link: link}
+	ctx, cancel := context.WithCancel(userContext(1, "1.1.1.1"))
+	ctx = session.ContextWithTimeoutOnly(ctx, true)
+	if _, err := ld.Dispatch(ctx, target(true)); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := ld.RebindSession(userContext(1, "2.2.2.2"), link); err != nil {
+		t.Fatalf("live XUDP link did not survive Mux detach: %v", err)
+	}
+	select {
+	case <-raw.closed:
+		t.Fatal("old context terminated the rebound session")
+	default:
+	}
+	ld.devices.CloseUser(1)
+	waitWriter(t, raw)
+	if err := ld.RebindSession(userContext(1, "2.2.2.2"), link); err == nil {
+		t.Fatal("explicitly kicked XUDP session was reused")
+	}
+}
+
+func TestLimitDispatcherRebindUntrackedLink(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.UpdateLimits(map[string]int{userEmail(1): 1}, map[string]int{userEmail(1): 1}, nil)
+	untracked, _ := testLink()
+	if err := ld.RebindSession(userContext(9, "2.2.2.2"), untracked); err != nil {
+		t.Fatalf("unadmitted user could not reuse an untracked link: %v", err)
+	}
+	if err := ld.RebindSession(userContext(1, "2.2.2.2"), untracked); !errors.Is(err, routing.ErrSessionNotOwned) {
+		t.Fatalf("tracked user must get a fresh, admitted session: %v", err)
+	}
+	if ld.devices.ActiveCount() != 0 {
+		t.Fatal("rebind of an untracked link reserved an IP slot")
 	}
 }

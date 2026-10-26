@@ -20,11 +20,12 @@ import (
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
+	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
-const defaultDeviceLimitCooldown = 60 * time.Second
+const defaultDeviceLimitCooldown = limiter.DefaultDeviceLimitCooldown
 
 // drainTimeout is how long stop() waits for in-flight connections to finish
 // naturally after closing all listen sockets, before hard-killing them.

@@ -36,8 +36,6 @@ func TestSingBoxCapabilities(t *testing.T) {
 	}
 }
 
-
-
 type testConn struct {
 	closed bool
 	reads  [][]byte
@@ -60,11 +58,11 @@ func (c *testConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (c *testConn) Close() error { c.closed = true; return nil }
-func (c *testConn) LocalAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) RemoteAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) SetDeadline(time.Time) error { return nil }
-func (c *testConn) SetReadDeadline(time.Time) error { return nil }
+func (c *testConn) Close() error                     { c.closed = true; return nil }
+func (c *testConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *testConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *testConn) SetDeadline(time.Time) error      { return nil }
+func (c *testConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *testConn) SetWriteDeadline(time.Time) error { return nil }
 
 func testInboundContext(uuid, ip string) adapter.InboundContext {
@@ -145,23 +143,17 @@ func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T)
 func TestConnTrackerAdmitDeviceMergesFreshGlobalDevices(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
-	us := tracker.users[1]
-	us.addConn("1.1.1.1")
-	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
-
-	// Local {1.1.1.1} + global {9.9.9.9} already fills limit=2, so any new IP
-	// is rejected no matter how it sorts.
-	if tracker.admitDevice(us, 1, "2.2.2.2", 2) {
-		t.Fatal("expected third device to be rejected once local+global fills the limit")
+	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return 2, true })
+	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
+	first := &testConn{}
+	wrapped := tracker.RoutedConnection(context.Background(), first, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+	if wrapped == first {
+		t.Fatal("existing global IP should be admitted")
 	}
-	if tracker.admitDevice(us, 1, "99.99.99.99", 2) {
-		t.Fatal("expected merged local+global device state to reject third device")
-	}
-	if !tracker.admitDevice(us, 1, "1.1.1.1", 2) {
-		t.Fatal("existing local IP should still be allowed")
-	}
-	if !tracker.admitDevice(us, 1, "9.9.9.9", 2) {
-		t.Fatal("existing global IP should still be allowed")
+	second := &testConn{}
+	tracker.RoutedConnection(context.Background(), second, testInboundContext("uuid-1", "2.2.2.2"), nil, nil)
+	if !second.closed {
+		t.Fatal("local and global IPs must share the same limit")
 	}
 }
 

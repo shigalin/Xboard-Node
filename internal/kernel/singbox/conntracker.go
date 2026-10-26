@@ -15,624 +15,141 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 
+	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
-// ipPool caches ipSnapshot maps to reduce allocations.
-var ipPool = sync.Pool{
-	New: func() interface{} {
-		return make(map[string]struct{}, 16)
-	},
-}
-
-// ─── Per-user statistics ────────────────────────────────────────────────────
-
-// userStats holds per-user traffic counters and alive IP tracking.
-// Traffic counters are lock-free atomics (read on every packet).
-// IP tracking uses a lightweight mutex (only touched at connect/disconnect).
+// userStats contains only traffic counters. Online IPs and connection lifetimes
+// are owned by the same DeviceManager used by the Xray adapter.
 type userStats struct {
 	upload   atomic.Int64
 	download atomic.Int64
-
-	mu        sync.RWMutex   // RWMutex for concurrent reads
-	ips       map[string]int // sourceIP → refcount (number of active conns from that IP)
-	connCount int            // total active connections
-
-	// Sweep invariant: bump kickEpoch before adding an unserved request to
-	// sweepReq; kicking permits one worker, which runs until sweepReq is zero.
-	kicking  atomic.Bool
-	sweepReq atomic.Int64
-
-	// banUntil is the UnixNano deadline of the device-limit punishment window.
-	// While it is in the future every connection of this user is refused.
-	banUntil atomic.Int64
-
-	// kickEpoch increments at the start of every per-user connection sweep.
-	// Admission records the epoch before counting the connection and re-checks
-	// it after registering in connMap: a change means a sweep snapshot may have
-	// missed this connection, so it must close itself.
-	kickEpoch atomic.Uint64
 }
 
-// addConn registers a new connection from sourceIP.
-func (u *userStats) addConn(sourceIP string) {
-	u.mu.Lock()
-	u.connCount++
-	u.ips[sourceIP]++
-	u.mu.Unlock()
-}
-
-// removeConn unregisters a connection from sourceIP.
-func (u *userStats) removeConn(sourceIP string) {
-	u.mu.Lock()
-	u.connCount--
-	u.ips[sourceIP]--
-	if u.ips[sourceIP] <= 0 {
-		delete(u.ips, sourceIP)
-	}
-	u.mu.Unlock()
-}
-
-// distinctIPs returns the number of distinct IPs currently connected.
-func (u *userStats) distinctIPs() int {
-	u.mu.Lock()
-	n := len(u.ips)
-	u.mu.Unlock()
-	return n
-}
-
-// ipSnapshot returns a pooled copy of the current IP set.
-func (u *userStats) ipSnapshot() map[string]struct{} {
-	cp := ipPool.Get().(map[string]struct{})
-	for k := range cp {
-		delete(cp, k)
-	}
-	u.mu.Lock()
-	for ip := range u.ips {
-		cp[ip] = struct{}{}
-	}
-	u.mu.Unlock()
-	return cp
-}
-
-// releaseIPSnapshot returns the snapshot to pool.
-// Large maps are discarded to prevent memory bloat.
-func releaseIPSnapshot(m map[string]struct{}) {
-	// Discard large maps to prevent pool memory bloat
-	if len(m) > 64 {
-		return
-	}
-	ipPool.Put(m)
-}
-
-// aliveIPList returns the set of alive IPs as a boolean map (for reporting).
-func (u *userStats) aliveIPList() map[string]bool {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if len(u.ips) == 0 {
-		return nil
-	}
-	result := make(map[string]bool, len(u.ips))
-	for ip := range u.ips {
-		result[ip] = true
-	}
-	return result
-}
-
-// connRef is a force-closable handle to a tracked connection (TCP or UDP),
-// tagged with the owning user so all of a user's connections can be closed
-// at once.
-type connRef struct {
-	userID int
-	epoch  uint64 // kick epoch observed at admission; sweeps skip conns admitted after their kick
-	closer io.Closer
-}
-
-// ─── ConnTracker ────────────────────────────────────────────────────────────
-
-// ConnTracker provides per-user traffic counting, alive IP tracking, device
-// limit gate-keeping, and per-user speed limiting for the sing-box kernel.
-//
-// Architecture: instead of maintaining a per-connection map (O(connections)),
-// it maintains per-user atomic counters and IP refcount sets (O(users)).
-// This means:
-//   - GetUserTraffic is O(users), not O(connections)
-//   - No Snapshot/pending buffer needed
-//   - No per-connection map lock contention
-//   - Bytes are counted directly into per-user atomics via CountFunc callbacks
-//
-// The per-connection wrapper (trackedConn) is still needed for:
-//   - Hooking into sing's ReadCounter/WriteCounter for zero-copy byte counting
-//   - Close callback to decrement IP refcounts
-//   - Per-connection rate limit token accumulation (amortized WaitN)
 type ConnTracker struct {
-	usersMu sync.RWMutex
-	users   map[int]*userStats // userID → stats
-	uuidMap map[string]int     // UUID → userID (for lookup in RoutedConnection)
-	connMap map[string]connRef // connID → conn ref (for force-close support)
-
-	idCounter atomic.Int64
-
-	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
-	speedLimitFunc atomic.Pointer[func(uuid string) *rate.Limiter]
-
-	// deviceLimitFunc resolves a user UUID to their device limit.
-	deviceLimitFunc atomic.Pointer[func(uuid string) (int, bool)]
-
-	// deviceLimitCooldown is the punishment window (nanoseconds) applied after
-	// a device-limit breach. Always positive: it defaults to
-	// defaultDeviceLimitCooldown and cannot be disabled.
-	deviceLimitCooldown atomic.Int64
-
-	// Multi-node device state from panel
-	globalDevices    map[int]map[string]bool // userID → IP → exists
-	globalMu         sync.RWMutex
-	globalLastUpdate time.Time
+	usersMu         sync.RWMutex
+	users           map[int]*userStats
+	uuidMap         map[string]int
+	devices         *limiter.DeviceManager
+	speedLimitFunc  atomic.Pointer[func(string) *rate.Limiter]
+	deviceLimitFunc atomic.Pointer[func(string) (int, bool)]
 }
 
-// NewConnTracker creates a tracker.
 func NewConnTracker(_ int) *ConnTracker {
-	t := &ConnTracker{
-		users:         make(map[int]*userStats),
-		uuidMap:       make(map[string]int),
-		connMap:       make(map[string]connRef),
-		globalDevices: make(map[int]map[string]bool),
+	return &ConnTracker{
+		users: make(map[int]*userStats), uuidMap: make(map[string]int),
+		devices: limiter.NewDeviceManager(0),
 	}
-	t.deviceLimitCooldown.Store(int64(defaultDeviceLimitCooldown))
-	return t
 }
 
-// SetSpeedLimitFunc configures the per-user speed limit lookup.
-func (t *ConnTracker) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
-	t.speedLimitFunc.Store(&fn)
-}
+func (t *ConnTracker) SetSpeedLimitFunc(fn func(string) *rate.Limiter) { t.speedLimitFunc.Store(&fn) }
+func (t *ConnTracker) SetDeviceLimitFunc(fn func(string) (int, bool))  { t.deviceLimitFunc.Store(&fn) }
+func (t *ConnTracker) SetDeviceLimitCooldown(d time.Duration)          { t.devices.SetCooldown(d) }
 
-// SetDeviceLimitFunc configures the per-user device limit lookup for gate-keeping.
-func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
-	t.deviceLimitFunc.Store(&fn)
-}
-
-// SetDeviceLimitCooldown sets the punishment window applied after a device
-// limit breach. Non-positive durations are ignored so the window stays
-// positive; mapping "0 → default" is owned by deviceLimitCooldown().
-func (t *ConnTracker) SetDeviceLimitCooldown(d time.Duration) {
-	if d <= 0 {
-		return
-	}
-	t.deviceLimitCooldown.Store(int64(d))
-}
-
-// SetUserMap replaces the UUID→userID mapping and ensures per-user stats
-// structs exist for all users. Old users that are no longer present keep
-// their stats until their connections drain.
-func (t *ConnTracker) SetUserMap(m map[string]int) {
+func (t *ConnTracker) SetUserMap(users map[string]int) {
 	t.usersMu.Lock()
-	t.uuidMap = m
-	for _, uid := range m {
-		if _, ok := t.users[uid]; !ok {
-			t.users[uid] = &userStats{ips: make(map[string]int)}
+	t.uuidMap = users
+	for _, uid := range users {
+		if t.users[uid] == nil {
+			t.users[uid] = &userStats{}
 		}
 	}
 	t.usersMu.Unlock()
 }
 
-// UpdateGlobalDevices syncs global device state from panel.
 func (t *ConnTracker) UpdateGlobalDevices(users map[int][]string) {
-	t.globalMu.Lock()
-	t.globalDevices = make(map[int]map[string]bool, len(users))
-	for uid, ips := range users {
-		m := make(map[string]bool, len(ips))
-		for _, ip := range ips {
-			m[ip] = true
-		}
-		t.globalDevices[uid] = m
+	t.devices.UpdateGlobalDevices(users)
+}
+func (t *ConnTracker) ClearGlobalDevices() { t.devices.ClearGlobalDevices() }
+
+func (t *ConnTracker) admit(uuid, ip string) (*userStats, *limiter.DeviceLease, bool) {
+	t.usersMu.RLock()
+	uid, known := t.uuidMap[uuid]
+	us := t.users[uid]
+	t.usersMu.RUnlock()
+	if !known {
+		return nil, nil, true
 	}
-	t.globalLastUpdate = time.Now()
-	t.globalMu.Unlock()
-	nlog.Core().Debug("global device state updated", "users", len(users))
+	limit := 0
+	if fn := t.deviceLimitFunc.Load(); fn != nil && *fn != nil {
+		limit, _ = (*fn)(uuid)
+	}
+	lease, err := t.devices.Acquire(uid, ip, limit)
+	if err != nil {
+		nlog.Core().Debug("singbox: device admission rejected", "userID", uid)
+		return us, nil, false
+	}
+	return us, lease, true
 }
 
-// ClearGlobalDevices resets global device state (on WS disconnect).
-func (t *ConnTracker) ClearGlobalDevices() {
-	t.globalMu.Lock()
-	t.globalDevices = make(map[int]map[string]bool)
-	t.globalLastUpdate = time.Time{}
-	t.globalMu.Unlock()
-	nlog.Core().Debug("global device state cleared")
-}
-
-// ─── adapter.ConnectionTracker ──────────────────────────────────────────────
-
-// RoutedConnection wraps a TCP conn to count bytes per-user, track IPs,
-// and optionally rate-limit. Gate-keeps device limits at connection time.
-func (t *ConnTracker) RoutedConnection(
-	ctx context.Context, conn net.Conn,
-	metadata adapter.InboundContext,
-	_ adapter.Rule, _ adapter.Outbound,
-) net.Conn {
-	uuid := metadata.User
-	sourceIP := metadata.Source.Addr.String()
-
-	uid, us, epoch, ok := t.admitConn(uuid, sourceIP, "tcp")
+func (t *ConnTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) net.Conn {
+	us, lease, ok := t.admit(metadata.User, metadata.Source.Addr.String())
 	if !ok {
 		conn.Close()
 		return conn
 	}
-
-	connID := t.nextID()
-
-	var lim *rate.Limiter
-	if slf := t.speedLimitFunc.Load(); slf != nil {
-		lim = (*slf)(uuid)
+	tc := &trackedConn{Conn: conn, us: us, lease: lease, ctx: ctx}
+	if fn := t.speedLimitFunc.Load(); fn != nil && *fn != nil {
+		tc.limiter = (*fn)(metadata.User)
 	}
-
-	tc := &trackedConn{
-		Conn:     conn,
-		tracker:  t,
-		us:       us,
-		userID:   uid,
-		connID:   connID,
-		sourceIP: sourceIP,
-		limiter:  lim,
-		ctx:      ctx,
+	if lease != nil {
+		tc.connID = lease.ID()
+		if !lease.Bind(func() { tc.Close() }) {
+			return conn
+		}
 	}
-
-	// Store the wrapper (not the raw conn) so a force-close also runs the
-	// IP refcount bookkeeping in trackedConn.Close. If a sweep started while
-	// we were between admission and registration, close ourselves — the sweep
-	// snapshot may not have seen this connection.
-	if !t.registerConn(us, uid, epoch, connID, tc) {
-		tc.Close()
-		return conn
-	}
-
 	return tc
 }
 
-// RoutedPacketConnection wraps UDP with per-user counting. Like TCP, the
-// wrapper is registered in connMap so it can be force-closed by ID or as part
-// of a per-user kick.
-func (t *ConnTracker) RoutedPacketConnection(
-	ctx context.Context, conn N.PacketConn,
-	metadata adapter.InboundContext,
-	_ adapter.Rule, _ adapter.Outbound,
-) N.PacketConn {
-	uuid := metadata.User
-	sourceIP := metadata.Source.Addr.String()
-
-	uid, us, epoch, ok := t.admitConn(uuid, sourceIP, "udp")
+func (t *ConnTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) N.PacketConn {
+	us, lease, ok := t.admit(metadata.User, metadata.Source.Addr.String())
 	if !ok {
 		conn.Close()
 		return conn
 	}
-
-	connID := t.nextID()
-
-	var lim *rate.Limiter
-	if slf := t.speedLimitFunc.Load(); slf != nil {
-		lim = (*slf)(uuid)
+	tc := &trackedPacketConn{PacketConn: conn, us: us, lease: lease, ctx: ctx}
+	if fn := t.speedLimitFunc.Load(); fn != nil && *fn != nil {
+		tc.limiter = (*fn)(metadata.User)
 	}
-
-	tpc := &trackedPacketConn{
-		PacketConn: conn,
-		tracker:    t,
-		us:         us,
-		userID:     uid,
-		connID:     connID,
-		sourceIP:   sourceIP,
-		limiter:    lim,
-		ctx:        ctx,
+	if lease != nil {
+		tc.connID = lease.ID()
+		if !lease.Bind(func() { tc.Close() }) {
+			return conn
+		}
 	}
-
-	if !t.registerConn(us, uid, epoch, connID, tpc) {
-		tpc.Close()
-		return conn
-	}
-
-	return tpc
+	return tc
 }
 
-// RoutedFlow is called for flows that sing-box offloads in the tun pre-match
-// path. Panel nodes only run proxy inbounds, which go through
-// RoutedConnection and RoutedPacketConnection, so there is nothing to track.
-func (t *ConnTracker) RoutedFlow(
-	_ context.Context,
-	_ adapter.InboundContext,
-	_ adapter.Rule, _ adapter.Outbound,
-) tun.FlowTracker {
+// Panel proxy inbounds use the TCP and UDP callbacks, not tun offloaded flows.
+func (t *ConnTracker) RoutedFlow(context.Context, adapter.InboundContext, adapter.Rule, adapter.Outbound) tun.FlowTracker {
 	return nil
 }
 
-// admitConn is the single admission path shared by the TCP and UDP trackers.
-// It resolves the user, atomically performs the device-limit check together
-// with the IP/conn accounting, and returns the kick epoch observed BEFORE the
-// connection was counted (see registerConn). ok=false means the connection was
-// refused; the breach kick (if any) has already been triggered.
-func (t *ConnTracker) admitConn(uuid, sourceIP, network string) (uid int, us *userStats, epoch uint64, ok bool) {
-	t.usersMu.RLock()
-	uid = t.uuidMap[uuid]
-	us = t.users[uid]
-	t.usersMu.RUnlock()
-
-	if us != nil {
-		epoch = us.kickEpoch.Load()
-	}
-
-	var limit int
-	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
-		if l, hasLimit := (*dlf)(uuid); hasLimit {
-			limit = l
-		}
-	}
-
-	if us == nil || limit <= 0 {
-		// No stats to enforce against, or no device limit — count and admit.
-		if us != nil {
-			us.addConn(sourceIP)
-		}
-		return uid, us, epoch, true
-	}
-
-	// Punishment window: refuse everything, including IPs that previously
-	// held a slot, until it expires.
-	if until := us.banUntil.Load(); until > 0 {
-		if time.Now().UnixNano() < until {
-			return uid, us, epoch, false
-		}
-		us.banUntil.CompareAndSwap(until, 0)
-	}
-
-	if !t.admitDevice(us, uid, sourceIP, limit) {
-		nlog.Core().Info("singbox: device limit exceeded, kicking user and rejecting connection",
-			"user", uuid, "ip", sourceIP, "network", network, "limit", limit)
-		t.kickUser(us, uid)
-		return uid, us, epoch, false
-	}
-	return uid, us, epoch, true
-}
-
-// admitDevice atomically checks the device (distinct source IP) limit and, on
-// success, records the connection (IP refcount + conn count) in the SAME
-// critical section — so two IPs racing for the last slot can never both win.
-//
-// Policy: strict. If the merged local and fresh global IP set already exceeds
-// the limit, every connection is rejected so the caller can kick the user and
-// let the panel state drain. Otherwise, an IP already holding a slot is allowed
-// and a new IP is admitted only while the merged set is below the limit.
-func (t *ConnTracker) admitDevice(us *userStats, userID int, sourceIP string, limit int) bool {
-	// Snapshot global (multi-node) state first to keep lock scopes disjoint.
-	t.globalMu.RLock()
-	// Panel device entries expire after 300s. WS updates arrive on device report
-	// events and REST fallback polls them, so keep the last snapshot usable for
-	// the same bounded window before degrading to local-only admission.
-	globalStale := time.Since(t.globalLastUpdate) > 300*time.Second
-	globalIPs := t.globalDevices[userID]
-	t.globalMu.RUnlock()
-	globalFresh := !globalStale && globalIPs != nil
-
-	us.mu.Lock()
-	defer us.mu.Unlock()
-
-	// An IP already holding a slot (locally, or globally on another node)
-	// needs no extra one; a new IP claims one more.
-	need := 1
-	if _, known := us.ips[sourceIP]; known || (globalFresh && globalIPs[sourceIP]) {
-		need = 0
-	}
-
-	// admitted ⇔ merged distinct-IP count + need <= limit. Bound checks come
-	// first: iterating globalIPs under us.mu costs O(panel-reported IPs) per
-	// admission, so only merge when the set sizes alone cannot decide.
-	var admitted bool
-	switch {
-	case !globalFresh:
-		admitted = len(us.ips)+need <= limit
-	case len(us.ips) > limit || len(globalIPs) > limit:
-		admitted = false // either set alone already exceeds the limit
-	case len(us.ips)+len(globalIPs)+need <= limit:
-		admitted = true // even fully disjoint sets stay within the limit
-	default:
-		total := len(us.ips)
-		for ip := range globalIPs {
-			if _, dup := us.ips[ip]; !dup {
-				total++
-			}
-		}
-		admitted = total+need <= limit
-	}
-
-	if admitted {
-		us.connCount++
-		us.ips[sourceIP]++
-	}
-	return admitted
-}
-
-// registerConn stores the closable wrapper in connMap, then verifies no
-// per-user sweep started since `epoch` was read (before the connection was
-// counted). Returns false if the connection must close itself because a
-// concurrent sweep's snapshot may have missed it; the caller closes the
-// wrapper, which unwinds the accounting done by admitConn.
-func (t *ConnTracker) registerConn(us *userStats, userID int, epoch uint64, connID string, closer io.Closer) bool {
-	t.usersMu.Lock()
-	t.connMap[connID] = connRef{userID: userID, epoch: epoch, closer: closer}
-	t.usersMu.Unlock()
-
-	if us != nil && us.kickEpoch.Load() != epoch {
-		return false
-	}
-	return true
-}
-
-// kickUser applies the device-limit punishment: arms the cooldown window and
-// force-closes every tracked connection of the user.
-func (t *ConnTracker) kickUser(us *userStats, userID int) {
-	if us != nil {
-		cooldown := time.Duration(t.deviceLimitCooldown.Load())
-		us.banUntil.Store(time.Now().Add(cooldown).UnixNano())
-	}
-	t.closeUserConns(us, userID)
-}
-
-// closeUserConns asynchronously schedules all tracked connections belonging to
-// userID for closing.
-func (t *ConnTracker) closeUserConns(us *userStats, userID int) {
-	if us == nil {
-		go t.sweepUserConns(userID, ^uint64(0))
-		return
-	}
-
-	us.kickEpoch.Add(1)
-	us.sweepReq.Add(1)
-	if !us.kicking.CompareAndSwap(false, true) {
-		return
-	}
-
-	go func() {
-		for {
-			pending := us.sweepReq.Load()
-			// Cutoff loaded after pending: every counted request bumped the
-			// epoch first, so this cutoff covers all of them, while conns
-			// admitted after the latest bump keep their new epoch and survive.
-			t.sweepUserConns(userID, us.kickEpoch.Load())
-			us.sweepReq.Add(-pending)
-
-			us.kicking.Store(false)
-			if us.sweepReq.Load() == 0 {
-				return
-			}
-			if !us.kicking.CompareAndSwap(false, true) {
-				return
-			}
-		}
-	}()
-}
-
-// sweepUserConns snapshots connMap and closes every connection of userID that
-// was admitted before cutoff. A connection whose epoch is >= cutoff was
-// admitted after the kick being served and must survive (e.g. an immediate
-// reconnect after CloseByUUID, which does not arm the cooldown window).
-func (t *ConnTracker) sweepUserConns(userID int, cutoff uint64) {
-	t.usersMu.RLock()
-	victims := make([]io.Closer, 0, len(t.connMap))
-	for _, ref := range t.connMap {
-		if ref.userID == userID && ref.epoch < cutoff && ref.closer != nil {
-			victims = append(victims, ref.closer)
-		}
-	}
-	t.usersMu.RUnlock()
-
-	for _, c := range victims {
-		_ = c.Close()
-	}
-	nlog.Core().Info("user connection sweep done", "userID", userID, "closed", len(victims))
-}
-
-func (t *ConnTracker) nextID() string {
-	return "sb-" + formatInt36(t.idCounter.Add(1))
-}
-
-func formatInt36(n int64) string {
-	const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-	if n == 0 {
-		return "0"
-	}
-	var buf [13]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = digits[n%36]
-		n /= 36
-	}
-	return string(buf[i:])
-}
-
-// ─── Public API ─────────────────────────────────────────────────────────────
-
-// GetUserTraffic returns per-user cumulative traffic and alive IPs.
-// This is O(users), not O(connections).
 func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
 	t.usersMu.RLock()
 	traffic = make(map[int][2]int64, len(t.users))
-	aliveIPs = make(map[int]map[string]bool, len(t.users))
 	for uid, us := range t.users {
-		up := us.upload.Load()
-		down := us.download.Load()
+		up, down := us.upload.Load(), us.download.Load()
 		if up > 0 || down > 0 {
 			traffic[uid] = [2]int64{up, down}
 		}
-
-		ips := us.aliveIPList()
-		if ips != nil {
-			aliveIPs[uid] = ips
-		}
-
-		us.mu.Lock()
-		connCount += us.connCount
-		us.mu.Unlock()
 	}
 	t.usersMu.RUnlock()
+	aliveIPs, connCount = t.devices.Snapshot()
 	return
 }
 
-// CloseByID force-closes a connection by its ID.
-func (t *ConnTracker) CloseByID(id string) bool {
-	t.usersMu.RLock()
-	ref, ok := t.connMap[id]
-	t.usersMu.RUnlock()
-	if !ok {
-		return false
-	}
-	if ref.closer != nil {
-		_ = ref.closer.Close()
-	}
-	return true
-}
-
-// CloseByUUID force-closes ALL connections for a given user UUID.
-// Returns the number of connections scheduled for closing. Unlike a
-// device-limit kick, this does NOT arm the cooldown window — the user may
-// reconnect immediately.
+func (t *ConnTracker) CloseByID(id string) bool { return t.devices.CloseByID(id) }
 func (t *ConnTracker) CloseByUUID(uuid string) int {
 	t.usersMu.RLock()
-	uid, ok := t.uuidMap[uuid]
-	us := t.users[uid]
-	n := 0
-	for _, ref := range t.connMap {
-		if ref.userID == uid {
-			n++
-		}
-	}
+	uid, known := t.uuidMap[uuid]
 	t.usersMu.RUnlock()
-	if !ok {
+	if !known {
 		return 0
 	}
-	// Sweep even when the snapshot count is 0: a connection may have passed
-	// admission but not yet registered in connMap. The sweep bumps the kick
-	// epoch, which forces such a connection to close itself in registerConn.
-	t.closeUserConns(us, uid)
-	return n
+	return t.devices.CloseUser(uid)
 }
-
-// ActiveCount returns the total number of active connections.
-func (t *ConnTracker) ActiveCount() int {
-	t.usersMu.RLock()
-	total := 0
-	for _, us := range t.users {
-		us.mu.Lock()
-		total += us.connCount
-		us.mu.Unlock()
-	}
-	t.usersMu.RUnlock()
-	return total
-}
-
-// removeConnRef removes the connection reference from connMap on close.
-func (t *ConnTracker) removeConnRef(connID string) {
-	t.usersMu.Lock()
-	delete(t.connMap, connID)
-	t.usersMu.Unlock()
-}
+func (t *ConnTracker) ActiveCount() int { return t.devices.ActiveCount() }
 
 // ─── trackedConn (TCP) ──────────────────────────────────────────────────────
 
@@ -711,14 +228,12 @@ func (r *RateLimitedReadCloser) Read(b []byte) (int, error) {
 
 type trackedConn struct {
 	net.Conn
-	tracker  *ConnTracker
-	us       *userStats // per-user stats (upload/download atomics + IP tracking)
-	userID   int        // user ID for device tracking
-	connID   string
-	sourceIP string
-	limiter  *rate.Limiter
-	ctx      context.Context
-	closed   atomic.Bool
+	lease   *limiter.DeviceLease
+	us      *userStats // per-user traffic counters
+	connID  string
+	limiter *rate.Limiter
+	ctx     context.Context
+	closed  atomic.Bool
 }
 
 func (c *trackedConn) Read(b []byte) (int, error) {
@@ -785,12 +300,12 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 
 func (c *trackedConn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
-		if c.us != nil {
-			c.us.removeConn(c.sourceIP)
+		if c.lease != nil {
+			c.lease.Release()
 		}
-		c.tracker.removeConnRef(c.connID)
+		return c.Conn.Close()
 	}
-	return c.Conn.Close()
+	return nil
 }
 
 // makeCountFunc builds a CountFunc for zero-copy byte counting via sing's
@@ -840,14 +355,12 @@ func (c *trackedConn) WriterReplaceable() bool { return true }
 
 type trackedPacketConn struct {
 	N.PacketConn
-	tracker  *ConnTracker
-	us       *userStats
-	userID   int
-	connID   string
-	sourceIP string
-	limiter  *rate.Limiter
-	ctx      context.Context
-	closed   atomic.Bool
+	lease   *limiter.DeviceLease
+	us      *userStats
+	connID  string
+	limiter *rate.Limiter
+	ctx     context.Context
+	closed  atomic.Bool
 }
 
 func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
@@ -908,12 +421,12 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 
 func (c *trackedPacketConn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
-		if c.us != nil {
-			c.us.removeConn(c.sourceIP)
+		if c.lease != nil {
+			c.lease.Release()
 		}
-		c.tracker.removeConnRef(c.connID)
+		return c.PacketConn.Close()
 	}
-	return c.PacketConn.Close()
+	return nil
 }
 
 func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
