@@ -411,11 +411,11 @@ func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 }
 
 // UpdateGlobalDevices updates the global device state from panel (for multi-node).
-func (s *SingBox) UpdateGlobalDevices(users map[int][]string) {
+func (s *SingBox) UpdateGlobalDevices(users map[int][]string, receivedAt time.Time) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.connTracker != nil {
-		s.connTracker.UpdateGlobalDevices(users)
+		s.connTracker.UpdateGlobalDevices(users, receivedAt)
 	}
 }
 

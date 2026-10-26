@@ -57,8 +57,8 @@ func (t *ConnTracker) SetUserMap(users map[string]int) {
 	t.usersMu.Unlock()
 }
 
-func (t *ConnTracker) UpdateGlobalDevices(users map[int][]string) {
-	t.devices.UpdateGlobalDevices(users)
+func (t *ConnTracker) UpdateGlobalDevices(users map[int][]string, receivedAt time.Time) {
+	t.devices.UpdateGlobalDevicesAt(users, receivedAt)
 }
 func (t *ConnTracker) ClearGlobalDevices() { t.devices.ClearGlobalDevices() }
 

@@ -144,7 +144,7 @@ func TestConnTrackerAdmitDeviceMergesFreshGlobalDevices(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return 2, true })
-	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
+	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}}, time.Now())
 	first := &testConn{}
 	wrapped := tracker.RoutedConnection(context.Background(), first, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
 	if wrapped == first {
@@ -205,5 +205,17 @@ func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
 	cancelWrite()
 	if n, err := writeTracked.Write([]byte("a")); !errors.Is(err, context.Canceled) || n != 0 {
 		t.Fatalf("second Write() = (%d, %v), want (0, context canceled)", n, err)
+	}
+}
+
+func TestConnTrackerIgnoresGlobalSnapshotReceivedBeforeTTL(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return 1, true })
+	// A snapshot replayed after a restart keeps its original receive time.
+	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}}, time.Now().Add(-301*time.Second))
+	conn := &testConn{}
+	if wrapped := tracker.RoutedConnection(context.Background(), conn, testInboundContext("uuid-1", "1.1.1.1"), nil, nil); wrapped == conn || conn.closed {
+		t.Fatal("expired global snapshot still blocked admission")
 	}
 }

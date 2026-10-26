@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"golang.org/x/time/rate"
@@ -98,7 +99,9 @@ type Kernel interface {
 	// Both kernels pass this lookup to the shared online-IP admission logic.
 	SetDeviceLimitFunc(fn func(uuid string) (int, bool))
 	// UpdateGlobalDevices updates the global device state from panel (for multi-node).
-	UpdateGlobalDevices(users map[int][]string)
+	// receivedAt is when the snapshot arrived from the panel; replays after a
+	// kernel restart pass the original time so its freshness is not extended.
+	UpdateGlobalDevices(users map[int][]string, receivedAt time.Time)
 	// ClearGlobalDevices clears the global device state (on WS disconnect).
 	ClearGlobalDevices()
 }

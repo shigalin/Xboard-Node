@@ -112,6 +112,7 @@ type Service struct {
 	wsDisconnectAt   time.Time                      // when WS last disconnected (zero if connected)
 	wsResyncPending  atomic.Bool
 	globalDevices    map[int][]string
+	globalDevicesAt  time.Time // when globalDevices was received from the panel
 	machineMailbox   *controlplane.NodeMailbox
 	machineMailboxCh <-chan struct{}
 
@@ -618,7 +619,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 			} else {
 				nlog.Core().Info("ws disconnected")
 			}
-			s.globalDevices = nil
+			s.globalDevices, s.globalDevicesAt = nil, time.Time{}
 			s.kernel.ClearGlobalDevices()
 			// Fence any REST device poll that started before this disconnect; its
 			// snapshot predates the cleared transport state and must not be reapplied.
@@ -917,8 +918,8 @@ func (s *Service) applyGlobalDevices(users map[int][]string) {
 	for userID, ips := range users {
 		copyUsers[userID] = append([]string(nil), ips...)
 	}
-	s.globalDevices = copyUsers
-	s.kernel.UpdateGlobalDevices(copyUsers)
+	s.globalDevices, s.globalDevicesAt = copyUsers, time.Now()
+	s.kernel.UpdateGlobalDevices(copyUsers, s.globalDevicesAt)
 }
 
 // startKernel starts (or restarts) the kernel with the given config/users and
@@ -932,7 +933,9 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
 	if s.globalDevices != nil {
-		s.kernel.UpdateGlobalDevices(s.globalDevices)
+		// Replay with the original receive time: a restart must not make an
+		// aging panel snapshot look fresh again.
+		s.kernel.UpdateGlobalDevices(s.globalDevices, s.globalDevicesAt)
 	}
 
 	// Initialize node logger on first successful start

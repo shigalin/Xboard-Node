@@ -293,18 +293,17 @@ func (x *Xray) SetDeviceLimitFunc(fn func(string) (int, bool)) {
 	x.updateDispatcherLimits(users)
 }
 
-func (x *Xray) UpdateGlobalDevices(users map[int][]string) {
+func (x *Xray) UpdateGlobalDevices(users map[int][]string, receivedAt time.Time) {
 	copyUsers := make(map[int][]string, len(users))
 	for uid, ips := range users {
 		copyUsers[uid] = append([]string(nil), ips...)
 	}
-	at := time.Now()
 	x.mu.Lock()
-	x.globalDevices, x.globalDevicesAt = copyUsers, at
+	x.globalDevices, x.globalDevicesAt = copyUsers, receivedAt
 	ld := x.limitDispatcher
 	x.mu.Unlock()
 	if ld != nil {
-		ld.devices.UpdateGlobalDevicesAt(copyUsers, at)
+		ld.devices.UpdateGlobalDevicesAt(copyUsers, receivedAt)
 	}
 }
 
