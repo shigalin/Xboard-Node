@@ -295,4 +295,4 @@ require (
 
 replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20260902182505-87c8ff1aa849
 
-replace github.com/xtls/xray-core => ../Xray-core
+replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261027015150-0ced8f4195f2
