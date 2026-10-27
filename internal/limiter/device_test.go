@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cedar2025/xboard-node/internal/model"
 )
 
 func testDeviceManager() (*DeviceManager, *time.Time) {
@@ -217,4 +219,28 @@ func TestSnapshotPrunesIdleUsersOnlyAfterCooldown(t *testing.T) {
 		t.Fatal("idle user kept after cooldown expired")
 	}
 	mustAcquire(t, m, 1, "1.1.1.1", 1)
+}
+
+func TestCloseRemovedUsersClosesAbsentAndRekeyedUsers(t *testing.T) {
+	m := NewDeviceManager(0)
+	old := []model.UserSpec{{ID: 1, UUID: "a"}, {ID: 2, UUID: "b"}, {ID: 3, UUID: "c"}}
+	current := []model.UserSpec{{ID: 1, UUID: "a"}, {ID: 2, UUID: "b2"}}
+	var closed [4]atomic.Int32
+	for _, u := range old {
+		uid := u.ID
+		mustAcquire(t, m.NewScope(), uid, "1.1.1.1", 0).Bind(func() { closed[uid].Add(1) })
+	}
+	if n := m.CloseRemovedUsers(old, current); n != 2 {
+		t.Fatalf("closed %d sessions, want 2", n)
+	}
+	deadline := time.Now().Add(time.Second)
+	for closed[2].Load() != 1 || closed[3].Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("closers ran for users 2=%d 3=%d, want 1 each", closed[2].Load(), closed[3].Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, count := m.Snapshot(); count != 1 || closed[1].Load() != 0 {
+		t.Fatalf("kept user affected: count=%d closed=%d", count, closed[1].Load())
+	}
 }

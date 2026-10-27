@@ -167,8 +167,9 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.mu.Lock()
 	old := x.instance
 	oldLD := x.limitDispatcher
+	oldUsers := x.users
 	if old != nil {
-		x.draining[old] = x.users
+		x.draining[old] = oldUsers
 	}
 	x.instance = inst
 	x.limitDispatcher = ld
@@ -184,6 +185,9 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
 	stopAccepting(old)
 	x.closeOld(old, oldLD)
+	if old != nil {
+		x.devices.CloseRemovedUsers(oldUsers, users)
+	}
 
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -461,11 +465,13 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	}
 
 	x.mu.Lock()
+	oldUsers := x.users
 	x.users = kept
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
 	x.updateBandwidthLimits(kept)
 	x.dropBandwidthLimits(users, kept)
+	x.devices.CloseRemovedUsers(oldUsers, kept)
 
 	nlog.Core().Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
 	return actualRemoved, nil
@@ -530,11 +536,13 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	}
 
 	x.mu.Lock()
+	oldUsers := x.users
 	x.users = users
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 	x.dropBandwidthLimits(toRemove, users)
+	x.devices.CloseRemovedUsers(oldUsers, users)
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return

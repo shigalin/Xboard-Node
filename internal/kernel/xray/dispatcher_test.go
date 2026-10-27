@@ -334,3 +334,27 @@ func TestTrackedSessionCancelsOnlyAfterOutboundReturns(t *testing.T) {
 		}
 	}
 }
+
+// A direct (DispatchLink) session keeps its IP after the downlink closes while
+// the outbound still forwards uploads; only the outbound's return ends it.
+func TestDirectSessionHoldsLeaseUntilOutboundReturns(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.UpdateLimits(map[string]int{userEmail(1): 1}, nil, nil)
+	link, _ := testLink()
+	var observer routing.SessionLifecycle
+	ld.innerDisp = &testInnerDispatcher{onLink: func(ctx context.Context) error {
+		observer = routing.SessionLifecycleFromContext(ctx)
+		return nil
+	}}
+	if err := ld.DispatchLink(userContext(1, "1.1.1.1"), target(false), link); err != nil {
+		t.Fatal(err)
+	}
+	common.Close(link.Writer)
+	if _, count := ld.GetConnectionState(); count != 1 {
+		t.Fatal("downlink close released the IP while the upload may continue")
+	}
+	observer.(routing.OutboundObserver).OutboundReturned()
+	if _, count := ld.GetConnectionState(); count != 0 {
+		t.Fatal("finished direct session kept its IP")
+	}
+}

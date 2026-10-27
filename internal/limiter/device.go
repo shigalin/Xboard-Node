@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
@@ -236,6 +237,24 @@ func (m *DeviceManager) CloseUser(uid int) int {
 	m.mu.Unlock()
 	closeDevices(closers)
 	return n
+}
+
+// CloseRemovedUsers closes the sessions of every user in old that is absent
+// from current or has a new UUID. Kernels only stop authenticating removed
+// users; their established connections would otherwise run until they end.
+// It covers every scope, so sessions draining on a replaced instance close too.
+func (m *DeviceManager) CloseRemovedUsers(old, current []model.UserSpec) int {
+	uuids := make(map[int]string, len(current))
+	for _, u := range current {
+		uuids[u.ID] = u.UUID
+	}
+	closed := 0
+	for _, u := range old {
+		if uuid, ok := uuids[u.ID]; !ok || uuid != u.UUID {
+			closed += m.CloseUser(u.ID)
+		}
+	}
+	return closed
 }
 
 // CloseAll closes the leases acquired through this scope only.

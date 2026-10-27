@@ -129,8 +129,9 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	}
 	var tracked *trackedSession
 	if lease != nil {
-		// DispatchLink's writer is the downlink. The core closes it after
-		// processing; cancellation also ends raw protocol readers/writers.
+		// DispatchLink's writer is the downlink. The uplink is a raw reader the
+		// outbound consumes, so it counts as finished only when the outbound
+		// returns; cancellation also ends raw protocol readers/writers.
 		ctx, tracked = newTrackedSession(ctx, lease, true)
 		d.trackLink(link, uid, tracked, tracked.DownlinkClosed)
 	}
@@ -157,6 +158,7 @@ type trackedSession struct {
 	mu                                     sync.Mutex
 	lease                                  *limiter.DeviceLease
 	cancel                                 context.CancelFunc
+	direct                                 bool // DispatchLink: uplink ends with the outbound
 	uplinkDone, downlinkDone, outboundDone bool
 	released, closed                       bool
 	reader                                 buf.Reader
@@ -171,7 +173,7 @@ func newTrackedSession(ctx context.Context, lease *limiter.DeviceLease, direct b
 		ctx = context.WithoutCancel(ctx)
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	tracked := &trackedSession{lease: lease, cancel: cancel, uplinkDone: direct}
+	tracked := &trackedSession{lease: lease, cancel: cancel, direct: direct}
 	context.AfterFunc(ctx, tracked.terminate)
 	return routing.ContextWithSessionLifecycle(ctx, tracked), tracked
 }
@@ -188,9 +190,16 @@ func (s *trackedSession) bind(link *transport.Link) {
 	s.lease.Bind(s.terminate)
 }
 
-func (s *trackedSession) uplinkClosed()     { s.settle(func() { s.uplinkDone = true }) }
-func (s *trackedSession) DownlinkClosed()   { s.settle(func() { s.downlinkDone = true }) }
-func (s *trackedSession) OutboundReturned() { s.settle(func() { s.outboundDone = true }) }
+func (s *trackedSession) uplinkClosed()   { s.settle(func() { s.uplinkDone = true }) }
+func (s *trackedSession) DownlinkClosed() { s.settle(func() { s.downlinkDone = true }) }
+func (s *trackedSession) OutboundReturned() {
+	s.settle(func() {
+		s.outboundDone = true
+		if s.direct {
+			s.uplinkDone = true
+		}
+	})
+}
 
 // settle releases the IP once both directions finished and cancels the
 // context once the outbound has returned as well. Graceful completion never
