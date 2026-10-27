@@ -217,3 +217,56 @@ func TestStopAcceptingKeepsEstablishedConnections(t *testing.T) {
 		t.Fatal("old instance still accepted a new connection")
 	}
 }
+
+// UDP inbounds cannot refuse new flows without closing their socket, so a
+// replaced instance must stop serving UDP entirely.
+func TestStopAcceptingClosesUDPInbound(t *testing.T) {
+	target, err := stdnet.ListenUDP("udp", &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	probe, err := stdnet.ListenUDP("udp", &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.LocalAddr().(*stdnet.UDPAddr).Port
+	probe.Close()
+	cfg, err := serial.LoadJSONConfig(strings.NewReader(fmt.Sprintf(`{"log":{"loglevel":"none"},
+		"inbounds":[{"listen":"127.0.0.1","port":%d,"protocol":"tunnel","settings":{"address":"127.0.0.1","port":%d,"network":"udp"}}],
+		"outbounds":[{"protocol":"freedom"}]}`, port, target.LocalAddr().(*stdnet.UDPAddr).Port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	xrayCreationMu.Lock()
+	inst, err := xrayCore.New(cfg)
+	xrayCreationMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { inst.Close() })
+	if err := inst.Start(); err != nil {
+		t.Fatal(err)
+	}
+	client, err := stdnet.Dial("udp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	got := make([]byte, 16)
+	if _, err := client.Write([]byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	target.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if n, _, err := target.ReadFrom(got); err != nil || string(got[:n]) != "before" {
+		t.Fatalf("UDP inbound did not forward before stop: %q, %v", got[:n], err)
+	}
+
+	stopAccepting(inst)
+
+	client.Write([]byte("after"))
+	target.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _, err := target.ReadFrom(got); err == nil {
+		t.Fatalf("stopped UDP inbound still forwarded %q", got[:n])
+	}
+}

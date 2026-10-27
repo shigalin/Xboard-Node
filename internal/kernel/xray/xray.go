@@ -719,12 +719,12 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 	}
 }
 
-// stopAccepting closes the stream listeners of a replaced instance. Inbounds
+// stopAccepting makes a replaced instance refuse new connections. Inbounds
 // share their port through SO_REUSEPORT, so an open old listener would keep
 // taking new connections with stale users and limits while it drains.
-// Established connections keep running. UDP-based listeners (Hysteria, KCP,
-// XHTTP over HTTP/3, Shadowsocks UDP) carry every flow on one socket and stay
-// open until the hard close.
+// Established stream connections keep running. UDP-based listeners (Hysteria,
+// mKCP, XHTTP over HTTP/3, Shadowsocks UDP) carry every flow on one socket, so
+// Xray-core closes them and their clients reconnect to the new instance.
 func stopAccepting(inst *xrayCore.Instance) {
 	if inst == nil {
 		return
@@ -736,7 +736,7 @@ func stopAccepting(inst *xrayCore.Instance) {
 	for _, h := range im.ListHandlers(context.Background()) {
 		if s, ok := h.(interface{ StopAccepting() error }); ok {
 			if err := s.StopAccepting(); err != nil {
-				nlog.Core().Debug("xray: old inbound keeps accepting until closed", "tag", h.Tag(), "reason", err)
+				nlog.Core().Warn("xray: old inbound may keep accepting until closed", "tag", h.Tag(), "error", err)
 			}
 		}
 	}
