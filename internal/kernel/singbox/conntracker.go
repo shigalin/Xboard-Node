@@ -71,13 +71,13 @@ func (t *ConnTracker) admit(uuid, ip string) (*userStats, *limiter.DeviceLease, 
 	us := t.users[uid]
 	t.usersMu.RUnlock()
 	if !known {
-		return nil, nil, true
+		return nil, nil, uuid == "" // only unauthenticated inbounds are untracked
 	}
 	limit := 0
 	if fn := t.deviceLimitFunc.Load(); fn != nil && *fn != nil {
 		limit, _ = (*fn)(uuid)
 	}
-	lease, err := t.devices.Acquire(uid, ip, limit)
+	lease, err := t.devices.Acquire(uid, uuid, ip, limit)
 	if err != nil {
 		nlog.Core().Debug("singbox: device admission rejected", "userID", uid)
 		return us, nil, false

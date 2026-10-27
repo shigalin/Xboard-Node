@@ -27,6 +27,7 @@ import (
 	"golang.org/x/time/rate"
 
 	_ "github.com/xtls/xray-core/main/distro/all"
+	hysteriaAccount "github.com/xtls/xray-core/proxy/hysteria/account"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
@@ -185,9 +186,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
 	stopAccepting(old)
 	x.closeOld(old, oldLD)
-	if old != nil {
-		x.devices.CloseRemovedUsers(oldUsers, users)
-	}
+	x.devices.UpdateUsers(users)
 
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -214,6 +213,7 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 	if same {
 		x.users = users
 		x.mu.Unlock()
+		x.devices.UpdateUsers(users)
 		nlog.Core().Debug("xray: limits updated, kernel configuration unchanged")
 		return nil
 	}
@@ -347,15 +347,23 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		userMap[u.ID] = u
 	}
 	var toAdd []model.UserSpec
+	rekey := false
 	for _, u := range users {
-		if _, exists := userMap[u.ID]; !exists {
+		if old, exists := userMap[u.ID]; !exists {
 			toAdd = append(toAdd, u)
+		} else if old.UUID != u.UUID {
+			rekey = true
 		}
 		userMap[u.ID] = u // always overwrite properties
 	}
 	merged := make([]model.UserSpec, 0, len(userMap))
 	for _, u := range userMap {
 		merged = append(merged, u)
+	}
+	if rekey {
+		x.mu.Unlock()
+		added, _, err := x.UpdateUsers(merged)
+		return added, err
 	}
 
 	if len(toAdd) == 0 {
@@ -364,6 +372,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
 		x.updateBandwidthLimits(merged)
+		x.devices.UpdateUsers(merged)
 		return 0, nil
 	}
 
@@ -404,6 +413,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	x.mu.Unlock()
 	x.updateDispatcherLimits(merged)
 	x.updateBandwidthLimits(merged)
+	x.devices.UpdateUsers(merged)
 
 	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(merged))
 	return added, nil
@@ -437,7 +447,12 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	if len(kept) == 0 {
 		x.mu.Unlock()
+		x.devices.UpdateUsers(nil)
+		x.updateDispatcherLimits(nil)
 		x.Stop()
+		x.mu.Lock()
+		x.users = nil
+		x.mu.Unlock()
 		return removed, nil
 	}
 
@@ -465,13 +480,12 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	}
 
 	x.mu.Lock()
-	oldUsers := x.users
 	x.users = kept
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
 	x.updateBandwidthLimits(kept)
 	x.dropBandwidthLimits(users, kept)
-	x.devices.CloseRemovedUsers(oldUsers, kept)
+	x.devices.UpdateUsers(kept)
 
 	nlog.Core().Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
 	return actualRemoved, nil
@@ -487,6 +501,15 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		return 0, 0, fmt.Errorf("not running")
 	}
 	toAdd, toRemove := kernel.UserDiff(x.users, users)
+	replacements := make(map[int]string, len(toAdd))
+	for _, next := range toAdd {
+		replacements[next.ID] = next.UUID
+	}
+	for _, old := range x.users {
+		if next, ok := replacements[old.ID]; ok && old.UUID != next {
+			toRemove = append(toRemove, old)
+		}
+	}
 	added, removed = len(toAdd), len(toRemove)
 
 	if added == 0 && removed == 0 {
@@ -495,6 +518,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		x.mu.Unlock()
 		x.updateDispatcherLimits(users)
 		x.updateBandwidthLimits(users)
+		x.devices.UpdateUsers(users)
 		nlog.Core().Info("xray: limits updated, kernel unchanged")
 		return 0, 0, nil
 	}
@@ -515,34 +539,17 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	nc := x.nodeConfig
 	x.mu.Unlock()
 
-	ctx := context.Background()
-
-	// Remove first, then add (order matters for UUID changes on same ID)
-	for _, u := range toRemove {
-		email := userEmail(u.ID)
-		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
-		}
-	}
-	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
-		if err != nil {
-			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
-			continue
-		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
-		}
+	if err = applyUserChanges(um, proto, nc, toAdd, toRemove); err != nil {
+		return 0, 0, err
 	}
 
 	x.mu.Lock()
-	oldUsers := x.users
 	x.users = users
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 	x.dropBandwidthLimits(toRemove, users)
-	x.devices.CloseRemovedUsers(oldUsers, users)
+	x.devices.UpdateUsers(users)
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return
@@ -594,6 +601,12 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 	mu := &protocol.MemoryUser{Email: email, Level: 0}
 
 	switch proto {
+	case "hysteria":
+		account, err := (&hysteriaAccount.Account{Auth: u.UUID}).AsAccount()
+		if err != nil {
+			return nil, fmt.Errorf("build hysteria account: %w", err)
+		}
+		mu.Account = account
 	case "vmess":
 		id, err := uuid.ParseString(u.UUID)
 		if err != nil {

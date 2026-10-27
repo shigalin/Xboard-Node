@@ -289,8 +289,11 @@ func TestLimitDispatcherRebindUntrackedLink(t *testing.T) {
 	ld := newTestDispatcher()
 	ld.UpdateLimits(map[string]int{userEmail(1): 1}, map[string]int{userEmail(1): 1}, nil)
 	untracked, _ := testLink()
-	if err := ld.RebindSession(userContext(9, "2.2.2.2"), untracked); err != nil {
-		t.Fatalf("unadmitted user could not reuse an untracked link: %v", err)
+	if err := ld.RebindSession(userContext(9, "2.2.2.2"), untracked); !errors.Is(err, limiter.ErrUserRevoked) {
+		t.Fatalf("unknown authenticated user must be rejected: %v", err)
+	}
+	if err := ld.RebindSession(context.Background(), untracked); err != nil {
+		t.Fatalf("anonymous inbound could not reuse an untracked link: %v", err)
 	}
 	if err := ld.RebindSession(userContext(1, "2.2.2.2"), untracked); !errors.Is(err, routing.ErrSessionNotOwned) {
 		t.Fatalf("tracked user must get a fresh, admitted session: %v", err)

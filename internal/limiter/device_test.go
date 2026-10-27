@@ -20,7 +20,7 @@ func testDeviceManager() (*DeviceManager, *time.Time) {
 
 func mustAcquire(t *testing.T, m *DeviceManager, uid int, ip string, limit int) *DeviceLease {
 	t.Helper()
-	l, err := m.Acquire(uid, ip, limit)
+	l, err := m.Acquire(uid, "", ip, limit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,14 +42,14 @@ func TestDevicesStrictLimitKicksAndPunishesAllIPs(t *testing.T) {
 	closed := make(chan struct{})
 	first.Bind(func() { close(closed); first.Release() })
 	second := mustAcquire(t, m, 1, "9.9.9.9", 1)
-	if _, err := m.Acquire(1, "1.1.1.1", 1); !errors.Is(err, ErrDeviceLimit) {
+	if _, err := m.Acquire(1, "", "1.1.1.1", 1); !errors.Is(err, ErrDeviceLimit) {
 		t.Fatalf("new IP admitted: %v", err)
 	}
 	waitClosed(t, closed)
 	if _, count := m.Snapshot(); count != 0 {
 		t.Fatalf("kicked connections still counted: %d", count)
 	}
-	if _, err := m.Acquire(1, "9.9.9.9", 1); !errors.Is(err, ErrDeviceLimit) {
+	if _, err := m.Acquire(1, "", "9.9.9.9", 1); !errors.Is(err, ErrDeviceLimit) {
 		t.Fatal("old IP bypassed cooldown")
 	}
 	// Releasing an old lease after a reconnect must not decrement the new slot.
@@ -80,7 +80,7 @@ func TestDevicesGlobalUnionAndFreshness(t *testing.T) {
 			if mode == "cleared" {
 				m.ClearGlobalDevices()
 			}
-			_, err := m.Acquire(1, "2.2.2.2", 2)
+			_, err := m.Acquire(1, "", "2.2.2.2", 2)
 			if mode == "fresh" && !errors.Is(err, ErrDeviceLimit) {
 				t.Fatal("global IP was not included")
 			}
@@ -99,7 +99,7 @@ func TestDevicesConcurrentLastSlotAndLateBind(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if _, err := m.Acquire(1, fmt.Sprintf("10.0.0.%d", i), 1); err == nil {
+			if _, err := m.Acquire(1, "", fmt.Sprintf("10.0.0.%d", i), 1); err == nil {
 				admitted.Add(1)
 			}
 		}(i)
@@ -127,7 +127,7 @@ func TestDevicesConcurrentLastSlotAndLateBind(t *testing.T) {
 func TestDevicesRebindAndInstanceIsolation(t *testing.T) {
 	m := NewDeviceManager(0)
 	l := mustAcquire(t, m, 1, "1.1.1.1", 1)
-	if err := l.Rebind("::ffff:2.2.2.2", 1); err != nil {
+	if err := l.Rebind("", "::ffff:2.2.2.2", 1); err != nil {
 		t.Fatal(err)
 	}
 	alive, count := m.Snapshot()
@@ -135,10 +135,10 @@ func TestDevicesRebindAndInstanceIsolation(t *testing.T) {
 		t.Fatalf("incorrect rebind: %v", alive)
 	}
 	mustAcquire(t, m, 1, "2.2.2.2", 1)
-	if err := l.Rebind("3.3.3.3", 1); !errors.Is(err, ErrDeviceLimit) {
+	if err := l.Rebind("", "3.3.3.3", 1); !errors.Is(err, ErrDeviceLimit) {
 		t.Fatal("rebind bypassed another live IP")
 	}
-	if err := l.Rebind("2.2.2.2", 1); !errors.Is(err, ErrConnectionClosed) {
+	if err := l.Rebind("", "2.2.2.2", 1); !errors.Is(err, ErrConnectionClosed) {
 		t.Fatal("revoked session was reusable")
 	}
 	other := NewDeviceManager(0)
@@ -155,7 +155,7 @@ func TestDevicesCloseByIDAndLimitReduction(t *testing.T) {
 	}
 	mustAcquire(t, m, 1, "1.1.1.1", 2)
 	mustAcquire(t, m, 1, "2.2.2.2", 2)
-	if _, err := m.Acquire(1, "1.1.1.1", 1); !errors.Is(err, ErrDeviceLimit) {
+	if _, err := m.Acquire(1, "", "1.1.1.1", 1); !errors.Is(err, ErrDeviceLimit) {
 		t.Fatal("existing IP bypassed reduced limit")
 	}
 }
@@ -170,7 +170,7 @@ func TestDevicesGlobalSnapshotExpiresAfterTTL(t *testing.T) {
 			m, now := testDeviceManager()
 			m.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
 			*now = now.Add(tc.age)
-			_, err := m.Acquire(1, "1.1.1.1", 1)
+			_, err := m.Acquire(1, "", "1.1.1.1", 1)
 			if tc.fresh != errors.Is(err, ErrDeviceLimit) {
 				t.Fatalf("snapshot aged %v: err=%v", tc.age, err)
 			}
@@ -183,7 +183,7 @@ func TestDeviceScopesShareAdmissionButNotLifetimes(t *testing.T) {
 	old, next := m.NewScope(), m.NewScope()
 	mustAcquire(t, old, 1, "1.1.1.1", 2)
 	mustAcquire(t, next, 2, "2.2.2.2", 0)
-	if _, err := next.Acquire(1, "3.3.3.3", 1); !errors.Is(err, ErrDeviceLimit) {
+	if _, err := next.Acquire(1, "", "3.3.3.3", 1); !errors.Is(err, ErrDeviceLimit) {
 		t.Fatal("IP held through another scope was not counted")
 	}
 	if old.ActiveCount() != 0 || next.ActiveCount() != 1 {
@@ -203,14 +203,14 @@ func TestSnapshotPrunesIdleUsersOnlyAfterCooldown(t *testing.T) {
 	m, now := testDeviceManager()
 	mustAcquire(t, m, 2, "2.2.2.2", 0).Release()
 	mustAcquire(t, m, 1, "1.1.1.1", 1)
-	if _, err := m.Acquire(1, "9.9.9.9", 1); !errors.Is(err, ErrDeviceLimit) {
+	if _, err := m.Acquire(1, "", "9.9.9.9", 1); !errors.Is(err, ErrDeviceLimit) {
 		t.Fatalf("breach admitted: %v", err)
 	}
 	m.Snapshot()
 	if _, ok := m.users[2]; ok {
 		t.Fatal("idle user without cooldown was kept")
 	}
-	if _, err := m.Acquire(1, "1.1.1.1", 1); !errors.Is(err, ErrDeviceLimit) {
+	if _, err := m.Acquire(1, "", "1.1.1.1", 1); !errors.Is(err, ErrDeviceLimit) {
 		t.Fatal("pruning forgot an active cooldown")
 	}
 	*now = now.Add(DefaultDeviceLimitCooldown)
@@ -221,16 +221,20 @@ func TestSnapshotPrunesIdleUsersOnlyAfterCooldown(t *testing.T) {
 	mustAcquire(t, m, 1, "1.1.1.1", 1)
 }
 
-func TestCloseRemovedUsersClosesAbsentAndRekeyedUsers(t *testing.T) {
+func TestUpdateUsersClosesAbsentAndRekeyedUsers(t *testing.T) {
 	m := NewDeviceManager(0)
 	old := []model.UserSpec{{ID: 1, UUID: "a"}, {ID: 2, UUID: "b"}, {ID: 3, UUID: "c"}}
 	current := []model.UserSpec{{ID: 1, UUID: "a"}, {ID: 2, UUID: "b2"}}
 	var closed [4]atomic.Int32
 	for _, u := range old {
 		uid := u.ID
-		mustAcquire(t, m.NewScope(), uid, "1.1.1.1", 0).Bind(func() { closed[uid].Add(1) })
+		lease, err := m.NewScope().Acquire(uid, u.UUID, "1.1.1.1", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease.Bind(func() { closed[uid].Add(1) })
 	}
-	if n := m.CloseRemovedUsers(old, current); n != 2 {
+	if n := m.UpdateUsers(current); n != 2 {
 		t.Fatalf("closed %d sessions, want 2", n)
 	}
 	deadline := time.Now().Add(time.Second)

@@ -1000,8 +1000,10 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		for _, delta := range deltaUsers {
 			for _, old := range s.lastUsers {
 				if old.ID == delta.ID && old.UUID != delta.UUID {
-					s.kernel.RemoveUsers([]model.UserSpec{old})
-					break
+					// Replace credentials in one kernel update. Removing the last
+					// user first stops Xray before the new credential can be added.
+					s.applyUserUpdate(ctx, merged, "")
+					return
 				}
 			}
 		}

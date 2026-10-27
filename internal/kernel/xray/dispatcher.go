@@ -72,7 +72,7 @@ type LimitDispatcher struct {
 	deviceLimitFunc func(string) (int, bool)
 }
 
-func (d *LimitDispatcher) identity(ctx context.Context) (uid int, ip string, limit int) {
+func (d *LimitDispatcher) identity(ctx context.Context) (uid int, credential, ip string, limit int, err error) {
 	si := session.InboundFromContext(ctx)
 	if si == nil || si.User == nil || si.User.Email == "" {
 		return
@@ -82,6 +82,11 @@ func (d *LimitDispatcher) identity(ctx context.Context) (uid int, ip string, lim
 	limit = d.deviceLimits[si.User.Email]
 	uuid, fn := d.uuidByUID[uid], d.deviceLimitFunc
 	d.mu.RUnlock()
+	if uid == 0 || !accountMatchesUUID(si.User.Account, uuid) {
+		err = limiter.ErrUserRevoked
+		return
+	}
+	credential = uuid
 	if fn != nil && uuid != "" {
 		if l, ok := fn(uuid); ok {
 			limit = l
@@ -92,11 +97,14 @@ func (d *LimitDispatcher) identity(ctx context.Context) (uid int, ip string, lim
 }
 
 func (d *LimitDispatcher) acquire(ctx context.Context) (*limiter.DeviceLease, int, error) {
-	uid, ip, limit := d.identity(ctx)
+	uid, credential, ip, limit, err := d.identity(ctx)
+	if err != nil {
+		return nil, uid, err
+	}
 	if uid == 0 {
 		return nil, 0, nil
 	}
-	lease, err := d.devices.Acquire(uid, ip, limit)
+	lease, err := d.devices.Acquire(uid, credential, ip, limit)
 	return lease, uid, err
 }
 
@@ -242,8 +250,14 @@ func (s *trackedSession) terminate() {
 // does not track (e.g. from the instance before a hot reload) is reported as
 // not owned, so Xray-core dispatches it anew instead of dropping the Mux.
 func (d *LimitDispatcher) RebindSession(ctx context.Context, link *transport.Link) error {
-	uid, ip, limit := d.identity(ctx)
 	writer, ok := link.Writer.(*closeTrackingWriter)
+	if ok && writer.dispatcher != d {
+		return routing.ErrSessionNotOwned
+	}
+	uid, credential, ip, limit, err := d.identity(ctx)
+	if err != nil {
+		return err
+	}
 	if !ok && uid == 0 {
 		return nil // neither session is subject to admission
 	}
@@ -253,7 +267,7 @@ func (d *LimitDispatcher) RebindSession(ctx context.Context, link *transport.Lin
 	if uid == 0 || writer.userID != uid {
 		return errors.New("XUDP session user mismatch")
 	}
-	if err := writer.lease.Rebind(ip, limit); err != nil {
+	if err := writer.lease.Rebind(credential, ip, limit); err != nil {
 		if errors.Is(err, limiter.ErrConnectionClosed) {
 			// The session already ended (kick, close or expiry) while Xray-core
 			// still caches it. Dispatching anew goes through admission again

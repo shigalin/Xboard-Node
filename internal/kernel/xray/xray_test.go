@@ -104,7 +104,7 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 		if i == 6 {
 			uid, ip = 2, "2.2.2.2"
 		}
-		if _, err := ld.devices.Acquire(uid, ip, 0); err != nil {
+		if _, err := ld.devices.Acquire(uid, "", ip, 0); err != nil {
 			t.Fatal(err)
 		}
 	}

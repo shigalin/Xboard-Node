@@ -16,6 +16,7 @@ const globalDeviceTTL = 300 * time.Second
 
 var ErrDeviceLimit = errors.New("device limit exceeded")
 var ErrConnectionClosed = errors.New("connection already closed")
+var ErrUserRevoked = errors.New("user identity revoked")
 
 type deviceUser struct {
 	ips      map[string]int
@@ -31,6 +32,7 @@ type deviceState struct {
 	global       map[int]map[string]bool
 	globalUpdate time.Time
 	cooldown     time.Duration
+	identities   map[int]string // nil until the first successful user update
 	nextID       uint64
 	now          func() time.Time
 }
@@ -81,9 +83,13 @@ func deviceIP(ip string) string {
 // Acquire checks and reserves a slot atomically, including for UDP. Bind must
 // attach the transport closer afterwards. A kick between Acquire and Bind
 // revokes the reservation, and Bind immediately closes the late transport.
-func (m *DeviceManager) Acquire(userID int, ip string, limit int) (*DeviceLease, error) {
+func (m *DeviceManager) Acquire(userID int, uuid, ip string, limit int) (*DeviceLease, error) {
 	ip = deviceIP(ip)
 	m.mu.Lock()
+	if !m.identityAllowedLocked(userID, uuid) {
+		m.mu.Unlock()
+		return nil, ErrUserRevoked
+	}
 	u := m.users[userID]
 	if u == nil {
 		u = &deviceUser{ips: make(map[string]int), conns: make(map[string]*DeviceLease)}
@@ -99,7 +105,7 @@ func (m *DeviceManager) Acquire(userID int, ip string, limit int) (*DeviceLease,
 		return nil, err
 	}
 	m.nextID++
-	l := &DeviceLease{manager: m, userID: userID, ip: ip, id: strconv.FormatUint(m.nextID, 36)}
+	l := &DeviceLease{manager: m, userID: userID, uuid: uuid, ip: ip, id: strconv.FormatUint(m.nextID, 36)}
 	u.ips[ip]++
 	u.conns[l.id] = l
 	m.conns[l.id] = l
@@ -239,22 +245,37 @@ func (m *DeviceManager) CloseUser(uid int) int {
 	return n
 }
 
-// CloseRemovedUsers closes the sessions of every user in old that is absent
-// from current or has a new UUID. Kernels only stop authenticating removed
-// users; their established connections would otherwise run until they end.
-// It covers every scope, so sessions draining on a replaced instance close too.
-func (m *DeviceManager) CloseRemovedUsers(old, current []model.UserSpec) int {
+// UpdateUsers publishes the identities accepted by every scope and revokes
+// obsolete leases atomically with admission. A newly authenticated UUID must
+// not be closed merely because it shares a user ID with the old credential.
+func (m *DeviceManager) UpdateUsers(current []model.UserSpec) int {
 	uuids := make(map[int]string, len(current))
 	for _, u := range current {
 		uuids[u.ID] = u.UUID
 	}
 	closed := 0
-	for _, u := range old {
-		if uuid, ok := uuids[u.ID]; !ok || uuid != u.UUID {
-			closed += m.CloseUser(u.ID)
+	m.mu.Lock()
+	m.identities = uuids
+	var closers []func()
+	for _, l := range m.conns {
+		if !m.identityAllowedLocked(l.userID, l.uuid) {
+			closed++
+			if closer := m.releaseLocked(l); closer != nil {
+				closers = append(closers, closer)
+			}
 		}
 	}
+	m.mu.Unlock()
+	closeDevices(closers)
 	return closed
+}
+
+func (m *DeviceManager) identityAllowedLocked(uid int, uuid string) bool {
+	if m.identities == nil {
+		return true
+	}
+	current, ok := m.identities[uid]
+	return ok && current == uuid
 }
 
 // CloseAll closes the leases acquired through this scope only.
@@ -311,6 +332,7 @@ func closeDevices(closers []func()) {
 type DeviceLease struct {
 	manager *DeviceManager
 	userID  int
+	uuid    string
 	ip      string
 	id      string
 	closed  bool
@@ -341,13 +363,17 @@ func (l *DeviceLease) Release() {
 
 // Rebind rechecks an existing XUDP session against the current user's policy.
 // Moving a session releases its old IP reference before reserving the new one.
-func (l *DeviceLease) Rebind(ip string, limit int) error {
+func (l *DeviceLease) Rebind(uuid, ip string, limit int) error {
 	m := l.manager
 	ip = deviceIP(ip)
 	m.mu.Lock()
 	if l.closed {
 		m.mu.Unlock()
 		return ErrConnectionClosed
+	}
+	if uuid != l.uuid || !m.identityAllowedLocked(l.userID, uuid) {
+		m.mu.Unlock()
+		return ErrUserRevoked
 	}
 	u := m.users[l.userID]
 	oldIP := l.ip

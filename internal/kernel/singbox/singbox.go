@@ -117,7 +117,6 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	oldCancel := s.cancel
 	oldCtx := s.ctx
 	oldTracker := s.connTracker
-	oldUsers := s.users
 
 	instance, err := box.New(box.Options{
 		Context: ctx,
@@ -158,9 +157,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.nodeConfig = nodeConfig
 	s.tls = tls
 	s.connTracker = tracker
-	if oldTracker != nil {
-		s.devices.CloseRemovedUsers(oldUsers, users)
-	}
+	s.devices.UpdateUsers(users)
 
 	// Recycle old instance in background — drain then close.
 	if oldBox != nil {
@@ -321,7 +318,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	}
 
 	nlog.Core().Debug("sing-box reloaded", "users", len(users))
-	s.devices.CloseRemovedUsers(s.users, users)
+	s.devices.UpdateUsers(users)
 	s.users = users
 	s.nodeConfig = nodeConfig
 	s.tls = tls
@@ -445,6 +442,7 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	if err := s.reloadInboundsLocked(merged); err != nil {
 		return 0, err
 	}
+	s.devices.UpdateUsers(merged)
 	s.users = merged
 	return len(toAdd), nil
 }
@@ -479,7 +477,7 @@ func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 	if err := s.reloadInboundsLocked(kept); err != nil {
 		return 0, err
 	}
-	s.devices.CloseRemovedUsers(s.users, kept)
+	s.devices.UpdateUsers(kept)
 	s.users = kept
 	return removed, nil
 }
@@ -501,6 +499,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 		if s.connTracker != nil {
 			s.connTracker.SetUserMap(buildUserMap(users))
 		}
+		s.devices.UpdateUsers(users)
 		s.users = users
 		return 0, 0, nil
 	}
@@ -508,7 +507,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 	if err = s.reloadInboundsLocked(users); err != nil {
 		return 0, 0, err
 	}
-	s.devices.CloseRemovedUsers(s.users, users)
+	s.devices.UpdateUsers(users)
 	s.users = users
 	return
 }
