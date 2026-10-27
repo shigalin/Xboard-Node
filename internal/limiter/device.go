@@ -80,6 +80,49 @@ func deviceIP(ip string) string {
 	return ip
 }
 
+// deviceSet counts devices the way the panel does: one dual-stack broadband
+// line shows an IPv4 address plus an IPv6 /64, so the count is the larger of
+// distinct IPv4 addresses and distinct IPv6 /64 networks. Grouping by /64 also
+// keeps rotating privacy addresses on one device. Unparsable strings count as
+// IPv4 addresses.
+type deviceSet struct {
+	v4 map[string]struct{}
+	v6 map[netip.Prefix]struct{}
+}
+
+func (s *deviceSet) add(ip string) {
+	addr, err := netip.ParseAddr(ip)
+	if err == nil {
+		addr = addr.Unmap()
+		ip = addr.String()
+	}
+	if err == nil && addr.Is6() {
+		p, _ := addr.WithZone("").Prefix(64)
+		if s.v6 == nil {
+			s.v6 = make(map[netip.Prefix]struct{})
+		}
+		s.v6[p] = struct{}{}
+		return
+	}
+	if s.v4 == nil {
+		s.v4 = make(map[string]struct{})
+	}
+	s.v4[ip] = struct{}{}
+}
+
+func (s *deviceSet) count() int {
+	return max(len(s.v4), len(s.v6))
+}
+
+// CountDevices returns the device count of one user's online IPs.
+func CountDevices(ips map[string]bool) int {
+	var s deviceSet
+	for ip := range ips {
+		s.add(ip)
+	}
+	return s.count()
+}
+
 // Acquire checks and reserves a slot atomically, including for UDP. Bind must
 // attach the transport closer afterwards. A kick between Acquire and Bind
 // revokes the reservation, and Bind immediately closes the late transport.
@@ -143,23 +186,17 @@ func (m *DeviceManager) hasRoomLocked(u *deviceUser, uid int, ip string, limit i
 	if m.globalUpdate.IsZero() || now.Sub(m.globalUpdate) > globalDeviceTTL {
 		global = nil
 	}
-	need := 0
-	if u.ips[ip] == 0 && !global[ip] {
-		need = 1
+	// The union never counts fewer devices than either side, so an already
+	// over-limit local or panel set is refused even for a known IP.
+	var s deviceSet
+	for ip := range u.ips {
+		s.add(ip)
 	}
-	if len(u.ips) > limit || len(global) > limit {
-		return false
-	}
-	if len(u.ips)+len(global)+need <= limit {
-		return true
-	}
-	total := len(u.ips)
 	for ip := range global {
-		if u.ips[ip] == 0 {
-			total++
-		}
+		s.add(ip)
 	}
-	return total+need <= limit
+	s.add(ip)
+	return s.count() <= limit
 }
 
 // UpdateGlobalDevices installs a panel snapshot. It lives in the state shared by

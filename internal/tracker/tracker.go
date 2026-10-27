@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
@@ -16,7 +17,7 @@ import (
 type snapshot struct {
 	traffic   map[int][2]int64        // userID → [upload, download] delta
 	aliveIPs  map[int]map[string]bool // userID → set of source IPs
-	online    map[int]int             // userID → distinct IP count
+	online    map[int]int             // userID → device count (limiter.CountDevices)
 	connCount int
 	inSpeed   int64
 	outSpeed  int64
@@ -132,7 +133,7 @@ func (t *Tracker) Process(
 	// Compute online from alive IPs.
 	online := make(map[int]int, len(kernelAliveIPs))
 	for uid, ips := range kernelAliveIPs {
-		online[uid] = len(ips)
+		online[uid] = limiter.CountDevices(ips)
 	}
 
 	// Publish new snapshot (readers will see this atomically).
@@ -307,7 +308,7 @@ func calcAliveIPsHash(aliveIPs map[int]map[string]bool) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// CurrentOnline returns a snapshot copy of user_id → device count (distinct IPs).
+// CurrentOnline returns a snapshot copy of user_id → device count.
 // Lock-free: reads from live snapshot.
 func (t *Tracker) CurrentOnline() map[int]int {
 	s := t.live.Load()

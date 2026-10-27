@@ -91,6 +91,42 @@ func TestDevicesGlobalUnionAndFreshness(t *testing.T) {
 	}
 }
 
+func TestCountDevicesDualStack(t *testing.T) {
+	for _, tc := range []struct {
+		ips  []string
+		want int
+	}{
+		{[]string{"1.1.1.1", "2001:db8:1:1::a", "2001:db8:1:1::b"}, 1},
+		{[]string{"1.1.1.1", "::ffff:1.1.1.1", "fe80::1%eth0", "fe80::2"}, 1},
+		{[]string{"1.1.1.1", "2.2.2.2", "2001:db8:1:1::a"}, 2},
+		{[]string{"1.1.1.1", "2001:db8:1:1::a", "2001:db8:1:2::a"}, 2},
+	} {
+		ips := make(map[string]bool, len(tc.ips))
+		for _, ip := range tc.ips {
+			ips[ip] = true
+		}
+		if got := CountDevices(ips); got != tc.want {
+			t.Errorf("CountDevices(%v) = %d, want %d", tc.ips, got, tc.want)
+		}
+	}
+}
+
+func TestDevicesDualStackAdmission(t *testing.T) {
+	m, _ := testDeviceManager()
+	m.UpdateGlobalDevices(map[int][]string{1: {"2001:db8:1:1::a"}})
+	mustAcquire(t, m, 1, "1.1.1.1", 1)
+	mustAcquire(t, m, 1, "2001:db8:1:1::b", 1)
+	if _, err := m.Acquire(1, "", "2001:db8:1:2::a", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatal("second IPv6 /64 admitted")
+	}
+
+	m, _ = testDeviceManager()
+	mustAcquire(t, m, 1, "1.1.1.1", 1)
+	if _, err := m.Acquire(1, "", "2.2.2.2", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatal("second IPv4 address admitted")
+	}
+}
+
 func TestDevicesConcurrentLastSlotAndLateBind(t *testing.T) {
 	m := NewDeviceManager(time.Hour)
 	var admitted atomic.Int64
