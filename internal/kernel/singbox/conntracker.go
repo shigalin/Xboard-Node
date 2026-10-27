@@ -35,10 +35,14 @@ type ConnTracker struct {
 	deviceLimitFunc atomic.Pointer[func(string) (int, bool)]
 }
 
-func NewConnTracker(_ int) *ConnTracker {
+// NewConnTracker uses devices for admission; nil creates a private manager.
+func NewConnTracker(devices *limiter.DeviceManager) *ConnTracker {
+	if devices == nil {
+		devices = limiter.NewDeviceManager(0)
+	}
 	return &ConnTracker{
 		users: make(map[int]*userStats), uuidMap: make(map[string]int),
-		devices: limiter.NewDeviceManager(0),
+		devices: devices,
 	}
 }
 
@@ -150,6 +154,10 @@ func (t *ConnTracker) CloseByUUID(uuid string) int {
 	return t.devices.CloseUser(uid)
 }
 func (t *ConnTracker) ActiveCount() int { return t.devices.ActiveCount() }
+
+// closeAll releases this tracker's leases so a stopped instance cannot keep
+// occupying IP slots in the admission state it shares with its successor.
+func (t *ConnTracker) closeAll() { t.devices.CloseAll() }
 
 // ─── trackedConn (TCP) ──────────────────────────────────────────────────────
 

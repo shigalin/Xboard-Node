@@ -26,6 +26,7 @@ func TestXrayConfiguresSharedAdmissionBeforeStart(t *testing.T) {
 	x.UpdateGlobalDevices(global, time.Now())
 	global[1][0] = "8.8.8.8" // The cached bootstrap must own a copy.
 	ld := newTestDispatcher()
+	x.attachDispatcher(ld)
 	x.configureDispatcher(ld, users)
 	link, raw := testLink()
 	ld.innerDisp = &testInnerDispatcher{link: link}
@@ -44,6 +45,7 @@ func TestXrayConfiguresSharedAdmissionBeforeStart(t *testing.T) {
 func TestXrayGlobalStateAndForceCloseAdapters(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	ld := newTestDispatcher()
+	x.attachDispatcher(ld)
 	x.limitDispatcher = ld
 	x.users = []model.UserSpec{{ID: 1, UUID: "uuid-1", DeviceLimit: 1}, {ID: 2, UUID: "uuid-2"}}
 	x.updateDispatcherLimits(x.users)
@@ -85,10 +87,47 @@ func TestXrayReloadKeepsGlobalSnapshotAge(t *testing.T) {
 	// Received longer ago than the panel TTL, then replayed into a new dispatcher.
 	x.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}}, time.Now().Add(-301*time.Second))
 	ld := newTestDispatcher()
+	x.attachDispatcher(ld)
 	x.configureDispatcher(ld, users)
 	link, _ := testLink()
 	ld.innerDisp = &testInnerDispatcher{link: link}
 	if _, err := ld.Dispatch(userContext(1, "1.1.1.1"), target(false)); err != nil {
 		t.Fatalf("reload revived an expired global snapshot: %v", err)
+	}
+}
+
+func TestXrayRestartKeepsDrainingSessionsAndLateSnapshots(t *testing.T) {
+	x := New(config.KernelConfig{Type: "xray"})
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1", DeviceLimit: 1}}
+	old := newTestDispatcher()
+	x.attachDispatcher(old)
+	x.configureDispatcher(old, users)
+	link, _ := testLink()
+	old.innerDisp = &testInnerDispatcher{link: link}
+	if _, err := old.Dispatch(userContext(1, "1.1.1.1"), target(false)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The replacement is configured before it is swapped in; the old instance
+	// keeps draining its session meanwhile.
+	next := newTestDispatcher()
+	x.attachDispatcher(next)
+	x.configureDispatcher(next, users)
+	if _, err := next.Dispatch(userContext(1, "2.2.2.2"), target(false)); !errors.Is(err, limiter.ErrDeviceLimit) {
+		t.Fatalf("draining session's IP was not counted after restart: %v", err)
+	}
+	if old.devices.ActiveCount() != 0 || next.devices.ActiveCount() != 0 {
+		t.Fatal("breach on the new instance did not kick the draining session")
+	}
+
+	// A snapshot arriving before the swap must reach the replacement.
+	x.devices.CloseUser(1)
+	other := New(config.KernelConfig{Type: "xray"})
+	fresh := newTestDispatcher()
+	other.attachDispatcher(fresh)
+	other.configureDispatcher(fresh, users)
+	other.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}}, time.Now())
+	if _, err := fresh.Dispatch(userContext(1, "3.3.3.3"), target(false)); !errors.Is(err, limiter.ErrDeviceLimit) {
+		t.Fatalf("snapshot received before swap was lost: %v", err)
 	}
 }

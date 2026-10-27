@@ -73,7 +73,7 @@ func testInboundContext(uuid, ip string) adapter.InboundContext {
 }
 
 func TestConnTrackerRoutedConnectionTracksTrafficAndAliveIPs(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := NewConnTracker(nil)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	base := &testConn{reads: [][]byte{[]byte("hello")}}
 
@@ -115,7 +115,7 @@ func TestConnTrackerRoutedConnectionTracksTrafficAndAliveIPs(t *testing.T) {
 }
 
 func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := NewConnTracker(nil)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	tracker.SetDeviceLimitFunc(func(uuid string) (int, bool) {
 		if uuid != "uuid-1" {
@@ -141,7 +141,7 @@ func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T)
 }
 
 func TestConnTrackerAdmitDeviceMergesFreshGlobalDevices(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := NewConnTracker(nil)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return 2, true })
 	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}}, time.Now())
@@ -158,7 +158,7 @@ func TestConnTrackerAdmitDeviceMergesFreshGlobalDevices(t *testing.T) {
 }
 
 func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := NewConnTracker(nil)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	base := &testConn{}
 	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
@@ -175,7 +175,7 @@ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
 }
 
 func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := NewConnTracker(nil)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	tracker.SetSpeedLimitFunc(func(uuid string) *rate.Limiter {
 		if uuid != "uuid-1" {
@@ -209,7 +209,7 @@ func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
 }
 
 func TestConnTrackerIgnoresGlobalSnapshotReceivedBeforeTTL(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := NewConnTracker(nil)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return 1, true })
 	// A snapshot replayed after a restart keeps its original receive time.

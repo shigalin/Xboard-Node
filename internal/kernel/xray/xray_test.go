@@ -306,3 +306,37 @@ func TestXrayRemoveUsersStopsKernelWhenLastUserRemoved(t *testing.T) {
 		t.Fatal("expected xray to stop when last user is removed")
 	}
 }
+
+func TestXrayBandwidthConfiguredBeforeSwapAndNeverEmptied(t *testing.T) {
+	inst := new(xrayCore.Instance)
+	bm := featurebandwidth.New()
+	if err := inst.AddFeature(bm); err != nil {
+		t.Fatalf("Instance.AddFeature(bandwidth) error = %v", err)
+	}
+	x := New(config.KernelConfig{Type: "xray"})
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 8}}
+	// Start configures the new instance before it becomes x.instance.
+	x.configureBandwidth(inst, users)
+	if bm.GetUserLimiter(userEmail(1)) == nil {
+		t.Fatal("new instance was not limited before it started accepting")
+	}
+
+	x.instance, x.users = inst, users
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2000; i++ {
+			x.updateBandwidthLimits(nil)
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			if bm.GetUserLimiter(userEmail(1)) == nil {
+				t.Fatal("limiter disappeared while limits were refreshed")
+			}
+		}
+	}
+}

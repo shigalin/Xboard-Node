@@ -174,3 +174,24 @@ func TestDevicesGlobalSnapshotKeepsReceiveTime(t *testing.T) {
 		})
 	}
 }
+
+func TestDeviceScopesShareAdmissionButNotLifetimes(t *testing.T) {
+	m := NewDeviceManager(0)
+	old, next := m.NewScope(), m.NewScope()
+	mustAcquire(t, old, 1, "1.1.1.1", 2)
+	mustAcquire(t, next, 2, "2.2.2.2", 0)
+	if _, err := next.Acquire(1, "3.3.3.3", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatal("IP held through another scope was not counted")
+	}
+	if old.ActiveCount() != 0 || next.ActiveCount() != 1 {
+		t.Fatalf("active counts = %d/%d, want 0/1", old.ActiveCount(), next.ActiveCount())
+	}
+	mustAcquire(t, old, 3, "4.4.4.4", 0)
+	old.CloseAll()
+	if old.ActiveCount() != 0 || next.ActiveCount() != 1 {
+		t.Fatal("CloseAll reached leases of another scope")
+	}
+	if _, count := m.Snapshot(); count != 1 {
+		t.Fatalf("shared snapshot count = %d, want 1", count)
+	}
+}

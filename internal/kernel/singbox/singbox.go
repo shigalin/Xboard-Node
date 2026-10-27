@@ -53,6 +53,10 @@ type SingBox struct {
 	// Survives Reload (hot-swap) since live connections persist.
 	connTracker *ConnTracker
 
+	// devices is the admission state shared by every tracker of this kernel,
+	// so a restart neither forgets draining connections nor the panel snapshot.
+	devices *limiter.DeviceManager
+
 	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
 	// Set once by SetSpeedLimitFunc and forwarded to every new ConnTracker.
 	speedLimitFunc func(string) *rate.Limiter
@@ -67,7 +71,7 @@ type SingBox struct {
 }
 
 func New(cfg config.KernelConfig) *SingBox {
-	return &SingBox{cfg: cfg}
+	return &SingBox{cfg: cfg, devices: limiter.NewDeviceManager(deviceLimitCooldown(cfg))}
 }
 
 var _ kernel.Kernel = (*SingBox)(nil)
@@ -143,9 +147,8 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.tls = tls
 
 	// Fresh tracker on full restart.
-	s.connTracker = NewConnTracker(0)
+	s.connTracker = NewConnTracker(s.devices.NewScope())
 	s.connTracker.SetUserMap(buildUserMap(users))
-	s.connTracker.SetDeviceLimitCooldown(deviceLimitCooldown(s.cfg))
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
 	}
@@ -189,6 +192,9 @@ func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context
 	oldBox.Close()
 	if oldCancel != nil {
 		oldCancel()
+	}
+	if oldTracker != nil {
+		oldTracker.closeAll()
 	}
 	nlog.Core().Debug("sing-box: old instance recycled")
 }
@@ -372,6 +378,9 @@ func (s *SingBox) stop() {
 		s.cancel()
 		s.cancel = nil
 	}
+	if s.connTracker != nil {
+		s.connTracker.closeAll()
+	}
 	s.ctx = nil
 }
 
@@ -412,20 +421,12 @@ func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 
 // UpdateGlobalDevices updates the global device state from panel (for multi-node).
 func (s *SingBox) UpdateGlobalDevices(users map[int][]string, receivedAt time.Time) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.connTracker != nil {
-		s.connTracker.UpdateGlobalDevices(users, receivedAt)
-	}
+	s.devices.UpdateGlobalDevicesAt(users, receivedAt)
 }
 
 // ClearGlobalDevices clears the global device state (on WS disconnect).
 func (s *SingBox) ClearGlobalDevices() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.connTracker != nil {
-		s.connTracker.ClearGlobalDevices()
-	}
+	s.devices.ClearGlobalDevices()
 }
 
 // ─── User management (non-disruptive) ───────────────────────────────────────

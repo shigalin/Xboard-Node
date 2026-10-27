@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const DefaultDeviceLimitCooldown = 60 * time.Second
@@ -20,9 +22,8 @@ type deviceUser struct {
 	banUntil time.Time
 }
 
-// DeviceManager owns online IP admission and connection lifetimes for one node
-// instance. Both kernels use it; transport and traffic accounting stay outside.
-type DeviceManager struct {
+// deviceState is the admission state shared by every scope of a manager.
+type deviceState struct {
 	mu           sync.Mutex
 	users        map[int]*deviceUser
 	conns        map[string]*DeviceLease
@@ -33,14 +34,32 @@ type DeviceManager struct {
 	now          func() time.Time
 }
 
+// DeviceManager owns online IP admission and connection lifetimes for one node.
+// Both kernels use it; transport and traffic accounting stay outside. Each
+// kernel instance acquires through its own scope (NewScope), so connections
+// still draining on a replaced instance keep counting against the new one.
+type DeviceManager struct {
+	*deviceState
+	scoped map[string]*DeviceLease // leases acquired through this scope
+}
+
 func NewDeviceManager(cooldown time.Duration) *DeviceManager {
 	if cooldown <= 0 {
 		cooldown = DefaultDeviceLimitCooldown
 	}
 	return &DeviceManager{
-		users: make(map[int]*deviceUser), conns: make(map[string]*DeviceLease),
-		global: make(map[int]map[string]bool), cooldown: cooldown, now: time.Now,
+		deviceState: &deviceState{
+			users: make(map[int]*deviceUser), conns: make(map[string]*DeviceLease),
+			global: make(map[int]map[string]bool), cooldown: cooldown, now: time.Now,
+		},
+		scoped: make(map[string]*DeviceLease),
 	}
+}
+
+// NewScope returns a view sharing this manager's admission state. ActiveCount
+// and CloseAll only cover leases acquired through the returned scope.
+func (m *DeviceManager) NewScope() *DeviceManager {
+	return &DeviceManager{deviceState: m.deviceState, scoped: make(map[string]*DeviceLease)}
 }
 
 func (m *DeviceManager) SetCooldown(d time.Duration) {
@@ -69,9 +88,12 @@ func (m *DeviceManager) Acquire(userID int, ip string, limit int) (*DeviceLease,
 		u = &deviceUser{ips: make(map[string]int), conns: make(map[string]*DeviceLease)}
 		m.users[userID] = u
 	}
-	closers, err := m.checkLocked(u, userID, ip, limit)
+	closers, kicked, err := m.checkLocked(u, userID, ip, limit)
 	if err != nil {
 		m.mu.Unlock()
+		if kicked {
+			logDeviceKick(userID, ip, limit)
+		}
 		closeDevices(closers)
 		return nil, err
 	}
@@ -80,24 +102,33 @@ func (m *DeviceManager) Acquire(userID int, ip string, limit int) (*DeviceLease,
 	u.ips[ip]++
 	u.conns[l.id] = l
 	m.conns[l.id] = l
+	m.scoped[l.id] = l
 	m.mu.Unlock()
 	return l, nil
 }
 
 // checkLocked punishes a new session that exceeds the shared IP-set policy.
-func (m *DeviceManager) checkLocked(u *deviceUser, uid int, ip string, limit int) ([]func(), error) {
+// kicked reports a fresh breach, as opposed to a refusal during cooldown.
+func (m *DeviceManager) checkLocked(u *deviceUser, uid int, ip string, limit int) (closers []func(), kicked bool, err error) {
 	if limit <= 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	now := m.now()
 	if now.Before(u.banUntil) {
-		return nil, ErrDeviceLimit
+		return nil, false, ErrDeviceLimit
 	}
 	if m.hasRoomLocked(u, uid, ip, limit, now) {
-		return nil, nil
+		return nil, false, nil
 	}
 	u.banUntil = now.Add(m.cooldown)
-	return m.closeUserLocked(u), ErrDeviceLimit
+	return m.closeUserLocked(u), true, ErrDeviceLimit
+}
+
+// logDeviceKick reports a breach that arms the cooldown. Refusals during the
+// cooldown are routine and left to the kernels' debug logs.
+func logDeviceKick(uid int, ip string, limit int) {
+	nlog.Core().Info("device limit exceeded, kicking user and rejecting connection",
+		"userID", uid, "ip", ip, "limit", limit)
 }
 
 func (m *DeviceManager) hasRoomLocked(u *deviceUser, uid int, ip string, limit int, now time.Time) bool {
@@ -167,10 +198,11 @@ func (m *DeviceManager) Snapshot() (map[int]map[string]bool, int) {
 	return alive, len(m.conns)
 }
 
+// ActiveCount returns the number of live leases acquired through this scope.
 func (m *DeviceManager) ActiveCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.conns)
+	return len(m.scoped)
 }
 
 func (m *DeviceManager) CloseByID(id string) bool {
@@ -203,11 +235,14 @@ func (m *DeviceManager) CloseUser(uid int) int {
 	return n
 }
 
+// CloseAll closes the leases acquired through this scope only.
 func (m *DeviceManager) CloseAll() {
 	m.mu.Lock()
-	var closers []func()
-	for _, u := range m.users {
-		closers = append(closers, m.closeUserLocked(u)...)
+	closers := make([]func(), 0, len(m.scoped))
+	for _, l := range m.scoped {
+		if closer := m.releaseLocked(l); closer != nil {
+			closers = append(closers, closer)
+		}
 	}
 	m.mu.Unlock()
 	closeDevices(closers)
@@ -231,6 +266,7 @@ func (m *DeviceManager) releaseLocked(l *DeviceLease) func() {
 	u := m.users[l.userID]
 	delete(u.conns, l.id)
 	delete(m.conns, l.id)
+	delete(l.manager.scoped, l.id)
 	u.ips[l.ip]--
 	if u.ips[l.ip] == 0 {
 		delete(u.ips, l.ip)
@@ -308,6 +344,9 @@ func (l *DeviceLease) Rebind(ip string, limit int) error {
 			closers = m.closeUserLocked(u)
 		}
 		m.mu.Unlock()
+		if breach {
+			logDeviceKick(l.userID, ip, limit)
+		}
 		closeDevices(closers)
 		return ErrDeviceLimit
 	}

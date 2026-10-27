@@ -10,6 +10,8 @@ import (
 
 	"github.com/sagernet/sing/common/buf"
 	singM "github.com/sagernet/sing/common/metadata"
+
+	"github.com/cedar2025/xboard-node/internal/config"
 )
 
 type devicePacketConn struct {
@@ -28,7 +30,7 @@ func (*devicePacketConn) SetReadDeadline(time.Time) error                    { r
 func (*devicePacketConn) SetWriteDeadline(time.Time) error                   { return nil }
 
 func TestSingBoxUDPAdmissionKicksAndPunishes(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := NewConnTracker(nil)
 	tracker.SetUserMap(map[string]int{"user-1": 1})
 	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return 1, true })
 	first := &devicePacketConn{closed: make(chan struct{})}
@@ -59,5 +61,30 @@ func TestSingBoxUDPAdmissionKicksAndPunishes(t *testing.T) {
 	wrapped.Close()
 	if tracker.ActiveCount() != 0 {
 		t.Fatal("kicked UDP connection leaked a reference")
+	}
+}
+
+func TestSingBoxRestartKeepsDrainingConnsAndSnapshots(t *testing.T) {
+	s := New(config.KernelConfig{})
+	s.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}}, time.Now())
+	old := NewConnTracker(s.devices.NewScope())
+	next := NewConnTracker(s.devices.NewScope())
+	for _, tr := range []*ConnTracker{old, next} {
+		tr.SetUserMap(map[string]int{"user-1": 1})
+		tr.SetDeviceLimitFunc(func(string) (int, bool) { return 2, true })
+	}
+	first := &devicePacketConn{closed: make(chan struct{})}
+	if old.RoutedPacketConnection(context.Background(), first, testInboundContext("user-1", "1.1.1.1"), nil, nil) == first {
+		t.Fatal("first source was not admitted")
+	}
+	second := &devicePacketConn{closed: make(chan struct{})}
+	next.RoutedPacketConnection(context.Background(), second, testInboundContext("user-1", "2.2.2.2"), nil, nil)
+	select {
+	case <-second.closed:
+	case <-time.After(time.Second):
+		t.Fatal("restart ignored the draining connection or the panel snapshot")
+	}
+	if old.ActiveCount() != 0 {
+		t.Fatal("breach did not kick the draining connection")
 	}
 }

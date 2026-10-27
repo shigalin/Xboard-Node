@@ -70,8 +70,11 @@ type Xray struct {
 	cumTraffic      map[int][2]int64
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
-	globalDevices   map[int][]string
-	globalDevicesAt time.Time // when globalDevices was received from the panel
+
+	// devices is the admission state shared by every dispatcher this kernel
+	// creates. Global snapshots and bans live here, so they need no replay
+	// into a new instance, and draining connections keep their IP slots.
+	devices *limiter.DeviceManager
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -82,6 +85,7 @@ func New(cfg config.KernelConfig) *Xray {
 	return &Xray{
 		cfg:        cfg,
 		cumTraffic: make(map[int][2]int64),
+		devices:    limiter.NewDeviceManager(time.Duration(cfg.DeviceLimitCooldown) * time.Second),
 	}
 }
 
@@ -140,8 +144,11 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	if err != nil {
 		return fmt.Errorf("create xray: %w", err)
 	}
-	// Configure admission before listeners can accept their first connection.
+	// Configure admission and speed limits before listeners can accept their
+	// first connection; a connection dispatched earlier would stay unthrottled.
+	x.attachDispatcher(ld)
 	x.configureDispatcher(ld, users)
+	x.configureBandwidth(inst, users)
 
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
 	if err := startWithTimeout(inst, startTimeout); err != nil {
@@ -294,28 +301,10 @@ func (x *Xray) SetDeviceLimitFunc(fn func(string) (int, bool)) {
 }
 
 func (x *Xray) UpdateGlobalDevices(users map[int][]string, receivedAt time.Time) {
-	copyUsers := make(map[int][]string, len(users))
-	for uid, ips := range users {
-		copyUsers[uid] = append([]string(nil), ips...)
-	}
-	x.mu.Lock()
-	x.globalDevices, x.globalDevicesAt = copyUsers, receivedAt
-	ld := x.limitDispatcher
-	x.mu.Unlock()
-	if ld != nil {
-		ld.devices.UpdateGlobalDevicesAt(copyUsers, receivedAt)
-	}
+	x.devices.UpdateGlobalDevicesAt(users, receivedAt)
 }
 
-func (x *Xray) ClearGlobalDevices() {
-	x.mu.Lock()
-	x.globalDevices, x.globalDevicesAt = nil, time.Time{}
-	ld := x.limitDispatcher
-	x.mu.Unlock()
-	if ld != nil {
-		ld.devices.ClearGlobalDevices()
-	}
-}
+func (x *Xray) ClearGlobalDevices() { x.devices.ClearGlobalDevices() }
 
 // ─── User management (non-disruptive where possible) ────────────────────────
 
@@ -790,14 +779,24 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 	return traffic, nil
 }
 
-// updateBandwidthLimits configures the patched xray-core bandwidth feature
-// with per-user speed limits in bytes per second.
+// updateBandwidthLimits configures the patched xray-core bandwidth feature of
+// the running instance with per-user speed limits in bytes per second.
 func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	inst := x.instance
-	fn := x.speedLimitFunc
 	currentUsers := x.users
 	x.mu.Unlock()
+	if users == nil {
+		users = currentUsers
+	}
+	x.configureBandwidth(inst, users)
+}
+
+// configureBandwidth sets the limiters of inst. Dispatch reads them per
+// connection and keeps what it got, so a user must never be absent while
+// being reconfigured: entries are overwritten in place instead of Reset.
+// Removed users keep a stale entry, which no longer authenticates.
+func (x *Xray) configureBandwidth(inst *xrayCore.Instance, users []model.UserSpec) {
 	if inst == nil {
 		return
 	}
@@ -809,10 +808,9 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	if !ok {
 		return
 	}
-	bm.Reset()
-	if users == nil {
-		users = currentUsers
-	}
+	x.mu.Lock()
+	fn := x.speedLimitFunc
+	x.mu.Unlock()
 	for _, u := range users {
 		email := userEmail(u.ID)
 		if fn != nil {
@@ -837,26 +835,21 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.configureDispatcher(ld, users)
 }
 
+// attachDispatcher points a newly created dispatcher at this kernel's shared
+// admission state. It must run before the instance starts accepting.
+func (x *Xray) attachDispatcher(ld *LimitDispatcher) {
+	if ld != nil {
+		ld.devices = x.devices.NewScope()
+	}
+}
+
 func (x *Xray) configureDispatcher(ld *LimitDispatcher, users []model.UserSpec) {
 	if ld == nil {
 		return
 	}
 	x.mu.Lock()
-	fn, global, globalAt := x.deviceLimitFunc, x.globalDevices, x.globalDevicesAt
+	fn := x.deviceLimitFunc
 	x.mu.Unlock()
-	cooldown := time.Duration(x.cfg.DeviceLimitCooldown) * time.Second
-	if cooldown <= 0 {
-		cooldown = limiter.DefaultDeviceLimitCooldown
-	}
-	ld.devices.SetCooldown(cooldown)
-	// A cached panel snapshot is reapplied only to a newly created dispatcher,
-	// keeping its receive time so a reload cannot extend its freshness window.
-	ld.mu.RLock()
-	newDispatcher := ld.emailToUID == nil
-	ld.mu.RUnlock()
-	if global != nil && newDispatcher {
-		ld.devices.UpdateGlobalDevicesAt(global, globalAt)
-	}
 
 	emailToUID := make(map[string]int, len(users)*2)
 	deviceLimits := make(map[string]int)
