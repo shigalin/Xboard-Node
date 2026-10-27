@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"errors"
+	"maps"
 	"net/netip"
 	"strconv"
 	"sync"
@@ -14,14 +15,77 @@ import (
 const DefaultDeviceLimitCooldown = 60 * time.Second
 const globalDeviceTTL = 300 * time.Second
 
+// maxIPsPerDevice bounds the addresses a limited user may hold per allowed
+// device, superseded ones included, so rotation tolerance cannot admit an
+// unbounded address set.
+const maxIPsPerDevice = 8
+
 var ErrDeviceLimit = errors.New("device limit exceeded")
 var ErrConnectionClosed = errors.New("connection already closed")
 var ErrUserRevoked = errors.New("user identity revoked")
 
 type deviceUser struct {
-	ips      map[string]int
+	ips      map[string]ipUse
 	conns    map[string]*DeviceLease
 	banUntil time.Time
+}
+
+type ipUse struct {
+	refs  int
+	first time.Time // when the address came online
+	last  time.Time // when it last admitted a connection
+}
+
+func (u *deviceUser) addIP(ip string, now time.Time) {
+	e, ok := u.ips[ip]
+	if !ok {
+		e.first = now
+	}
+	e.refs++
+	e.last = now
+	u.ips[ip] = e
+}
+
+func (u *deviceUser) dropIP(ip string) {
+	e := u.ips[ip]
+	if e.refs--; e.refs <= 0 {
+		delete(u.ips, ip)
+		return
+	}
+	u.ips[ip] = e
+}
+
+// liveIPs returns the local addresses that count as devices, as if extra (when
+// non-empty) admitted a connection at now. An IPv6 address stops counting once
+// a newer address appears in its /64 and it admits nothing further: privacy
+// address rotation moves a device to a new address while long-lived
+// connections stay on the old one. Another device on that /64 counts again at
+// its next connection.
+func (u *deviceUser) liveIPs(extra string, now time.Time) map[string]bool {
+	uses := u.ips
+	if extra != "" {
+		uses = maps.Clone(u.ips)
+		e, ok := uses[extra]
+		if !ok {
+			e.first = now
+		}
+		e.last = now
+		uses[extra] = e
+	}
+	newest := make(map[netip.Prefix]time.Time)
+	for ip, e := range uses {
+		if p, ok := devicePrefix(ip); ok && e.first.After(newest[p]) {
+			newest[p] = e.first
+		}
+	}
+	live := make(map[string]bool, len(uses))
+	for ip, e := range uses {
+		if p, ok := devicePrefix(ip); ok && newest[p].After(e.last) {
+			continue
+		}
+		live[ip] = true
+	}
+	return live
 }
 
 // deviceState is the admission state shared by every scope of a manager.
@@ -80,14 +144,23 @@ func deviceIP(ip string) string {
 	return ip
 }
 
-// deviceSet counts devices the way the panel does: one dual-stack broadband
-// line shows an IPv4 address plus an IPv6 /64, so the count is the larger of
-// distinct IPv4 addresses and distinct IPv6 /64 networks. Grouping by /64 also
-// keeps rotating privacy addresses on one device. Unparsable strings count as
-// IPv4 addresses.
+// devicePrefix returns the /64 of an IPv6 address; ok is false otherwise.
+func devicePrefix(ip string) (netip.Prefix, bool) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Unmap().Is6() {
+		return netip.Prefix{}, false
+	}
+	p, _ := addr.WithZone("").Prefix(64)
+	return p, true
+}
+
+// deviceSet counts devices the way the panel does: devices behind one
+// broadband line share its NAT IPv4 address but each has its own IPv6
+// address, so the count is the larger of distinct IPv4 and distinct IPv6
+// addresses. Unparsable strings count as IPv4 addresses.
 type deviceSet struct {
 	v4 map[string]struct{}
-	v6 map[netip.Prefix]struct{}
+	v6 map[netip.Addr]struct{}
 }
 
 func (s *deviceSet) add(ip string) {
@@ -97,11 +170,10 @@ func (s *deviceSet) add(ip string) {
 		ip = addr.String()
 	}
 	if err == nil && addr.Is6() {
-		p, _ := addr.WithZone("").Prefix(64)
 		if s.v6 == nil {
-			s.v6 = make(map[netip.Prefix]struct{})
+			s.v6 = make(map[netip.Addr]struct{})
 		}
-		s.v6[p] = struct{}{}
+		s.v6[addr.WithZone("")] = struct{}{}
 		return
 	}
 	if s.v4 == nil {
@@ -135,10 +207,11 @@ func (m *DeviceManager) Acquire(userID int, uuid, ip string, limit int) (*Device
 	}
 	u := m.users[userID]
 	if u == nil {
-		u = &deviceUser{ips: make(map[string]int), conns: make(map[string]*DeviceLease)}
+		u = &deviceUser{ips: make(map[string]ipUse), conns: make(map[string]*DeviceLease)}
 		m.users[userID] = u
 	}
-	closers, kicked, err := m.checkLocked(u, userID, ip, limit)
+	now := m.now()
+	closers, kicked, err := m.checkLocked(u, userID, ip, limit, now)
 	if err != nil {
 		m.mu.Unlock()
 		if kicked {
@@ -149,7 +222,7 @@ func (m *DeviceManager) Acquire(userID int, uuid, ip string, limit int) (*Device
 	}
 	m.nextID++
 	l := &DeviceLease{manager: m, userID: userID, uuid: uuid, ip: ip, id: strconv.FormatUint(m.nextID, 36)}
-	u.ips[ip]++
+	u.addIP(ip, now)
 	u.conns[l.id] = l
 	m.conns[l.id] = l
 	m.scoped[l.id] = l
@@ -159,11 +232,10 @@ func (m *DeviceManager) Acquire(userID int, uuid, ip string, limit int) (*Device
 
 // checkLocked punishes a new session that exceeds the shared IP-set policy.
 // kicked reports a fresh breach, as opposed to a refusal during cooldown.
-func (m *DeviceManager) checkLocked(u *deviceUser, uid int, ip string, limit int) (closers []func(), kicked bool, err error) {
+func (m *DeviceManager) checkLocked(u *deviceUser, uid int, ip string, limit int, now time.Time) (closers []func(), kicked bool, err error) {
 	if limit <= 0 {
 		return nil, false, nil
 	}
-	now := m.now()
 	if now.Before(u.banUntil) {
 		return nil, false, ErrDeviceLimit
 	}
@@ -182,20 +254,35 @@ func logDeviceKick(uid int, ip string, limit int) {
 }
 
 func (m *DeviceManager) hasRoomLocked(u *deviceUser, uid int, ip string, limit int, now time.Time) bool {
+	if _, ok := u.ips[ip]; !ok && len(u.ips) >= limit*maxIPsPerDevice {
+		return false
+	}
 	global := m.global[uid]
 	if m.globalUpdate.IsZero() || now.Sub(m.globalUpdate) > globalDeviceTTL {
 		global = nil
 	}
+	// A /64 with a live local address the panel has not seen yet predates the
+	// panel's view, so its other addresses there are no evidence of activity
+	// after rotation. Local addresses follow their own liveness instead.
 	// The union never counts fewer devices than either side, so an already
 	// over-limit local or panel set is refused even for a known IP.
 	var s deviceSet
-	for ip := range u.ips {
-		s.add(ip)
+	unreported := make(map[netip.Prefix]bool)
+	for live := range u.liveIPs(ip, now) {
+		s.add(live)
+		if p, ok := devicePrefix(live); ok && !global[live] {
+			unreported[p] = true
+		}
 	}
-	for ip := range global {
-		s.add(ip)
+	for g := range global {
+		if _, ok := u.ips[g]; ok || g == ip {
+			continue
+		}
+		if p, ok := devicePrefix(g); ok && unreported[p] {
+			continue
+		}
+		s.add(g)
 	}
-	s.add(ip)
 	return s.count() <= limit
 }
 
@@ -221,7 +308,8 @@ func (m *DeviceManager) ClearGlobalDevices() {
 	m.mu.Unlock()
 }
 
-// Snapshot reports online IPs. It runs on every traffic report, so it also
+// Snapshot reports online IPs, leaving out IPv6 addresses superseded by
+// rotation (see liveIPs). It runs on every traffic report, so it also
 // drops idle users whose cooldown has expired; the shared state outlives
 // kernel restarts and would otherwise keep every user that ever connected.
 func (m *DeviceManager) Snapshot() (map[int]map[string]bool, int) {
@@ -236,11 +324,7 @@ func (m *DeviceManager) Snapshot() (map[int]map[string]bool, int) {
 			}
 			continue
 		}
-		ips := make(map[string]bool, len(u.ips))
-		for ip := range u.ips {
-			ips[ip] = true
-		}
-		alive[uid] = ips
+		alive[uid] = u.liveIPs("", now)
 	}
 	return alive, len(m.conns)
 }
@@ -347,10 +431,7 @@ func (m *DeviceManager) releaseLocked(l *DeviceLease) func() {
 	delete(u.conns, l.id)
 	delete(m.conns, l.id)
 	delete(l.manager.scoped, l.id)
-	u.ips[l.ip]--
-	if u.ips[l.ip] == 0 {
-		delete(u.ips, l.ip)
-	}
+	u.dropIP(l.ip)
 	return l.closer
 }
 
@@ -413,15 +494,14 @@ func (l *DeviceLease) Rebind(uuid, ip string, limit int) error {
 		return ErrUserRevoked
 	}
 	u := m.users[l.userID]
-	oldIP := l.ip
-	u.ips[oldIP]--
-	if u.ips[oldIP] == 0 {
-		delete(u.ips, oldIP)
+	oldIP, oldUse := l.ip, u.ips[l.ip]
+	if ip != oldIP {
+		u.dropIP(oldIP)
 	}
 	now := m.now()
 	banned := limit > 0 && now.Before(u.banUntil)
 	breach := limit > 0 && !banned && !m.hasRoomLocked(u, l.userID, ip, limit, now)
-	u.ips[oldIP]++
+	u.ips[oldIP] = oldUse
 	if banned || breach {
 		var closers []func()
 		if breach {
@@ -435,11 +515,13 @@ func (l *DeviceLease) Rebind(uuid, ip string, limit int) error {
 		closeDevices(closers)
 		return ErrDeviceLimit
 	}
-	u.ips[oldIP]--
-	if u.ips[oldIP] == 0 {
-		delete(u.ips, oldIP)
+	if ip == oldIP {
+		oldUse.last = now
+		u.ips[ip] = oldUse
+	} else {
+		u.dropIP(oldIP)
+		u.addIP(ip, now)
 	}
-	u.ips[ip]++
 	l.ip = ip
 	m.mu.Unlock()
 	return nil

@@ -96,10 +96,10 @@ func TestCountDevicesDualStack(t *testing.T) {
 		ips  []string
 		want int
 	}{
-		{[]string{"1.1.1.1", "2001:db8:1:1::a", "2001:db8:1:1::b"}, 1},
-		{[]string{"1.1.1.1", "::ffff:1.1.1.1", "fe80::1%eth0", "fe80::2"}, 1},
+		{[]string{"1.1.1.1", "2001:db8:1:1::a", "2001:db8:1:1::b"}, 2},
+		{[]string{"1.1.1.1", "::ffff:1.1.1.1", "fe80::1%eth0", "fe80::1"}, 1},
 		{[]string{"1.1.1.1", "2.2.2.2", "2001:db8:1:1::a"}, 2},
-		{[]string{"1.1.1.1", "2001:db8:1:1::a", "2001:db8:1:2::a"}, 2},
+		{[]string{"1.1.1.1", "1.1.1.1%eth0"}, 2},
 	} {
 		ips := make(map[string]bool, len(tc.ips))
 		for _, ip := range tc.ips {
@@ -111,19 +111,61 @@ func TestCountDevicesDualStack(t *testing.T) {
 	}
 }
 
-func TestDevicesDualStackAdmission(t *testing.T) {
-	m, _ := testDeviceManager()
-	m.UpdateGlobalDevices(map[int][]string{1: {"2001:db8:1:1::a"}})
+func TestDevicesIPv6Rotation(t *testing.T) {
+	m, now := testDeviceManager()
+	mustAcquire(t, m, 1, "2001:db8:1:1::a", 1)
 	mustAcquire(t, m, 1, "1.1.1.1", 1)
+	*now = now.Add(time.Second)
 	mustAcquire(t, m, 1, "2001:db8:1:1::b", 1)
-	if _, err := m.Acquire(1, "", "2001:db8:1:2::a", 1); !errors.Is(err, ErrDeviceLimit) {
-		t.Fatal("second IPv6 /64 admitted")
+	alive, _ := m.Snapshot()
+	if alive[1]["2001:db8:1:1::a"] || !alive[1]["2001:db8:1:1::b"] {
+		t.Fatalf("rotated address still reported: %v", alive[1])
+	}
+	// A new connection on the old address means a second device.
+	*now = now.Add(time.Second)
+	if _, err := m.Acquire(1, "", "2001:db8:1:1::a", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatal("second device on the same /64 admitted")
 	}
 
 	m, _ = testDeviceManager()
 	mustAcquire(t, m, 1, "1.1.1.1", 1)
 	if _, err := m.Acquire(1, "", "2.2.2.2", 1); !errors.Is(err, ErrDeviceLimit) {
 		t.Fatal("second IPv4 address admitted")
+	}
+}
+
+func TestDevicesIPv6RotationAgainstPanelSnapshot(t *testing.T) {
+	m, now := testDeviceManager()
+	m.UpdateGlobalDevices(map[int][]string{1: {"2001:db8:1:1::a"}})
+	*now = now.Add(time.Second)
+	mustAcquire(t, m, 1, "2001:db8:1:1::b", 1)
+	// Once the panel has seen the new address, the old one is live elsewhere.
+	m.UpdateGlobalDevices(map[int][]string{1: {"2001:db8:1:1::a", "2001:db8:1:1::b"}})
+	if _, err := m.Acquire(1, "", "2001:db8:1:1::b", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatal("address active on another node was ignored")
+	}
+
+	// A superseded local address is not reported, which must not hide a
+	// device that another node reports on the same /64.
+	m, now = testDeviceManager()
+	mustAcquire(t, m, 1, "2001:db8:1:1::a", 2)
+	*now = now.Add(time.Second)
+	mustAcquire(t, m, 1, "2001:db8:1:1::b", 2)
+	m.UpdateGlobalDevices(map[int][]string{1: {"2001:db8:1:1::b", "2001:db8:1:1::c"}})
+	if _, err := m.Acquire(1, "", "1.1.1.1", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatal("device reported by another node was hidden")
+	}
+}
+
+func TestDevicesIPv6RotationIsBounded(t *testing.T) {
+	m, now := testDeviceManager()
+	for i := 1; i <= maxIPsPerDevice; i++ {
+		*now = now.Add(time.Second)
+		mustAcquire(t, m, 1, fmt.Sprintf("2001:db8:1:1::%x", i), 1)
+	}
+	*now = now.Add(time.Second)
+	if _, err := m.Acquire(1, "", "2001:db8:1:1::ff", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatal("unbounded rotated addresses admitted")
 	}
 }
 
