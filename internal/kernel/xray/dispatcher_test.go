@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/limiter"
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -39,6 +40,7 @@ type testInnerDispatcher struct {
 	err          error
 	beforeReturn func()
 	observer     routing.SessionLifecycle
+	ctx          context.Context
 	onLink       func(context.Context) error
 }
 
@@ -47,6 +49,7 @@ func (d *testInnerDispatcher) Start() error      { return nil }
 func (d *testInnerDispatcher) Close() error      { return nil }
 func (d *testInnerDispatcher) Dispatch(ctx context.Context, _ net.Destination) (*transport.Link, error) {
 	d.observer = routing.SessionLifecycleFromContext(ctx)
+	d.ctx = ctx
 	if d.beforeReturn != nil {
 		d.beforeReturn()
 	}
@@ -250,8 +253,9 @@ func TestLimitDispatcherRebindChecksIPUserAndOwner(t *testing.T) {
 	}
 	ld.devices.CloseUser(1)
 	waitWriter(t, raw)
-	if err := ld.RebindSession(userContext(1, "2.2.2.2"), link); err == nil {
-		t.Fatal("kicked XUDP session was reusable")
+	// Xray-core must dispatch anew (admission again) rather than drop the Mux.
+	if err := ld.RebindSession(userContext(1, "2.2.2.2"), link); !errors.Is(err, routing.ErrSessionNotOwned) {
+		t.Fatalf("kicked XUDP session: got %v, want ErrSessionNotOwned", err)
 	}
 }
 
@@ -293,5 +297,40 @@ func TestLimitDispatcherRebindUntrackedLink(t *testing.T) {
 	}
 	if ld.devices.ActiveCount() != 0 {
 		t.Fatal("rebind of an untracked link reserved an IP slot")
+	}
+}
+
+func TestTrackedSessionCancelsOnlyAfterOutboundReturns(t *testing.T) {
+	for _, outboundFirst := range []bool{false, true} {
+		ld := newTestDispatcher()
+		ld.UpdateLimits(map[string]int{userEmail(1): 1}, nil, nil)
+		link, _ := testLink()
+		inner := &testInnerDispatcher{link: link}
+		ld.innerDisp = inner
+		result, err := ld.Dispatch(userContext(1, "1.1.1.1"), target(false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		returned := inner.observer.(routing.OutboundObserver).OutboundReturned
+		if outboundFirst { // e.g. an outbound that hands the link to a Mux client
+			returned()
+			if inner.ctx.Err() != nil {
+				t.Fatal("context cancelled while both directions were open")
+			}
+		}
+		common.Close(result.Writer)
+		inner.observer.DownlinkClosed()
+		if _, count := ld.GetConnectionState(); count != 0 {
+			t.Fatal("finished session kept its IP")
+		}
+		if !outboundFirst {
+			if inner.ctx.Err() != nil {
+				t.Fatal("context cancelled while the outbound may still flush uplink data")
+			}
+			returned()
+		}
+		if inner.ctx.Err() == nil {
+			t.Fatal("context outlived the finished session")
+		}
 	}
 }

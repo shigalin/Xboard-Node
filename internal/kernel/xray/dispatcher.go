@@ -151,14 +151,19 @@ func (d *LimitDispatcher) trackLink(link *transport.Link, uid int, tracked *trac
 
 // A logical session reserves its IP until both directions finish, or until
 // cancellation/force-close. The parent transport can remain open for Mux.
+// Its context is cancelled only once the outbound has also returned, so an
+// outbound still flushing buffered uplink data is not cut off.
 type trackedSession struct {
-	mu                               sync.Mutex
-	lease                            *limiter.DeviceLease
-	cancel                           context.CancelFunc
-	uplinkDone, downlinkDone, closed bool
-	reader                           buf.Reader
-	writer                           buf.Writer
+	mu                                     sync.Mutex
+	lease                                  *limiter.DeviceLease
+	cancel                                 context.CancelFunc
+	uplinkDone, downlinkDone, outboundDone bool
+	released, closed                       bool
+	reader                                 buf.Reader
+	writer                                 buf.Writer
 }
+
+var _ routing.OutboundObserver = (*trackedSession)(nil)
 
 func newTrackedSession(ctx context.Context, lease *limiter.DeviceLease, direct bool) (context.Context, *trackedSession) {
 	if session.TimeoutOnlyFromContext(ctx) {
@@ -183,40 +188,43 @@ func (s *trackedSession) bind(link *transport.Link) {
 	s.lease.Bind(s.terminate)
 }
 
-func (s *trackedSession) uplinkClosed()   { s.directionClosed(true) }
-func (s *trackedSession) DownlinkClosed() { s.directionClosed(false) }
-func (s *trackedSession) directionClosed(up bool) {
+func (s *trackedSession) uplinkClosed()     { s.settle(func() { s.uplinkDone = true }) }
+func (s *trackedSession) DownlinkClosed()   { s.settle(func() { s.downlinkDone = true }) }
+func (s *trackedSession) OutboundReturned() { s.settle(func() { s.outboundDone = true }) }
+
+// settle releases the IP once both directions finished and cancels the
+// context once the outbound has returned as well. Graceful completion never
+// interrupts the link: its reader must still get buffered downlink data.
+func (s *trackedSession) settle(mark func()) {
 	s.mu.Lock()
-	if up {
-		s.uplinkDone = true
-	} else {
-		s.downlinkDone = true
-	}
-	done := s.uplinkDone && s.downlinkDone
+	mark()
+	both := s.uplinkDone && s.downlinkDone
+	release := both && !s.released
+	done := both && s.outboundDone && !s.closed
+	s.released = s.released || both
+	s.closed = s.closed || done
 	s.mu.Unlock()
+	if release {
+		s.lease.Release()
+	}
 	if done {
-		s.finish(false)
+		s.cancel()
 	}
 }
 
-func (s *trackedSession) terminate() { s.finish(true) }
-
-func (s *trackedSession) finish(interrupt bool) {
+func (s *trackedSession) terminate() {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return
 	}
-	s.closed = true
+	s.closed, s.released = true, true
 	reader, writer := s.reader, s.writer
 	s.mu.Unlock()
 	s.lease.Release()
 	s.cancel()
-	// Graceful completion must retain buffered downlink data for its reader.
-	if interrupt {
-		common.Interrupt(reader)
-		common.Interrupt(writer)
-	}
+	common.Interrupt(reader)
+	common.Interrupt(writer)
 }
 
 // RebindSession is called by Xray-core before reusing an XUDP link. A link
@@ -237,6 +245,12 @@ func (d *LimitDispatcher) RebindSession(ctx context.Context, link *transport.Lin
 		return errors.New("XUDP session user mismatch")
 	}
 	if err := writer.lease.Rebind(ip, limit); err != nil {
+		if errors.Is(err, limiter.ErrConnectionClosed) {
+			// The session already ended (kick, close or expiry) while Xray-core
+			// still caches it. Dispatching anew goes through admission again
+			// and, unlike a hard error here, keeps the client's Mux alive.
+			return routing.ErrSessionNotOwned
+		}
 		return fmt.Errorf("XUDP admission: %w", err)
 	}
 	return nil
