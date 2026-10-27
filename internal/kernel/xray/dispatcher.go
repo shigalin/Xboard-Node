@@ -83,7 +83,9 @@ func (d *LimitDispatcher) identity(ctx context.Context) (uid int, ip string, lim
 	uuid, fn := d.uuidByUID[uid], d.deviceLimitFunc
 	d.mu.RUnlock()
 	if fn != nil && uuid != "" {
-		limit, _ = fn(uuid)
+		if l, ok := fn(uuid); ok {
+			limit = l
+		}
 	}
 	ip = si.Source.Address.IP().String()
 	return

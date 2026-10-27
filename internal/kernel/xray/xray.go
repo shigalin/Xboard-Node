@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,7 +96,7 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 		DeviceLimit:          true,
 		BuiltInTrafficStats:  true,
 		AliveIPTracking:      true,
-		ForceCloseConnection: true,
+		ForceCloseConnection: false, // lease IDs are not exposed to callers
 		ForceCloseUser:       true,
 	}
 }
@@ -300,8 +299,8 @@ func (x *Xray) SetDeviceLimitFunc(fn func(string) (int, bool)) {
 	x.updateDispatcherLimits(users)
 }
 
-func (x *Xray) UpdateGlobalDevices(users map[int][]string, receivedAt time.Time) {
-	x.devices.UpdateGlobalDevicesAt(users, receivedAt)
+func (x *Xray) UpdateGlobalDevices(users map[int][]string) {
+	x.devices.UpdateGlobalDevices(users)
 }
 
 func (x *Xray) ClearGlobalDevices() { x.devices.ClearGlobalDevices() }
@@ -451,6 +450,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
 	x.updateBandwidthLimits(kept)
+	x.dropBandwidthLimits(users, kept)
 
 	nlog.Core().Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
 	return actualRemoved, nil
@@ -519,6 +519,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
+	x.dropBandwidthLimits(toRemove, users)
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return
@@ -601,18 +602,15 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 		}
 
 	case "shadowsocks":
-		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
+		if method, ok := ss2022Methods[nc.Cipher]; ok {
 			// 2022-blake3 multi-user mode
-			keySize := 32
-			if nc.Cipher == "2022-blake3-aes-128-gcm" {
-				keySize = 16
-			}
-			key := make([]byte, keySize)
-			copy(key, u.UUID)
-			mu.Account = &ss2022.MemoryAccount{Key: key}
+			mu.Account = &ss2022.MemoryAccount{Key: ss2022UserKey(u.UUID, method.size)}
 		} else {
 			// Traditional SS — build via getCipher path
 			ct := parseCipherType(nc.Cipher)
+			if ct == shadowsocks.CipherType_UNKNOWN {
+				return nil, fmt.Errorf("shadowsocks cipher %q is not supported by xray-core", nc.Cipher)
+			}
 			cipherObj, err := (&shadowsocks.Account{CipherType: ct, Password: u.UUID}).AsAccount()
 			if err != nil {
 				return nil, fmt.Errorf("build ss account: %w", err)
@@ -639,6 +637,7 @@ func parseCipherType(cipher string) shadowsocks.CipherType {
 	case "xchacha20-ietf-poly1305", "xchacha20-poly1305":
 		return shadowsocks.CipherType_XCHACHA20_POLY1305
 	case "none", "plain":
+		// Removed from xray-core; callers reject UNKNOWN explicitly.
 		return shadowsocks.CipherType_UNKNOWN
 	default:
 		return shadowsocks.CipherType_AES_256_GCM
@@ -795,17 +794,10 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 // configureBandwidth sets the limiters of inst. Dispatch reads them per
 // connection and keeps what it got, so a user must never be absent while
 // being reconfigured: entries are overwritten in place instead of Reset.
-// Removed users keep a stale entry, which no longer authenticates.
+// Removed users are deleted afterwards by dropBandwidthLimits.
 func (x *Xray) configureBandwidth(inst *xrayCore.Instance, users []model.UserSpec) {
-	if inst == nil {
-		return
-	}
-	feat := inst.GetFeature(featurebandwidth.ManagerType())
-	if feat == nil {
-		return
-	}
-	bm, ok := feat.(featurebandwidth.Manager)
-	if !ok {
+	bm := bandwidthManager(inst)
+	if bm == nil {
 		return
 	}
 	x.mu.Lock()
@@ -820,6 +812,40 @@ func (x *Xray) configureBandwidth(inst *xrayCore.Instance, users []model.UserSpe
 		bps := int64(u.SpeedLimit) * 1_000_000 / 8
 		bm.SetUserLimit(email, bps)
 	}
+}
+
+// dropBandwidthLimits deletes the limiters of removed users that are absent from
+// current, so user churn does not grow the running instance's limiter map. A
+// removed ID that is re-added (UUID change) keeps the entry just configured.
+func (x *Xray) dropBandwidthLimits(removed, current []model.UserSpec) {
+	x.mu.Lock()
+	inst := x.instance
+	x.mu.Unlock()
+	bm := bandwidthManager(inst)
+	if bm == nil {
+		return
+	}
+	kept := make(map[int]struct{}, len(current))
+	for _, u := range current {
+		kept[u.ID] = struct{}{}
+	}
+	for _, u := range removed {
+		if _, ok := kept[u.ID]; !ok {
+			bm.SetUserLimiter(userEmail(u.ID), nil)
+		}
+	}
+}
+
+func bandwidthManager(inst *xrayCore.Instance) featurebandwidth.Manager {
+	if inst == nil {
+		return nil
+	}
+	feat := inst.GetFeature(featurebandwidth.ManagerType())
+	if feat == nil {
+		return nil
+	}
+	bm, _ := feat.(featurebandwidth.Manager)
+	return bm
 }
 
 // updateDispatcherLimits configures the LimitDispatcher with per-user

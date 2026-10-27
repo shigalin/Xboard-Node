@@ -155,13 +155,9 @@ func (m *DeviceManager) hasRoomLocked(u *deviceUser, uid int, ip string, limit i
 	return total+need <= limit
 }
 
+// UpdateGlobalDevices installs a panel snapshot. It lives in the state shared by
+// every scope, so a kernel restart keeps it with its original freshness.
 func (m *DeviceManager) UpdateGlobalDevices(users map[int][]string) {
-	m.UpdateGlobalDevicesAt(users, m.now())
-}
-
-// UpdateGlobalDevicesAt installs a panel snapshot received at `at`. Replaying a
-// cached snapshot into a new manager must keep its original freshness window.
-func (m *DeviceManager) UpdateGlobalDevicesAt(users map[int][]string, at time.Time) {
 	global := make(map[int]map[string]bool, len(users))
 	for uid, ips := range users {
 		set := make(map[string]bool, len(ips))
@@ -171,7 +167,7 @@ func (m *DeviceManager) UpdateGlobalDevicesAt(users map[int][]string, at time.Ti
 		global[uid] = set
 	}
 	m.mu.Lock()
-	m.global, m.globalUpdate = global, at
+	m.global, m.globalUpdate = global, m.now()
 	m.mu.Unlock()
 }
 
@@ -181,12 +177,19 @@ func (m *DeviceManager) ClearGlobalDevices() {
 	m.mu.Unlock()
 }
 
+// Snapshot reports online IPs. It runs on every traffic report, so it also
+// drops idle users whose cooldown has expired; the shared state outlives
+// kernel restarts and would otherwise keep every user that ever connected.
 func (m *DeviceManager) Snapshot() (map[int]map[string]bool, int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.now()
 	alive := make(map[int]map[string]bool)
 	for uid, u := range m.users {
 		if len(u.ips) == 0 {
+			if !now.Before(u.banUntil) {
+				delete(m.users, uid)
+			}
 			continue
 		}
 		ips := make(map[string]bool, len(u.ips))

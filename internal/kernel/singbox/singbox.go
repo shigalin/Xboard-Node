@@ -25,8 +25,6 @@ import (
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
-const defaultDeviceLimitCooldown = limiter.DefaultDeviceLimitCooldown
-
 // drainTimeout is how long stop() waits for in-flight connections to finish
 // naturally after closing all listen sockets, before hard-killing them.
 const drainTimeout = 5 * time.Second
@@ -64,14 +62,11 @@ type SingBox struct {
 	// deviceLimitFunc resolves a user UUID to (limit, hasLimit) for gate-keeping.
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
 	deviceLimitFunc func(string) (int, bool)
-
-	// trackerRegistered prevents duplicate AppendTracker calls on the same
-	// Router instance during Reload. Reset to false on full restart.
-	trackerRegistered bool
 }
 
 func New(cfg config.KernelConfig) *SingBox {
-	return &SingBox{cfg: cfg, devices: limiter.NewDeviceManager(deviceLimitCooldown(cfg))}
+	// A zero cooldown selects limiter.DefaultDeviceLimitCooldown.
+	return &SingBox{cfg: cfg, devices: limiter.NewDeviceManager(time.Duration(cfg.DeviceLimitCooldown) * time.Second)}
 }
 
 var _ kernel.Kernel = (*SingBox)(nil)
@@ -132,9 +127,25 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 		return fmt.Errorf("create sing-box instance: %w", err)
 	}
 
+	// Attach a fresh tracker before Start so the first accepted connection is
+	// already subject to device admission, speed limits and traffic accounting.
+	// The Router keeps it across Reload; a full restart builds a new Router.
+	tracker := NewConnTracker(s.devices.NewScope())
+	tracker.SetUserMap(buildUserMap(users))
+	if s.speedLimitFunc != nil {
+		tracker.SetSpeedLimitFunc(s.speedLimitFunc)
+	}
+	if s.deviceLimitFunc != nil {
+		tracker.SetDeviceLimitFunc(s.deviceLimitFunc)
+	}
+	if router := service.FromContext[adapter.Router](ctx); router != nil {
+		router.AppendTracker(tracker)
+	}
+
 	if err := instance.Start(); err != nil {
 		instance.Close()
 		cancel()
+		tracker.closeAll()
 		return fmt.Errorf("start sing-box: %w", err)
 	}
 
@@ -145,19 +156,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.users = users
 	s.nodeConfig = nodeConfig
 	s.tls = tls
-
-	// Fresh tracker on full restart.
-	s.connTracker = NewConnTracker(s.devices.NewScope())
-	s.connTracker.SetUserMap(buildUserMap(users))
-	if s.speedLimitFunc != nil {
-		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
-	}
-	if s.deviceLimitFunc != nil {
-		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
-	}
-
-	s.trackerRegistered = false
-	s.registerTracker(ctx)
+	s.connTracker = tracker
 
 	// Recycle old instance in background — drain then close.
 	if oldBox != nil {
@@ -324,23 +323,6 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	return nil
 }
 
-// registerTracker wires the ConnTracker to the current Router exactly once.
-// The ConnTracker handles both byte counting and optional rate limiting
-// in a single wrapper, so no additional trackers are needed.
-func (s *SingBox) registerTracker(ctx context.Context) {
-	if s.trackerRegistered {
-		return
-	}
-	router := service.FromContext[adapter.Router](ctx)
-	if router == nil {
-		return
-	}
-	if s.connTracker != nil {
-		router.AppendTracker(s.connTracker)
-	}
-	s.trackerRegistered = true
-}
-
 func (s *SingBox) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -420,8 +402,8 @@ func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 }
 
 // UpdateGlobalDevices updates the global device state from panel (for multi-node).
-func (s *SingBox) UpdateGlobalDevices(users map[int][]string, receivedAt time.Time) {
-	s.devices.UpdateGlobalDevicesAt(users, receivedAt)
+func (s *SingBox) UpdateGlobalDevices(users map[int][]string) {
+	s.devices.UpdateGlobalDevices(users)
 }
 
 // ClearGlobalDevices clears the global device state (on WS disconnect).
@@ -648,15 +630,6 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 	}
 	ct.CloseByUUID(uuid)
 	return nil
-}
-
-// deviceLimitCooldown resolves the configured device-limit punishment window.
-// 0 means "use the default". Negative values are rejected during config load.
-func deviceLimitCooldown(cfg config.KernelConfig) time.Duration {
-	if cfg.DeviceLimitCooldown == 0 {
-		return defaultDeviceLimitCooldown
-	}
-	return time.Duration(cfg.DeviceLimitCooldown) * time.Second
 }
 
 // buildUserMap creates a UUID→userID mapping used by ConnTracker to attribute

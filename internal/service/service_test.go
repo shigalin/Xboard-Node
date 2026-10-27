@@ -5,7 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cedar2025/xboard-node/internal/cert"
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -33,9 +32,6 @@ type fakeKernel struct {
 
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
-
-	globalDevices   map[int][]string
-	globalDevicesAt time.Time
 }
 
 func (f *fakeKernel) Name() string { return "fake" }
@@ -97,9 +93,7 @@ func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) erro
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
 func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) { f.deviceLimitFunc = fn }
-func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string, receivedAt time.Time) {
-	f.globalDevices, f.globalDevicesAt = users, receivedAt
-}
+func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string) { _ = users }
 func (f *fakeKernel) ClearGlobalDevices() {}
 
 func newTestService(k *fakeKernel) *Service {
@@ -300,28 +294,5 @@ func TestValidateNodeRuntimeRejectsRealityWithoutServerNameOrDest(t *testing.T) 
 	}
 	if got := err.Error(); got != "reality tls requires tls_settings.server_name or tls_settings.dest" {
 		t.Fatalf("unexpected error: %v", got)
-	}
-}
-
-func TestStartKernelReplaysGlobalDevicesWithReceiveTime(t *testing.T) {
-	k := &fakeKernel{}
-	s := newTestService(k)
-	before := time.Now()
-	s.applyGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
-	receivedAt := k.globalDevicesAt
-	if receivedAt.Before(before) || receivedAt.After(time.Now()) {
-		t.Fatalf("receive time %v not stamped on apply", receivedAt)
-	}
-
-	k.globalDevices, k.globalDevicesAt = nil, time.Time{}
-	time.Sleep(10 * time.Millisecond)
-	if !s.startKernel(&model.NodeSpec{Protocol: "vless"}, []model.UserSpec{{ID: 1, UUID: "uuid-1"}}) {
-		t.Fatal("startKernel failed")
-	}
-	if !k.globalDevicesAt.Equal(receivedAt) {
-		t.Fatalf("restart replayed snapshot at %v, want original %v", k.globalDevicesAt, receivedAt)
-	}
-	if len(k.globalDevices[1]) != 1 || k.globalDevices[1][0] != "9.9.9.9" {
-		t.Fatalf("replayed snapshot = %v", k.globalDevices)
 	}
 }

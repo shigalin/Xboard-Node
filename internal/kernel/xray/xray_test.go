@@ -203,7 +203,7 @@ func TestXrayCapabilities(t *testing.T) {
 	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking {
 		t.Fatalf("unexpected positive xray capabilities: %+v", caps)
 	}
-	if !caps.ForceCloseConnection || !caps.ForceCloseUser {
+	if caps.ForceCloseConnection || !caps.ForceCloseUser {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }
@@ -257,6 +257,71 @@ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 	x.updateBandwidthLimits(nil)
 	if bm.GetUserLimiter(userEmail(2)) == nil {
 		t.Fatal("expected fallback limiter derived from user speed")
+	}
+}
+
+func TestXrayDropBandwidthLimits(t *testing.T) {
+	first := model.UserSpec{ID: 1, UUID: "uuid-1"}
+	second := model.UserSpec{ID: 2, UUID: "uuid-2"}
+	replacement := model.UserSpec{ID: 1, UUID: "uuid-1-new"}
+
+	for _, tc := range []struct {
+		name    string
+		removed []model.UserSpec
+		current []model.UserSpec
+		want    map[int]string // user ID to the UUID supplying its limiter
+	}{
+		{
+			name:    "deletes removed user",
+			removed: []model.UserSpec{first},
+			current: []model.UserSpec{second},
+			want:    map[int]string{2: second.UUID},
+		},
+		{
+			name:    "preserves retained user",
+			removed: []model.UserSpec{second},
+			current: []model.UserSpec{first},
+			want:    map[int]string{1: first.UUID},
+		},
+		{
+			name:    "preserves new limiter for same ID with changed UUID",
+			removed: []model.UserSpec{first},
+			current: []model.UserSpec{replacement, second},
+			want:    map[int]string{1: replacement.UUID, 2: second.UUID},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := new(xrayCore.Instance)
+			bm := featurebandwidth.New()
+			if err := inst.AddFeature(bm); err != nil {
+				t.Fatalf("Instance.AddFeature(bandwidth) error = %v", err)
+			}
+			x := New(config.KernelConfig{Type: "xray"})
+			x.instance = inst
+			limiters := map[string]*rate.Limiter{
+				first.UUID:       rate.NewLimiter(100, 100),
+				second.UUID:      rate.NewLimiter(200, 200),
+				replacement.UUID: rate.NewLimiter(300, 300),
+			}
+			x.SetSpeedLimitFunc(func(uuid string) *rate.Limiter { return limiters[uuid] })
+			x.updateBandwidthLimits([]model.UserSpec{first, second})
+			for _, user := range []model.UserSpec{first, second} {
+				if bm.GetUserLimiter(userEmail(user.ID)) != limiters[user.UUID] {
+					t.Fatalf("initial limiter for user %d was not installed", user.ID)
+				}
+			}
+
+			// User updates configure the current set before dropping removed users.
+			x.updateBandwidthLimits(tc.current)
+			x.dropBandwidthLimits(tc.removed, tc.current)
+
+			for _, id := range []int{1, 2} {
+				want := limiters[tc.want[id]] // nil for a removed user
+				if got := bm.GetUserLimiter(userEmail(id)); got != want {
+					t.Errorf("user %d limiter = %p, want %p", id, got, want)
+				}
+			}
+		})
 	}
 }
 

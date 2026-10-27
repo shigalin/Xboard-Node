@@ -66,7 +66,7 @@ func TestSingBoxUDPAdmissionKicksAndPunishes(t *testing.T) {
 
 func TestSingBoxRestartKeepsDrainingConnsAndSnapshots(t *testing.T) {
 	s := New(config.KernelConfig{})
-	s.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}}, time.Now())
+	s.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
 	old := NewConnTracker(s.devices.NewScope())
 	next := NewConnTracker(s.devices.NewScope())
 	for _, tr := range []*ConnTracker{old, next} {

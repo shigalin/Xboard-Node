@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/limiter"
@@ -23,7 +22,7 @@ func TestXrayConfiguresSharedAdmissionBeforeStart(t *testing.T) {
 		return 1, true
 	})
 	global := map[int][]string{1: {"9.9.9.9"}}
-	x.UpdateGlobalDevices(global, time.Now())
+	x.UpdateGlobalDevices(global)
 	global[1][0] = "8.8.8.8" // The cached bootstrap must own a copy.
 	ld := newTestDispatcher()
 	x.attachDispatcher(ld)
@@ -49,7 +48,7 @@ func TestXrayGlobalStateAndForceCloseAdapters(t *testing.T) {
 	x.limitDispatcher = ld
 	x.users = []model.UserSpec{{ID: 1, UUID: "uuid-1", DeviceLimit: 1}, {ID: 2, UUID: "uuid-2"}}
 	x.updateDispatcherLimits(x.users)
-	x.UpdateGlobalDevices(map[int][]string{1: {"8.8.8.8", "9.9.9.9"}}, time.Now())
+	x.UpdateGlobalDevices(map[int][]string{1: {"8.8.8.8", "9.9.9.9"}})
 	x.ClearGlobalDevices()
 	first, writer1 := testLink()
 	ld.innerDisp = &testInnerDispatcher{link: first}
@@ -77,22 +76,6 @@ func TestXrayGlobalStateAndForceCloseAdapters(t *testing.T) {
 	waitWriter(t, writer2)
 	if ld.devices.ActiveCount() != 0 {
 		t.Fatal("force-close adapters left live IP slots")
-	}
-}
-
-func TestXrayReloadKeepsGlobalSnapshotAge(t *testing.T) {
-	x := New(config.KernelConfig{Type: "xray"})
-	users := []model.UserSpec{{ID: 1, UUID: "uuid-1", DeviceLimit: 1}}
-	x.SetDeviceLimitFunc(func(string) (int, bool) { return 1, true })
-	// Received longer ago than the panel TTL, then replayed into a new dispatcher.
-	x.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}}, time.Now().Add(-301*time.Second))
-	ld := newTestDispatcher()
-	x.attachDispatcher(ld)
-	x.configureDispatcher(ld, users)
-	link, _ := testLink()
-	ld.innerDisp = &testInnerDispatcher{link: link}
-	if _, err := ld.Dispatch(userContext(1, "1.1.1.1"), target(false)); err != nil {
-		t.Fatalf("reload revived an expired global snapshot: %v", err)
 	}
 }
 
@@ -126,7 +109,7 @@ func TestXrayRestartKeepsDrainingSessionsAndLateSnapshots(t *testing.T) {
 	fresh := newTestDispatcher()
 	other.attachDispatcher(fresh)
 	other.configureDispatcher(fresh, users)
-	other.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}}, time.Now())
+	other.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
 	if _, err := fresh.Dispatch(userContext(1, "3.3.3.3"), target(false)); !errors.Is(err, limiter.ErrDeviceLimit) {
 		t.Fatalf("snapshot received before swap was lost: %v", err)
 	}

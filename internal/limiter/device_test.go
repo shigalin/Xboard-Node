@@ -158,7 +158,7 @@ func TestDevicesCloseByIDAndLimitReduction(t *testing.T) {
 	}
 }
 
-func TestDevicesGlobalSnapshotKeepsReceiveTime(t *testing.T) {
+func TestDevicesGlobalSnapshotExpiresAfterTTL(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		age   time.Duration
@@ -166,7 +166,8 @@ func TestDevicesGlobalSnapshotKeepsReceiveTime(t *testing.T) {
 	}{{"within TTL", globalDeviceTTL - time.Second, true}, {"expired", globalDeviceTTL + time.Nanosecond, false}} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, now := testDeviceManager()
-			m.UpdateGlobalDevicesAt(map[int][]string{1: {"9.9.9.9"}}, now.Add(-tc.age))
+			m.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
+			*now = now.Add(tc.age)
 			_, err := m.Acquire(1, "1.1.1.1", 1)
 			if tc.fresh != errors.Is(err, ErrDeviceLimit) {
 				t.Fatalf("snapshot aged %v: err=%v", tc.age, err)
@@ -194,4 +195,26 @@ func TestDeviceScopesShareAdmissionButNotLifetimes(t *testing.T) {
 	if _, count := m.Snapshot(); count != 1 {
 		t.Fatalf("shared snapshot count = %d, want 1", count)
 	}
+}
+
+func TestSnapshotPrunesIdleUsersOnlyAfterCooldown(t *testing.T) {
+	m, now := testDeviceManager()
+	mustAcquire(t, m, 2, "2.2.2.2", 0).Release()
+	mustAcquire(t, m, 1, "1.1.1.1", 1)
+	if _, err := m.Acquire(1, "9.9.9.9", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatalf("breach admitted: %v", err)
+	}
+	m.Snapshot()
+	if _, ok := m.users[2]; ok {
+		t.Fatal("idle user without cooldown was kept")
+	}
+	if _, err := m.Acquire(1, "1.1.1.1", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatal("pruning forgot an active cooldown")
+	}
+	*now = now.Add(DefaultDeviceLimitCooldown)
+	m.Snapshot()
+	if _, ok := m.users[1]; ok {
+		t.Fatal("idle user kept after cooldown expired")
+	}
+	mustAcquire(t, m, 1, "1.1.1.1", 1)
 }
