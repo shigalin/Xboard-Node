@@ -56,7 +56,11 @@ type Xray struct {
 	cfg config.KernelConfig
 
 	// mu protects instance, limitDispatcher, users, protocol, inboundTag,
-	// lastKernelHash, and cumTraffic. Never held during slow I/O.
+	// lastKernelHash, cumTraffic and draining. Never held during slow I/O.
+	//
+	// cumTraffic stays monotonic across restarts: the tracker bills the
+	// difference to its previous value, so a reset would under-bill any user
+	// whose new total passes the old one.
 	mu              sync.Mutex
 	instance        *xrayCore.Instance
 	limitDispatcher *LimitDispatcher
@@ -67,6 +71,9 @@ type Xray struct {
 	inboundTag      string
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
+	// draining maps replaced instances that still carry connections to the
+	// users they served; their counters feed cumTraffic until the hard close.
+	draining        map[*xrayCore.Instance][]model.UserSpec
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
 
@@ -84,6 +91,7 @@ func New(cfg config.KernelConfig) *Xray {
 	return &Xray{
 		cfg:        cfg,
 		cumTraffic: make(map[int][2]int64),
+		draining:   make(map[*xrayCore.Instance][]model.UserSpec),
 		devices:    limiter.NewDeviceManager(time.Duration(cfg.DeviceLimitCooldown) * time.Second),
 	}
 }
@@ -159,6 +167,9 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.mu.Lock()
 	old := x.instance
 	oldLD := x.limitDispatcher
+	if old != nil {
+		x.draining[old] = x.users
+	}
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
@@ -166,13 +177,13 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.tls = tls
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
-	x.cumTraffic = make(map[int][2]int64)
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
 	x.running.Store(true)
 	x.mu.Unlock()
 
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
-	closeOld(old, oldLD)
+	stopAccepting(old)
+	x.closeOld(old, oldLD)
 
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -215,14 +226,18 @@ func (x *Xray) Stop() {
 	x.mu.Lock()
 	inst := x.instance
 	ld := x.limitDispatcher
+	if inst != nil {
+		x.draining[inst] = x.users
+	}
 	x.instance = nil
 	x.limitDispatcher = nil
 	x.mu.Unlock()
 
+	stopAccepting(inst)
 	if ld != nil {
 		drainConns(ld, drainTimeout)
 	}
-	closeOld(inst, ld)
+	x.closeOld(inst, ld)
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -704,10 +719,35 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 	}
 }
 
+// stopAccepting closes the stream listeners of a replaced instance. Inbounds
+// share their port through SO_REUSEPORT, so an open old listener would keep
+// taking new connections with stale users and limits while it drains.
+// Established connections keep running. UDP-based listeners (Hysteria, KCP,
+// XHTTP over HTTP/3, Shadowsocks UDP) carry every flow on one socket and stay
+// open until the hard close.
+func stopAccepting(inst *xrayCore.Instance) {
+	if inst == nil {
+		return
+	}
+	im, ok := inst.GetFeature(inbound.ManagerType()).(inbound.Manager)
+	if !ok {
+		return
+	}
+	for _, h := range im.ListHandlers(context.Background()) {
+		if s, ok := h.(interface{ StopAccepting() error }); ok {
+			if err := s.StopAccepting(); err != nil {
+				nlog.Core().Debug("xray: old inbound keeps accepting until closed", "tag", h.Tag(), "reason", err)
+			}
+		}
+	}
+}
+
 // closeOld shuts down a previously running instance and its dispatcher.
 // Recycling happens in a background goroutine to prevent the main thread
 // from blocking on slow connection draining, enabling "hitless" reload.
-func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
+// The instance must be registered in x.draining; its final traffic is
+// collected after the hard close.
+func (x *Xray) closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 	if inst == nil {
 		return
 	}
@@ -723,6 +763,10 @@ func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 		if ld != nil {
 			ld.ResetConns()
 		}
+		x.mu.Lock()
+		x.collectStats(inst, x.draining[inst])
+		delete(x.draining, inst)
+		x.mu.Unlock()
 		nlog.Core().Debug("xray: old instance recycled")
 	}()
 }
@@ -739,21 +783,35 @@ func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 	}
 }
 
-// aggregateStats is a fallback path that reads xray's built-in stats counters
-// when LimitDispatcher is not available. Returns per-user cumulative traffic.
-// Must be called with x.mu held.
+// aggregateStats reads xray's built-in user counters of the running instance
+// and of replaced instances still draining, and returns per-user cumulative
+// traffic. Users no longer configured keep their totals, so traffic their
+// draining connections carry is still reported. Must be called with x.mu held.
 func (x *Xray) aggregateStats() (map[int][2]int64, error) {
-	sm := x.instance.GetFeature(stats.ManagerType())
-	if sm == nil {
-		return nil, nil
+	x.collectStats(x.instance, x.users)
+	for inst, users := range x.draining {
+		x.collectStats(inst, users)
 	}
-	mgr, ok := sm.(stats.Manager)
-	if !ok {
-		return nil, nil
+	traffic := make(map[int][2]int64, len(x.cumTraffic))
+	for uid, cum := range x.cumTraffic {
+		if cum[0] > 0 || cum[1] > 0 {
+			traffic[uid] = cum
+		}
 	}
+	return traffic, nil
+}
 
-	traffic := make(map[int][2]int64)
-	for _, u := range x.users {
+// collectStats moves inst's per-user counters into cumTraffic. Must be called
+// with x.mu held.
+func (x *Xray) collectStats(inst *xrayCore.Instance, users []model.UserSpec) {
+	if inst == nil {
+		return
+	}
+	mgr, ok := inst.GetFeature(stats.ManagerType()).(stats.Manager)
+	if !ok {
+		return
+	}
+	for _, u := range users {
 		email := userEmail(u.ID)
 
 		var dUp, dDown int64
@@ -770,12 +828,7 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 			cum[1] += dDown
 			x.cumTraffic[u.ID] = cum
 		}
-
-		if cum := x.cumTraffic[u.ID]; cum[0] > 0 || cum[1] > 0 {
-			traffic[u.ID] = cum
-		}
 	}
-	return traffic, nil
 }
 
 // updateBandwidthLimits configures the patched xray-core bandwidth feature of

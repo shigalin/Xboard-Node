@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"fmt"
 	"io"
 	stdnet "net"
 	"strings"
@@ -165,5 +166,54 @@ func TestCoreDispatchLinkForceCloseCancelsRawStreams(t *testing.T) {
 	awaitSignal(t, serverDone, "force-close did not close the outbound socket")
 	if ld.devices.ActiveCount() != 0 {
 		t.Fatal("closed raw session retained its IP")
+	}
+}
+
+func TestStopAcceptingKeepsEstablishedConnections(t *testing.T) {
+	target := testTCPListener(t)
+	probe := testTCPListener(t)
+	port := probe.Addr().(*stdnet.TCPAddr).Port
+	probe.Close()
+	cfg, err := serial.LoadJSONConfig(strings.NewReader(fmt.Sprintf(`{"log":{"loglevel":"none"},
+		"inbounds":[{"listen":"127.0.0.1","port":%d,"protocol":"tunnel","settings":{"address":"127.0.0.1","port":%d,"network":"tcp"}}],
+		"outbounds":[{"protocol":"freedom"}]}`, port, target.Addr().(*stdnet.TCPAddr).Port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	xrayCreationMu.Lock()
+	inst, err := xrayCore.New(cfg)
+	xrayCreationMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { inst.Close() })
+	if err := inst.Start(); err != nil {
+		t.Fatal(err)
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	client, err := stdnet.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := target.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.SetDeadline(time.Now().Add(3 * time.Second))
+
+	stopAccepting(inst)
+
+	if _, err := client.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 2)
+	if _, err := io.ReadFull(server, got); err != nil || string(got) != "ok" {
+		t.Fatalf("established connection stopped forwarding: %q, %v", got, err)
+	}
+	if conn, err := stdnet.DialTimeout("tcp", addr, time.Second); err == nil {
+		conn.Close()
+		t.Fatal("old instance still accepted a new connection")
 	}
 }

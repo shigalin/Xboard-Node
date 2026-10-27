@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -403,5 +404,49 @@ func TestXrayBandwidthConfiguredBeforeSwapAndNeverEmptied(t *testing.T) {
 				t.Fatal("limiter disappeared while limits were refreshed")
 			}
 		}
+	}
+}
+
+// A replaced instance keeps feeding cumulative traffic, including for users no
+// longer configured, up to and including the read after its hard close.
+func TestXrayCountsDrainingInstanceTraffic(t *testing.T) {
+	x, mgr := newStatsBackedXray(t, []model.UserSpec{{ID: 1, UUID: "uuid-1"}}, nil)
+	mustRegisterCounter(t, mgr, counterName(1, "uplink")).Add(10)
+	oldMgr := newStatsManager(t)
+	old := new(xrayCore.Instance)
+	if err := old.AddFeature(oldMgr); err != nil {
+		t.Fatal(err)
+	}
+	x.draining[old] = []model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}}
+	mustRegisterCounter(t, oldMgr, counterName(1, "uplink")).Add(5)
+	removed := mustRegisterCounter(t, oldMgr, counterName(2, "downlink"))
+	removed.Add(7)
+
+	traffic, _, _, err := x.GetUserTraffic(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if traffic[1] != [2]int64{15, 0} || traffic[2] != [2]int64{0, 7} {
+		t.Fatalf("traffic = %v, want user 1 up 15 and user 2 down 7", traffic)
+	}
+
+	removed.Add(3) // sent after the last report, before the hard close
+	x.closeOld(old, nil)
+	deadline := time.Now().Add(time.Second)
+	for {
+		x.mu.Lock()
+		pending := len(x.draining)
+		x.mu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("closed instance was not collected")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	traffic, _, _, _ = x.GetUserTraffic(context.Background())
+	if traffic[2] != [2]int64{0, 10} {
+		t.Fatalf("final traffic of the closed instance = %v, want down 10", traffic[2])
 	}
 }
