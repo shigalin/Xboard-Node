@@ -135,7 +135,7 @@ func TestCoreDispatchKeepsIPThroughUploadHalfClose(t *testing.T) {
 func TestCoreDispatchLinkForceCloseCancelsRawStreams(t *testing.T) {
 	ld, ctx := liveTestDispatcher(t)
 	listener := testTCPListener(t)
-	accepted := make(chan struct{})
+	forwarded := make(chan struct{})
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
@@ -145,7 +145,11 @@ func TestCoreDispatchLinkForceCloseCancelsRawStreams(t *testing.T) {
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(3 * time.Second))
-		close(accepted)
+		request := make([]byte, len("request"))
+		if _, err := io.ReadFull(conn, request); err != nil {
+			return
+		}
+		close(forwarded)
 		io.Copy(io.Discard, conn)
 	}()
 	client, peer := stdnet.Pipe()
@@ -154,7 +158,13 @@ func TestCoreDispatchLinkForceCloseCancelsRawStreams(t *testing.T) {
 	go func() {
 		done <- ld.DispatchLink(ctx, net.DestinationFromAddr(listener.Addr()), &transport.Link{Reader: buf.NewReader(client), Writer: buf.NewWriter(client)})
 	}()
-	awaitSignal(t, accepted, "outbound connection was not established")
+	peer.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := peer.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	// Accept can precede the dial returning. Wait for forwarded data so the
+	// close exercises active streams rather than cancellation during dialing.
+	awaitSignal(t, forwarded, "outbound did not forward the request")
 	ld.devices.CloseUser(1)
 	select {
 	case <-done:
