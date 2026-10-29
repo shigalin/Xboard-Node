@@ -2,10 +2,13 @@ package xray
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	stdnet "net"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 func liveTestDispatcher(t *testing.T) (*LimitDispatcher, context.Context) {
@@ -136,21 +140,25 @@ func TestCoreDispatchLinkForceCloseCancelsRawStreams(t *testing.T) {
 	ld, ctx := liveTestDispatcher(t)
 	listener := testTCPListener(t)
 	forwarded := make(chan struct{})
-	serverDone := make(chan struct{})
+	serverDone := make(chan error, 1)
 	go func() {
-		defer close(serverDone)
 		conn, err := listener.Accept()
 		if err != nil {
+			serverDone <- err
 			return
 		}
 		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		// Far beyond the assertion windows below, so the copy ends because
+		// force-close shut the socket rather than because the read expired.
+		conn.SetDeadline(time.Now().Add(30 * time.Second))
 		request := make([]byte, len("request"))
 		if _, err := io.ReadFull(conn, request); err != nil {
+			serverDone <- err
 			return
 		}
 		close(forwarded)
-		io.Copy(io.Discard, conn)
+		_, err = io.Copy(io.Discard, conn)
+		serverDone <- err
 	}()
 	client, peer := stdnet.Pipe()
 	t.Cleanup(func() { client.Close(); peer.Close() })
@@ -171,11 +179,62 @@ func TestCoreDispatchLinkForceCloseCancelsRawStreams(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("core kept processing raw streams after force-close")
 	}
-	client.Close()
-	peer.Close()
-	awaitSignal(t, serverDone, "force-close did not close the outbound socket")
+	// The pipe stays open on purpose: the outbound socket must be closed by
+	// force-close, not by the client going away.
+	select {
+	case err := <-serverDone:
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("force-close did not close the outbound socket: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("force-close did not close the outbound socket")
+	}
 	if ld.devices.ActiveCount() != 0 {
 		t.Fatal("closed raw session retained its IP")
+	}
+}
+
+// blockingDialer stalls every dial until its context ends, so force-close can
+// be exercised while the outbound is still connecting.
+type blockingDialer struct {
+	once    sync.Once
+	dialing chan struct{}
+}
+
+func (d *blockingDialer) Dial(ctx context.Context, _ net.Address, _ net.Destination, _ *internet.SocketConfig) (net.Conn, error) {
+	d.once.Do(func() { close(d.dialing) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (d *blockingDialer) DestIpAddress() net.IP { return nil }
+
+func TestCoreDispatchLinkForceCloseEndsDialingSession(t *testing.T) {
+	ld, ctx := liveTestDispatcher(t)
+	dialer := &blockingDialer{dialing: make(chan struct{})}
+	internet.UseAlternativeSystemDialer(dialer)
+	t.Cleanup(func() { internet.UseAlternativeSystemDialer(nil) })
+	client, peer := stdnet.Pipe()
+	t.Cleanup(func() { client.Close(); peer.Close() })
+	done := make(chan error, 1)
+	go func() {
+		done <- ld.DispatchLink(ctx, net.TCPDestination(net.LocalHostIP, net.Port(9)), &transport.Link{Reader: buf.NewReader(client), Writer: buf.NewWriter(client)})
+	}()
+	awaitSignal(t, dialer.dialing, "outbound never started dialing")
+	ld.devices.CloseUser(1)
+	// The stub dialer only returns once the context is done, so DispatchLink
+	// returning at all proves the cancellation landed; its error says nothing
+	// because the outbound handler swallows dial failures. Cancelling a dial
+	// then waits out the outbound's retry backoff, which sleeps about a second
+	// without watching the context, so this path needs a wider window than
+	// force-closing active streams does.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("core kept dialing after force-close")
+	}
+	if ld.devices.ActiveCount() != 0 {
+		t.Fatal("closed dialing session retained its IP")
 	}
 }
 
