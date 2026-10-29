@@ -11,7 +11,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
-const DefaultDeviceLimitCooldown = 60 * time.Second
+const DefaultDeviceLimitCooldown = 180 * time.Second
 const globalDeviceTTL = 300 * time.Second
 
 var ErrDeviceLimit = errors.New("device limit exceeded")

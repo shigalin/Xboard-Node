@@ -133,7 +133,7 @@ type KernelConfig struct {
 	// user breaches the device (distinct source IP) limit: all of that user's
 	// connections are force-closed and every new connection is refused until
 	// the window expires.
-	//   0  → use the default (60)
+	//   0  → use the default (180)
 	// Maximum 86400 (one day); larger values are rejected at load.
 	// Shared by the sing-box and xray kernels.
 	DeviceLimitCooldown int `yaml:"device_limit_cooldown"`

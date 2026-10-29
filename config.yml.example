@@ -31,4 +31,4 @@
 # breached, ALL of that user's connections are force-closed and every new
 # connection is refused for `device_limit_cooldown` seconds.
 # kernel:
-#   device_limit_cooldown: 60   # 0 = default (60s), max 86400 (1 day)
+#   device_limit_cooldown: 180  # 0 = default (180s), max 86400 (1 day)
