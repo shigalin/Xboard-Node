@@ -19,7 +19,7 @@ import (
 type M = map[string]interface{}
 
 func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
-	local := kernel.WithRealityTarget(nc, kcfg.RealityTargets)
+	nc = kernel.WithRealityTarget(nc, kcfg.RealityTargets)
 	var outbounds []M
 	tags := make(map[string]bool)
 
@@ -54,17 +54,8 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		"outbounds": outbounds,
 	}
 
-	inbound := buildInbound(local, users, tc)
+	inbound := buildInbound(nc, users, tc)
 	if inbound != nil {
-		if local != nc {
-			// Only a matched local target uses IPv6-aware parsing. Keep the
-			// legacy destination parser unchanged for panel-owned targets.
-			if host, port, err := net.SplitHostPort(local.TLSSettings["dest"].(string)); err == nil {
-				if p, err := strconv.Atoi(port); err == nil {
-					inbound["tls"].(M)["reality"].(M)["handshake"] = M{"server": host, "server_port": p}
-				}
-			}
-		}
 		cfg["inbounds"] = []M{inbound}
 	}
 
@@ -942,10 +933,12 @@ func buildRealityConfig(nc *model.NodeSpec) M {
 	}
 
 	if dest != "" {
+		// SplitHostPort keeps bracketed IPv6 destinations intact; a bare host
+		// without a port falls back to the panel port, then to 443.
 		handshake := M{"server": dest, "server_port": 443}
-		if parts := strings.SplitN(dest, ":", 2); len(parts) == 2 {
-			handshake["server"] = parts[0]
-			if p, err := strconv.Atoi(parts[1]); err == nil {
+		if host, port, err := net.SplitHostPort(dest); err == nil {
+			handshake["server"] = host
+			if p, err := strconv.Atoi(port); err == nil {
 				handshake["server_port"] = p
 			}
 		} else if settings.ServerPort > 0 {

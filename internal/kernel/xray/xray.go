@@ -133,6 +133,7 @@ func (x *Xray) Protocols() []string {
 func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
 	x.ensureGeoData(nodeConfig)
+	kernel.LogRealityTarget(nodeConfig, x.cfg.RealityTargets)
 
 	data, err := marshalConfig(x.cfg, nodeConfig, users, tls)
 	if err != nil {

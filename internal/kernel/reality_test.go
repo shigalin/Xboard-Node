@@ -17,16 +17,34 @@ func TestWithRealityTargetPreservesPanelSpec(t *testing.T) {
 	if nc.TLSSettings["dest"] != "old.example.com:443" {
 		t.Fatal("panel-owned settings were mutated")
 	}
-	for _, change := range []func(*model.NodeSpec){
-		func(n *model.NodeSpec) { n.TLS = 1 },
-		func(n *model.NodeSpec) { n.Protocol = "vmess" },
-		func(n *model.NodeSpec) { n.TLSSettings = map[string]any{"server_name": "other.example.com"} },
+	for name, change := range map[string]func(*model.NodeSpec){
+		"non-reality TLS mode": func(n *model.NodeSpec) { n.TLS = 1 },
+		"unmapped SNI":         func(n *model.NodeSpec) { n.TLSSettings = map[string]any{"server_name": "other.example.com"} },
+		"no SNI":               func(n *model.NodeSpec) { n.TLSSettings = map[string]any{"private_key": "test-key"} },
 	} {
-		other := *nc
-		change(&other)
-		if WithRealityTarget(&other, targets) != &other {
-			t.Fatal("unmatched or non-REALITY node was changed")
-		}
+		t.Run(name, func(t *testing.T) {
+			// Replace TLSSettings wholesale: the shallow copy shares the map.
+			other := *nc
+			change(&other)
+			if WithRealityTarget(&other, targets) != &other {
+				t.Fatal("unmatched or non-REALITY node was changed")
+			}
+		})
+	}
+}
+
+// Every protocol a kernel can serve REALITY on must be remapped: xray emits
+// security=reality for vmess and http inbounds too, not just vless/trojan.
+func TestWithRealityTargetAppliesToAnyRealityProtocol(t *testing.T) {
+	for _, protocol := range []string{"vless", "trojan", "vmess", "http"} {
+		t.Run(protocol, func(t *testing.T) {
+			nc := &model.NodeSpec{Protocol: protocol, TLS: 2,
+				TLSSettings: map[string]any{"server_name": "site.example.com"}}
+			local := WithRealityTarget(nc, map[string]string{"site.example.com": "127.0.0.1:48080"})
+			if local == nc || local.TLSSettings["dest"] != "127.0.0.1:48080" {
+				t.Fatal("REALITY node was not remapped")
+			}
+		})
 	}
 }
 
@@ -53,4 +71,16 @@ func TestWithRealityTargetNormalizesSNI(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Logging must tolerate specs the panel can realistically produce.
+func TestLogRealityTargetHandlesIncompleteSpecs(t *testing.T) {
+	targets := map[string]string{"site.example.com": "127.0.0.1:48080"}
+	LogRealityTarget(nil, targets)
+	LogRealityTarget(&model.NodeSpec{Protocol: "vless", TLS: 2}, targets)
+	LogRealityTarget(&model.NodeSpec{Protocol: "vless", TLS: 2,
+		TLSSettings: map[string]any{"server_name": "site.example.com"}}, targets)
+	LogRealityTarget(&model.NodeSpec{Protocol: "shadowsocks"}, targets)
+	LogRealityTarget(&model.NodeSpec{Protocol: "vless", TLS: 2,
+		TLSSettings: map[string]any{"server_name": "site.example.com"}}, nil)
 }

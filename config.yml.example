@@ -32,3 +32,11 @@
 # connection is refused for `device_limit_cooldown` seconds.
 # kernel:
 #   device_limit_cooldown: 180  # 0 = default (180s), max 86400 (1 day)
+
+# ── Local REALITY websites ──
+# Maps the panel's REALITY SNI names to a camouflage website that listens on
+# loopback, replacing only the handshake destination. The file is a YAML
+# mapping of SNI -> loopback host:port; see README for details. The
+# realityTargetsFile / REALITY_TARGETS_FILE env vars override this setting.
+# kernel:
+#   reality_targets_file: "/etc/xboard-node/reality-targets.yml"

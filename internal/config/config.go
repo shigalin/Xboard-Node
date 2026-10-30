@@ -152,8 +152,14 @@ type KernelConfig struct {
 	// Compatible with V2bX OriginalPath format.
 	CustomConfig string `yaml:"custom_config"`
 
-	// RealityTargets is loaded from REALITY_TARGETS_FILE. It overrides only the
-	// handshake destination for matching SNI names; panel listeners stay intact.
+	// RealityTargetsFile is the path to an SNI -> loopback host:port mapping.
+	// Overridden by the realityTargetsFile / REALITY_TARGETS_FILE env vars.
+	// Leaving it empty disables the feature.
+	RealityTargetsFile string `yaml:"reality_targets_file"`
+
+	// RealityTargets is the mapping loaded from RealityTargetsFile. It overrides
+	// only the handshake destination for matching SNI names; panel listeners
+	// stay intact.
 	RealityTargets map[string]string `yaml:"-"`
 }
 
@@ -237,13 +243,8 @@ func LoadRoot(path string) (*RootConfig, error) {
 
 	rc.applyEnvOverrides()
 	rc.resolveEnvRefs()
-	targets, err := LoadRealityTargets(os.Getenv("REALITY_TARGETS_FILE"))
-	if err != nil {
+	if err := rc.loadRealityTargets(); err != nil {
 		return nil, err
-	}
-	rc.Config.Kernel.RealityTargets = targets
-	for i := range rc.Instances {
-		rc.Instances[i].Kernel.RealityTargets = targets
 	}
 
 	// Compute stable instance IDs early — they're content-based (derived from
@@ -391,11 +392,9 @@ func Load(path string) (*Config, error) {
 
 	cfg.applyEnvOverrides()
 	cfg.resolveEnvRefs()
-	targets, err := LoadRealityTargets(os.Getenv("REALITY_TARGETS_FILE"))
-	if err != nil {
+	if err := cfg.loadRealityTargets(); err != nil {
 		return nil, err
 	}
-	cfg.Kernel.RealityTargets = targets
 	cfg.setDefaultsFrom(baseDir)
 
 	if err := cfg.validate(); err != nil {
@@ -403,6 +402,29 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// loadRealityTargets resolves each instance's local REALITY destination map.
+// Instances are independent, so a per-instance file is honoured as-is.
+func (rc *RootConfig) loadRealityTargets() error {
+	if len(rc.Instances) == 0 {
+		return rc.Config.loadRealityTargets()
+	}
+	for i := range rc.Instances {
+		if err := rc.Instances[i].loadRealityTargets(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Config) loadRealityTargets() error {
+	targets, err := LoadRealityTargets(c.Kernel.RealityTargetsFile)
+	if err != nil {
+		return fmt.Errorf("kernel.reality_targets_file (REALITY_TARGETS_FILE): %w", err)
+	}
+	c.Kernel.RealityTargets = targets
+	return nil
 }
 
 // envFirst returns the first non-empty value among the given env var names.
@@ -432,6 +454,9 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := envFirst("kernel", "KERNEL_TYPE"); v != "" {
 		c.Kernel.Type = v
+	}
+	if v := envFirst("realityTargetsFile", "REALITY_TARGETS_FILE"); v != "" {
+		c.Kernel.RealityTargetsFile = v
 	}
 	if v := envFirst("certFile", "CERT_FILE"); v != "" {
 		c.Cert.CertFile = v
@@ -535,6 +560,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if c.Kernel.CustomConfig == "" {
 		c.Kernel.CustomConfig = parent.Kernel.CustomConfig
+	}
+	if c.Kernel.RealityTargetsFile == "" {
+		c.Kernel.RealityTargetsFile = parent.Kernel.RealityTargetsFile
 	}
 	if len(c.Kernel.CustomOutbound) == 0 {
 		c.Kernel.CustomOutbound = parent.Kernel.CustomOutbound

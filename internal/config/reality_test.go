@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +25,8 @@ func TestLoadRealityTargets(t *testing.T) {
 		{"invalid port", "site.example.com: 127.0.0.1:65536\n", false},
 		{"invalid SNI", "'site.example.com:443': 127.0.0.1:48080\n", false},
 		{"duplicate normalized SNI", "Site.example.com: 127.0.0.1:48080\nsite.example.com: 127.0.0.1:48081\n", false},
+		{"port only", "site.example.com: 48080\n", false},
+		{"null destination", "site.example.com:\n", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			targets, err := LoadRealityTargets(writeTemp(t, tt.text))
@@ -73,5 +76,50 @@ instances:
 	}
 	if _, err := LoadRoot(writeTemp(t, "panel: {url: 'https://one.example.com', token: 'test-token', node_id: 1}\n")); err == nil {
 		t.Fatal("invalid destination must fail before node startup")
+	}
+}
+
+func TestRealityTargetsFileFromConfigFile(t *testing.T) {
+	path := writeTemp(t, "site.example.com: 127.0.0.1:48080\n")
+	cfg, err := Load(writeTemp(t, fmt.Sprintf("panel: {url: 'https://one.example.com', token: 'test-token', node_id: 1}\nkernel:\n  reality_targets_file: %q\n", path)))
+	if err != nil || cfg.Kernel.RealityTargets["site.example.com"] != "127.0.0.1:48080" {
+		t.Fatalf("yaml-configured mapping was not loaded: %v", err)
+	}
+
+	// Follow the repository convention: the environment wins over YAML.
+	override := writeTemp(t, "site.example.com: 127.0.0.1:48081\n")
+	t.Setenv("REALITY_TARGETS_FILE", override)
+	cfg, err = Load(writeTemp(t, fmt.Sprintf("panel: {url: 'https://one.example.com', token: 'test-token', node_id: 1}\nkernel:\n  reality_targets_file: %q\n", path)))
+	if err != nil || cfg.Kernel.RealityTargets["site.example.com"] != "127.0.0.1:48081" {
+		t.Fatalf("environment did not override the configured file: %v", err)
+	}
+}
+
+func TestRealityTargetsFileInheritedByInstances(t *testing.T) {
+	shared := writeTemp(t, "site.example.com: 127.0.0.1:48080\n")
+	perInstance := writeTemp(t, "second.example.com: 127.0.0.1:48081\n")
+	root, err := LoadRoot(writeTemp(t, fmt.Sprintf(`
+kernel:
+  reality_targets_file: %q
+instances:
+  - panel: {url: "https://one.example.com", token: "test-token", node_id: 1}
+  - panel: {url: "https://two.example.com", token: "test-token", node_id: 2}
+    kernel: {reality_targets_file: %q}
+`, shared, perInstance)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := root.NormalizeInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instances[0].Kernel.RealityTargets["site.example.com"] != "127.0.0.1:48080" {
+		t.Fatal("instance did not inherit the top-level mapping file")
+	}
+	if instances[1].Kernel.RealityTargets["second.example.com"] != "127.0.0.1:48081" {
+		t.Fatal("per-instance mapping file was not honoured")
+	}
+	if _, exists := instances[1].Kernel.RealityTargets["site.example.com"]; exists {
+		t.Fatal("per-instance file must replace, not merge with, the inherited one")
 	}
 }

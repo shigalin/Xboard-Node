@@ -21,7 +21,9 @@ func LoadRealityTargets(path string) (map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read reality targets: %w", err)
 	}
-	var raw map[string]string
+	// Values are decoded as any so that a non-string entry reports the
+	// destination error below instead of a raw YAML type mismatch.
+	var raw map[string]any
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse reality targets: %w", err)
 	}
@@ -29,16 +31,16 @@ func LoadRealityTargets(path string) (map[string]string, error) {
 		return nil, fmt.Errorf("reality targets must contain at least one SNI mapping")
 	}
 	targets := make(map[string]string, len(raw))
-	for name, dest := range raw {
+	for name, value := range raw {
 		sni := NormalizeRealitySNI(name)
 		if sni == "" || strings.ContainsAny(sni, "/:* \t\r\n") || net.ParseIP(sni) != nil {
 			return nil, fmt.Errorf("invalid reality target SNI %q", name)
 		}
-		host, port, err := net.SplitHostPort(dest)
+		host, port, err := net.SplitHostPort(fmt.Sprint(value))
 		ip := net.ParseIP(host)
 		n, portErr := strconv.Atoi(port)
 		if err != nil || ip == nil || !ip.IsLoopback() || portErr != nil || n < 1 || n > 65535 {
-			return nil, fmt.Errorf("reality target for %q must be a loopback IP and port", name)
+			return nil, fmt.Errorf("reality target for %q must be a loopback IP and port, got %v", name, value)
 		}
 		if _, exists := targets[sni]; exists {
 			return nil, fmt.Errorf("duplicate reality target SNI %q", name)

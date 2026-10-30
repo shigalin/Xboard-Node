@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.buildTime=$(BUILD_TIME) -X main.commit=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
-.PHONY: build clean test docker install build-linux build-linux-arm64 build-all
+.PHONY: build clean test test-tagged docker install build-linux build-linux-arm64 build-all
 
 # Build for current platform
 build:
@@ -25,6 +25,13 @@ build-all: build-linux build-linux-arm64
 # Run tests
 test:
 	go test -v -race -count=1 ./internal/...
+
+# Run tests that need the kernel build tags (e.g. the REALITY integration test,
+# which starts both kernels and requires with_utls).
+# No -race here: it enables checkptr, and sing-vmess' Vision connection does
+# unsafe pointer arithmetic that checkptr aborts the process on.
+test-tagged:
+	go test -count=1 -tags "with_quic with_utls with_wireguard with_clash_api" ./internal/...
 
 # Clean build artifacts
 clean:

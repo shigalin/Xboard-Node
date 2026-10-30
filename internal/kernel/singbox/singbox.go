@@ -95,6 +95,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	kernel.LogRealityTarget(nodeConfig, s.cfg.RealityTargets)
 	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
@@ -210,6 +211,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		return fmt.Errorf("not running")
 	}
 
+	kernel.LogRealityTarget(nodeConfig, s.cfg.RealityTargets)
 	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {

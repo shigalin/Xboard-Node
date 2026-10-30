@@ -61,21 +61,30 @@ Legacy single-panel config is fully compatible. Appending bindings auto-migrates
 
 ### Local REALITY websites
 
-Set `REALITY_TARGETS_FILE` to a readable, non-empty YAML mapping from the panel's
-REALITY SNI names to local HTTPS destinations:
+Point `kernel.reality_targets_file` (or the `realityTargetsFile` /
+`REALITY_TARGETS_FILE` env vars, which take precedence) at a readable, non-empty
+YAML mapping from the panel's REALITY SNI names to local HTTPS destinations:
 
 ```yaml
 site.example.com: "127.0.0.1:48080"
 second.example.com: "127.0.0.1:48080"
+ipv6.example.com: "[::1]:48080"    # bracketed IPv6 must be quoted in YAML
 ```
 
-Both kernels apply the mapping only to matching VLESS/Trojan REALITY nodes.
-The panel's SNI, credentials and listener ports stay unchanged. Unmatched nodes
-retain their existing destination behavior. Only loopback IP destinations are
-accepted; an explicitly configured missing, empty or invalid file stops
-configuration loading. The file must be readable inside the container. Restart
-the node after changing the mapping; changing this file alone does not trigger
-hot reload.
+Both kernels apply the mapping only to REALITY nodes (`tls: 2`) whose SNI
+matches. The panel's SNI, credentials and listener ports stay unchanged;
+unmatched nodes retain their existing destination behavior. In multi-instance
+mode each instance may set its own file, and an instance without one inherits
+the top-level setting.
+
+Only loopback IP destinations are accepted, so the website must listen in the
+same network namespace as the node process — a site in a separate container,
+reachable only on a bridge address or service name, cannot be used. An
+explicitly configured missing, empty or invalid file stops configuration
+loading, so a node never silently falls back to dialing its own public
+listener; when a mapping is loaded but a node's SNI is absent from it, the node
+logs a warning and keeps the panel destination. Restart the node after changing
+the mapping; changing this file alone does not trigger hot reload.
 
 In XBoard, put the website domain in **伪装站点（dest）** (`server_name`). Put the
 loopback HTTPS address and port in the mapping file. A matching entry replaces
@@ -83,7 +92,7 @@ the entire handshake destination, including its port; the panel's
 `reality_settings.server_port` is not used for that entry. Keep the VLESS
 connection and server listener ports as configured for that node. Set the
 client's SNI to the same website domain and refresh its subscription.
-A website listening only on loopback requires `REALITY_TARGETS_FILE`.
+A website listening only on loopback requires this mapping.
 
 `xboard-node --supports-reality-targets` prints `reality-targets-v1` when supported.
 `xboard-node --check-reality-targets /path/to/targets.yml` validates the mapping

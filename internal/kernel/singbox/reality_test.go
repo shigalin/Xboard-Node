@@ -31,7 +31,7 @@ func TestBuildConfigLocalRealityTarget(t *testing.T) {
 	}
 }
 
-func TestBuildConfigUnmappedRealityTargetPreservesLegacyParsing(t *testing.T) {
+func TestBuildConfigUnmappedRealityTargetUsesPanelDestination(t *testing.T) {
 	for _, protocol := range []string{"vless", "trojan"} {
 		t.Run(protocol, func(t *testing.T) {
 			for _, tt := range []struct {
@@ -46,12 +46,38 @@ func TestBuildConfigUnmappedRealityTargetPreservesLegacyParsing(t *testing.T) {
 						TLSSettings: M{"server_name": "site.example.com", "dest": "[2001:db8::1]:8443"}})
 					cfg := buildConfig(config.KernelConfig{RealityTargets: tt.targets}, nc, testUsers, kernel.TLSCert{})
 					handshake := cfg["inbounds"].([]M)[0]["tls"].(M)["reality"].(M)["handshake"].(M)
-					// Preserve even the legacy parser's IPv6 limitation outside
-					// the explicitly enabled and matched local mapping path.
-					if handshake["server"] != "[2001" || handshake["server_port"] != 443 {
-						t.Fatalf("unmapped destination parsing changed: %#v", handshake)
+					if handshake["server"] != "2001:db8::1" || handshake["server_port"] != 8443 {
+						t.Fatalf("panel destination was not parsed: %#v", handshake)
 					}
 				})
+			}
+		})
+	}
+}
+
+// The panel destination parser must keep its documented fallbacks.
+func TestBuildRealityConfigDestinationFallbacks(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		settings M
+		server   string
+		port     int
+	}{
+		{"host and port", M{"server_name": "site.example.com", "dest": "panel.example.com:8443"}, "panel.example.com", 8443},
+		{"host only uses panel port", M{"server_name": "site.example.com", "dest": "panel.example.com", "server_port": 8443}, "panel.example.com", 8443},
+		{"host only without panel port", M{"server_name": "site.example.com", "dest": "panel.example.com"}, "panel.example.com", 443},
+		{"non-numeric port", M{"server_name": "site.example.com", "dest": "panel.example.com:https"}, "panel.example.com", 443},
+		{"server name fallback", M{"server_name": "site.example.com"}, "site.example.com", 443},
+		// An unbracketed IPv6 destination has no parsable port; keeping the
+		// address whole is better than the old parser's truncated first group.
+		{"bare ipv6", M{"server_name": "site.example.com", "dest": "2001:db8::1"}, "2001:db8::1", 443},
+		{"bare ipv6 with panel port", M{"server_name": "site.example.com", "dest": "2001:db8::1", "server_port": 8443}, "2001:db8::1", 8443},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			nc := testNodeSpec(&panel.NodeConfig{Protocol: "vless", TLS: 2, TLSSettings: tt.settings})
+			handshake := buildRealityConfig(nc)["reality"].(M)["handshake"].(M)
+			if handshake["server"] != tt.server || handshake["server_port"] != tt.port {
+				t.Fatalf("handshake = %#v", handshake)
 			}
 		})
 	}
