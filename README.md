@@ -75,7 +75,8 @@ Both kernels apply the mapping only to REALITY nodes (`tls: 2`) whose SNI
 matches. The panel's SNI, credentials and listener ports stay unchanged;
 unmatched nodes retain their existing destination behavior. In multi-instance
 mode each instance may set its own file, and an instance without one inherits
-the top-level setting.
+the top-level setting — so an instance cannot opt out by leaving the field
+empty. The env vars are process-wide and replace every instance's own file.
 
 Only loopback IP destinations are accepted, so the website must listen in the
 same network namespace as the node process — a site in a separate container,

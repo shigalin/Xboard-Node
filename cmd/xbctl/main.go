@@ -92,13 +92,14 @@ type fileNodeConfig struct {
 }
 
 type fileKernelConfig struct {
-	Type         string           `yaml:"type"`
-	ConfigDir    string           `yaml:"config_dir"`
-	LogLevel     string           `yaml:"log_level,omitempty"`
-	GeoDataDir   string           `yaml:"geo_data_dir,omitempty"`
-	CustomConfig string           `yaml:"custom_config,omitempty"`
-	CustomRoute  []map[string]any `yaml:"custom_route,omitempty"`
-	CustomOut    []map[string]any `yaml:"custom_outbound,omitempty"`
+	Type               string           `yaml:"type"`
+	ConfigDir          string           `yaml:"config_dir"`
+	LogLevel           string           `yaml:"log_level,omitempty"`
+	GeoDataDir         string           `yaml:"geo_data_dir,omitempty"`
+	CustomConfig       string           `yaml:"custom_config,omitempty"`
+	CustomRoute        []map[string]any `yaml:"custom_route,omitempty"`
+	CustomOut          []map[string]any `yaml:"custom_outbound,omitempty"`
+	RealityTargetsFile string           `yaml:"reality_targets_file,omitempty"`
 }
 
 type fileLogConfig struct {
@@ -849,8 +850,12 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Log.Level != "" || p.Log.Output != "" {
 		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
 	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" {
-		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel}
+	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" || p.Kernel.RealityTargetsFile != "" {
+		out.Kernel = &fileKernelConfig{
+			Type:               p.Kernel.Type,
+			LogLevel:           p.Kernel.LogLevel,
+			RealityTargetsFile: p.Kernel.RealityTargetsFile,
+		}
 	}
 	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
 		out.Node = &fileNodeConfig{
@@ -880,13 +885,14 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 				NodeType: inst.Panel.NodeType,
 			},
 			Kernel: fileKernelConfig{
-				Type:         inst.Kernel.Type,
-				ConfigDir:    inst.Kernel.ConfigDir,
-				LogLevel:     inst.Kernel.LogLevel,
-				GeoDataDir:   inst.Kernel.GeoDataDir,
-				CustomConfig: inst.Kernel.CustomConfig,
-				CustomRoute:  inst.Kernel.CustomRoute,
-				CustomOut:    inst.Kernel.CustomOutbound,
+				Type:               inst.Kernel.Type,
+				ConfigDir:          inst.Kernel.ConfigDir,
+				LogLevel:           inst.Kernel.LogLevel,
+				GeoDataDir:         inst.Kernel.GeoDataDir,
+				CustomConfig:       inst.Kernel.CustomConfig,
+				CustomRoute:        inst.Kernel.CustomRoute,
+				CustomOut:          inst.Kernel.CustomOutbound,
+				RealityTargetsFile: inst.Kernel.RealityTargetsFile,
 			},
 			Log: fileLogConfig{
 				Level:  inst.Log.Level,

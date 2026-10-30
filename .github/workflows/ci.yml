@@ -26,6 +26,9 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Run build-tag tests
+        run: make test-tagged
+
   build:
     name: Build
     runs-on: ubuntu-latest

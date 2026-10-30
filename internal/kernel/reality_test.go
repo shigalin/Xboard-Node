@@ -33,10 +33,11 @@ func TestWithRealityTargetPreservesPanelSpec(t *testing.T) {
 	}
 }
 
-// Every protocol a kernel can serve REALITY on must be remapped: xray emits
-// security=reality for vmess and http inbounds too, not just vless/trojan.
-func TestWithRealityTargetAppliesToAnyRealityProtocol(t *testing.T) {
-	for _, protocol := range []string{"vless", "trojan", "vmess", "http"} {
+// Every protocol a kernel can serve REALITY on must be remapped. For xray that
+// includes vmess, whose inbound always builds stream settings and so emits
+// security=reality at tls=2; its http inbound only builds them at tls=1.
+func TestWithRealityTargetAppliesToEveryRealityProtocol(t *testing.T) {
+	for _, protocol := range []string{"vless", "trojan", "vmess"} {
 		t.Run(protocol, func(t *testing.T) {
 			nc := &model.NodeSpec{Protocol: protocol, TLS: 2,
 				TLSSettings: map[string]any{"server_name": "site.example.com"}}
