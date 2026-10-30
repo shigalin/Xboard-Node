@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -54,22 +55,22 @@ type fileRootConfig struct {
 	WS        *config.WSConfig   `yaml:"ws,omitempty"`
 	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
 	Cert      *config.CertConfig `yaml:"cert,omitempty"`
-	Instances []fileInstance      `yaml:"instances,omitempty"`
+	Instances []fileInstance     `yaml:"instances,omitempty"`
 }
 
 type fileInstance struct {
-	ID         string             `yaml:"id,omitempty"`
-	Panel      filePanelConfig    `yaml:"panel"`
-	Node       *fileNodeConfig    `yaml:"node,omitempty"`
-	Kernel     fileKernelConfig   `yaml:"kernel"`
-	Log        fileLogConfig      `yaml:"log"`
-	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	HealthPort int                `yaml:"health_port,omitempty"`
-	Machine    *fileMachineConfig `yaml:"machine,omitempty"`
-	Standalone map[string]any     `yaml:"standalone,omitempty"`
-	Cert       *config.CertConfig `yaml:"cert,omitempty"`
-	WS         *config.WSConfig   `yaml:"ws,omitempty"`
-	Nodes      []config.NodeEntry `yaml:"nodes,omitempty"`
+	ID         string                   `yaml:"id,omitempty"`
+	Panel      filePanelConfig          `yaml:"panel"`
+	Node       *fileNodeConfig          `yaml:"node,omitempty"`
+	Kernel     fileKernelConfig         `yaml:"kernel"`
+	Log        fileLogConfig            `yaml:"log"`
+	Runtime    *fileRuntimeConfig       `yaml:"runtime,omitempty"`
+	HealthPort int                      `yaml:"health_port,omitempty"`
+	Machine    *fileMachineConfig       `yaml:"machine,omitempty"`
+	Standalone *config.StandaloneConfig `yaml:"standalone,omitempty"`
+	Cert       *config.CertConfig       `yaml:"cert,omitempty"`
+	WS         *config.WSConfig         `yaml:"ws,omitempty"`
+	Nodes      []config.NodeEntry       `yaml:"nodes,omitempty"`
 }
 
 type filePanelConfig struct {
@@ -92,14 +93,15 @@ type fileNodeConfig struct {
 }
 
 type fileKernelConfig struct {
-	Type               string           `yaml:"type"`
-	ConfigDir          string           `yaml:"config_dir"`
-	LogLevel           string           `yaml:"log_level,omitempty"`
-	GeoDataDir         string           `yaml:"geo_data_dir,omitempty"`
-	CustomConfig       string           `yaml:"custom_config,omitempty"`
-	CustomRoute        []map[string]any `yaml:"custom_route,omitempty"`
-	CustomOut          []map[string]any `yaml:"custom_outbound,omitempty"`
-	RealityTargetsFile string           `yaml:"reality_targets_file,omitempty"`
+	Type                string           `yaml:"type"`
+	ConfigDir           string           `yaml:"config_dir"`
+	LogLevel            string           `yaml:"log_level,omitempty"`
+	GeoDataDir          string           `yaml:"geo_data_dir,omitempty"`
+	CustomConfig        string           `yaml:"custom_config,omitempty"`
+	CustomRoute         []map[string]any `yaml:"custom_route,omitempty"`
+	CustomOut           []map[string]any `yaml:"custom_outbound,omitempty"`
+	RealityTargetsFile  string           `yaml:"reality_targets_file,omitempty"`
+	DeviceLimitCooldown int              `yaml:"device_limit_cooldown,omitempty"`
 }
 
 type fileLogConfig struct {
@@ -838,6 +840,30 @@ func normalizeRootInstances(root *config.RootConfig) []config.Config {
 	return nil
 }
 
+// kernelToFile copies every stored kernel setting. RealityTargets is omitted on
+// purpose: it is loaded from RealityTargetsFile, not stored in config.yml.
+func kernelToFile(k config.KernelConfig) fileKernelConfig {
+	return fileKernelConfig{
+		Type:                k.Type,
+		ConfigDir:           k.ConfigDir,
+		LogLevel:            k.LogLevel,
+		GeoDataDir:          k.GeoDataDir,
+		CustomConfig:        k.CustomConfig,
+		CustomRoute:         k.CustomRoute,
+		CustomOut:           k.CustomOutbound,
+		RealityTargetsFile:  k.RealityTargetsFile,
+		DeviceLimitCooldown: k.DeviceLimitCooldown,
+	}
+}
+
+// isSet reports whether a config block holds anything worth writing. Using the
+// zero value instead of a hand-picked list of fields keeps a block from being
+// dropped when only one of its less common settings is configured.
+func isSet(block any) bool {
+	v := reflect.ValueOf(block)
+	return v.IsValid() && !v.IsZero()
+}
+
 func writeRootConfig(path string, root *config.RootConfig) error {
 	instances := root.Instances
 	if len(instances) == 0 && root.Config.Panel.URL != "" {
@@ -847,17 +873,14 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 
 	// Preserve top-level shared settings so instances can inherit them.
 	p := &root.Config
-	if p.Log.Level != "" || p.Log.Output != "" {
+	if isSet(p.Log) {
 		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
 	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" || p.Kernel.RealityTargetsFile != "" {
-		out.Kernel = &fileKernelConfig{
-			Type:               p.Kernel.Type,
-			LogLevel:           p.Kernel.LogLevel,
-			RealityTargetsFile: p.Kernel.RealityTargetsFile,
-		}
+	if isSet(p.Kernel) {
+		kernel := kernelToFile(p.Kernel)
+		out.Kernel = &kernel
 	}
-	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
+	if isSet(p.Node) {
 		out.Node = &fileNodeConfig{
 			PushInterval:         p.Node.PushInterval,
 			PullInterval:         p.Node.PullInterval,
@@ -865,13 +888,13 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 			DeviceReportInterval: p.Node.DeviceReportInterval,
 		}
 	}
-	if p.Runtime.GoMemLimit != "" || p.Runtime.GoGCPercent != 0 {
+	if isSet(p.Runtime) {
 		out.Runtime = &fileRuntimeConfig{GoMemLimit: p.Runtime.GoMemLimit, GoGCPercent: p.Runtime.GoGCPercent}
 	}
-	if p.WS.StatusInterval != 0 || p.WS.HandshakeTimeout != 0 || p.WS.BackoffInitial != 0 {
+	if isSet(p.WS) {
 		out.WS = &p.WS
 	}
-	if p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
+	if isSet(p.Cert) {
 		out.Cert = &p.Cert
 	}
 
@@ -884,23 +907,15 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 				NodeID:   inst.Panel.NodeID,
 				NodeType: inst.Panel.NodeType,
 			},
-			Kernel: fileKernelConfig{
-				Type:               inst.Kernel.Type,
-				ConfigDir:          inst.Kernel.ConfigDir,
-				LogLevel:           inst.Kernel.LogLevel,
-				GeoDataDir:         inst.Kernel.GeoDataDir,
-				CustomConfig:       inst.Kernel.CustomConfig,
-				CustomRoute:        inst.Kernel.CustomRoute,
-				CustomOut:          inst.Kernel.CustomOutbound,
-				RealityTargetsFile: inst.Kernel.RealityTargetsFile,
-			},
+			Kernel: kernelToFile(inst.Kernel),
 			Log: fileLogConfig{
 				Level:  inst.Log.Level,
 				Output: inst.Log.Output,
 			},
 			HealthPort: inst.HealthPort,
+			Standalone: inst.Standalone,
 		}
-		if !inst.IsMachineMode() && (inst.Node.PushInterval != 0 || inst.Node.PullInterval != 0 || inst.Node.TrackInterval != 0 || inst.Node.DeviceReportInterval != 0) {
+		if !inst.IsMachineMode() && isSet(inst.Node) {
 			fi.Node = &fileNodeConfig{
 				PushInterval:         inst.Node.PushInterval,
 				PullInterval:         inst.Node.PullInterval,
@@ -908,7 +923,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 				DeviceReportInterval: inst.Node.DeviceReportInterval,
 			}
 		}
-		if inst.Runtime.GoMemLimit != "" || inst.Runtime.GoGCPercent != 0 {
+		if isSet(inst.Runtime) {
 			fi.Runtime = &fileRuntimeConfig{
 				GoMemLimit:  inst.Runtime.GoMemLimit,
 				GoGCPercent: inst.Runtime.GoGCPercent,
@@ -922,10 +937,10 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 			fi.Panel.NodeID = 0
 			fi.Panel.NodeType = ""
 		}
-		if inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
+		if isSet(inst.Cert) {
 			fi.Cert = &inst.Cert
 		}
-		if inst.WS.StatusInterval != 0 || inst.WS.HandshakeTimeout != 0 || inst.WS.BackoffInitial != 0 {
+		if isSet(inst.WS) {
 			fi.WS = &inst.WS
 		}
 		if len(inst.Nodes) > 0 {
