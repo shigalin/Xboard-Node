@@ -17,6 +17,7 @@ import (
 type M = map[string]interface{}
 
 func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+	nc = kernel.WithRealityTarget(nc, kcfg.RealityTargets)
 	var outbounds []M
 	tags := make(map[string]bool)
 

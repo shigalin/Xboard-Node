@@ -19,6 +19,7 @@ import (
 type M = map[string]interface{}
 
 func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+	local := kernel.WithRealityTarget(nc, kcfg.RealityTargets)
 	var outbounds []M
 	tags := make(map[string]bool)
 
@@ -53,8 +54,17 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		"outbounds": outbounds,
 	}
 
-	inbound := buildInbound(nc, users, tc)
+	inbound := buildInbound(local, users, tc)
 	if inbound != nil {
+		if local != nc {
+			// Only a matched local target uses IPv6-aware parsing. Keep the
+			// legacy destination parser unchanged for panel-owned targets.
+			if host, port, err := net.SplitHostPort(local.TLSSettings["dest"].(string)); err == nil {
+				if p, err := strconv.Atoi(port); err == nil {
+					inbound["tls"].(M)["reality"].(M)["handshake"] = M{"server": host, "server_port": p}
+				}
+			}
+		}
 		cfg["inbounds"] = []M{inbound}
 	}
 

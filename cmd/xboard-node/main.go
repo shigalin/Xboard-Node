@@ -28,7 +28,21 @@ var (
 func main() {
 	configPath := flag.String("c", "config.yml", "config file path")
 	showVersion := flag.Bool("v", false, "show version")
+	realitySupport := flag.Bool("supports-reality-targets", false, "print local REALITY target mapping capability")
+	realityCheck := flag.String("check-reality-targets", "", "validate a local REALITY target mapping file and exit")
 	flag.Parse()
+	if *realitySupport {
+		fmt.Println("reality-targets-v1")
+		return
+	}
+	if *realityCheck != "" {
+		if _, err := config.LoadRealityTargets(*realityCheck); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("reality targets valid")
+		return
+	}
 
 	if *showVersion {
 		fmt.Printf("xboard-node %s (built %s)\n", version, buildTime)

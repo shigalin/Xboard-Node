@@ -151,6 +151,10 @@ type KernelConfig struct {
 	// customization of dns, outbounds, endpoints, route, experimental, etc.
 	// Compatible with V2bX OriginalPath format.
 	CustomConfig string `yaml:"custom_config"`
+
+	// RealityTargets is loaded from REALITY_TARGETS_FILE. It overrides only the
+	// handshake destination for matching SNI names; panel listeners stay intact.
+	RealityTargets map[string]string `yaml:"-"`
 }
 
 type CertConfig struct {
@@ -233,6 +237,14 @@ func LoadRoot(path string) (*RootConfig, error) {
 
 	rc.applyEnvOverrides()
 	rc.resolveEnvRefs()
+	targets, err := LoadRealityTargets(os.Getenv("REALITY_TARGETS_FILE"))
+	if err != nil {
+		return nil, err
+	}
+	rc.Config.Kernel.RealityTargets = targets
+	for i := range rc.Instances {
+		rc.Instances[i].Kernel.RealityTargets = targets
+	}
 
 	// Compute stable instance IDs early — they're content-based (derived from
 	// panel URL + machine/node ID), so reordering instances in the YAML doesn't
@@ -379,6 +391,11 @@ func Load(path string) (*Config, error) {
 
 	cfg.applyEnvOverrides()
 	cfg.resolveEnvRefs()
+	targets, err := LoadRealityTargets(os.Getenv("REALITY_TARGETS_FILE"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Kernel.RealityTargets = targets
 	cfg.setDefaultsFrom(baseDir)
 
 	if err := cfg.validate(); err != nil {
