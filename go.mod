@@ -171,7 +171,7 @@ require (
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/stun/v3 v3.1.7 // indirect
 	github.com/pion/transport/v4 v4.1.0 // indirect
-	github.com/pires/go-proxyproto v0.15.0 // indirect
+	github.com/pires/go-proxyproto v0.16.0 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/sftp v1.13.10 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
@@ -295,4 +295,4 @@ require (
 
 replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20260902182505-87c8ff1aa849
 
-replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261027015150-0ced8f4195f2
+replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261031171914-8e14f4183d34
