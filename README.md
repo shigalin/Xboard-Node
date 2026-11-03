@@ -59,6 +59,47 @@ xbctl service restart
 
 Legacy single-panel config is fully compatible. Appending bindings auto-migrates to `instances` format. See `config.yml.example`.
 
+### REALITY destinations selected by client SNI (Xray)
+
+Set `kernel.reality_sni_targets` to let clients of the **same Xray REALITY node**
+choose among explicitly configured camouflage websites by changing their SNI:
+
+```yaml
+kernel:
+  type: xray
+  reality_sni_targets:
+    site.example.com: "127.0.0.1:48080"
+    www.apple.com: "www.apple.com:443"
+```
+
+The map must include the panel's REALITY `server_name`, so the existing
+subscription keeps working. The client keeps its node address, port, UUID and
+REALITY credentials; only its `servername` / `serverName` changes. Each target
+must accept its mapped SNI and support REALITY's TLS handshake requirements.
+Use lowercase DNS names (IDNs in ASCII/Punycode) and an explicit destination
+port; IPv6 destinations use `[address]:port`. Names are normalized at load.
+Wildcards, IP-valued SNI names and malformed destinations are rejected.
+
+The node starts an internal Xray router on a private Unix socket and forwards
+the original TLS handshake according to SNI. No Nginx, extra public listener,
+or Xray-core patch is needed. Unknown/absent SNI and non-TLS traffic are blocked;
+destinations are never constructed from arbitrary client input. Ordinary TLS
+probes for a listed SNI reach that SNI's website too. These handshake connections
+do not use the proxy users' custom routes or affect their device/IP counts.
+Explicit loopback targets are supported without relaxing the proxy's ordinary
+private-address restrictions. Do not point a target back to the node's own
+REALITY listener; a local site must have its own HTTPS listener in the same
+network namespace.
+
+This map applies only to Xray REALITY inbounds and takes precedence over the
+static destination, including `reality_targets_file`. A non-empty per-instance
+map replaces the inherited top-level map; an omitted/empty map inherits it.
+Restart the node after editing the YAML. Without this map, existing behavior
+is unchanged. sing-box is unaffected. Invalid maps fail configuration loading;
+a panel update whose default SNI is missing from the map fails without replacing
+the running Xray instance. Routers are closed with their owning instances,
+including draining generations after reload.
+
 ### Local REALITY websites
 
 Point `kernel.reality_targets_file` (or the `realityTargetsFile` /

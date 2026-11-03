@@ -125,17 +125,31 @@ func (x *Xray) Protocols() []string {
 // Crucially, the old instance stays alive until the new one is confirmed
 // running — if StartNew fails, the old instance is untouched.
 //
-//	Phase 1 – Build:      generate protobuf config  (no lock, pure computation)
+//	Phase 1 – Build:      generate config and start optional SNI router (no lock)
 //	Phase 2 – Create:     xrayCore.New + capture LD (brief global lock)
 //	Phase 3 – StartNew:   instance.Start            (no lock, potentially slow)
 //	Phase 4 – Swap:       store new, extract old     (brief kernel lock)
 //	Phase 5 – RecycleOld: close old in background    (non-blocking)
 func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
-	// ── Phase 1: Build config (no shared state) ─────────────────────────
+	// ── Phase 1: Build config and prepare optional SNI routing ───────────
 	x.ensureGeoData(nodeConfig)
-	kernel.LogRealityTarget(nodeConfig, x.cfg.RealityTargets)
+	cfgMap := buildConfig(x.cfg, nodeConfig, users, tls)
+	sniRouter, err := prepareRealitySNIRouting(cfgMap, x.cfg.RealitySNITargets)
+	if err != nil {
+		return err
+	}
+	// Until registered with the main instance, the router is owned here.
+	routerRegistered := false
+	defer func() {
+		if sniRouter != nil && !routerRegistered {
+			sniRouter.Close()
+		}
+	}()
+	if sniRouter == nil {
+		kernel.LogRealityTarget(nodeConfig, x.cfg.RealityTargets)
+	}
 
-	data, err := marshalConfig(x.cfg, nodeConfig, users, tls)
+	data, err := marshalConfig(cfgMap)
 	if err != nil {
 		return err
 	}
@@ -152,6 +166,13 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	xrayCreationMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("create xray: %w", err)
+	}
+	if sniRouter != nil {
+		if err := inst.AddFeature(sniRouter); err != nil {
+			inst.Close()
+			return fmt.Errorf("attach REALITY SNI router: %w", err)
+		}
+		routerRegistered = true
 	}
 	// Configure admission and speed limits before listeners can accept their
 	// first connection; a connection dispatched earlier would stay unthrottled.
@@ -713,9 +734,8 @@ func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
 	os.Setenv("XRAY_LOCATION_ASSET", dir)
 }
 
-// marshalConfig builds the xray JSON config and returns the raw bytes.
-func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) ([]byte, error) {
-	cfgMap := buildConfig(cfg, nc, users, tls)
+// marshalConfig returns the generated Xray configuration as JSON.
+func marshalConfig(cfgMap M) ([]byte, error) {
 	data, err := json.MarshalIndent(cfgMap, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)

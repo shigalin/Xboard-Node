@@ -161,6 +161,10 @@ type KernelConfig struct {
 	// only the handshake destination for matching SNI names; panel listeners
 	// stay intact.
 	RealityTargets map[string]string `yaml:"-"`
+
+	// RealitySNITargets selects a handshake destination for each client SNI.
+	// Xray REALITY only; replaces the static destination when non-empty.
+	RealitySNITargets map[string]string `yaml:"reality_sni_targets,omitempty"`
 }
 
 type CertConfig struct {
@@ -424,6 +428,10 @@ func (c *Config) loadRealityTargets() error {
 		return fmt.Errorf("kernel.reality_targets_file (REALITY_TARGETS_FILE): %w", err)
 	}
 	c.Kernel.RealityTargets = targets
+	c.Kernel.RealitySNITargets, err = NormalizeRealitySNITargets(c.Kernel.RealitySNITargets)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -563,6 +571,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if c.Kernel.RealityTargetsFile == "" {
 		c.Kernel.RealityTargetsFile = parent.Kernel.RealityTargetsFile
+	}
+	if len(c.Kernel.RealitySNITargets) == 0 {
+		c.Kernel.RealitySNITargets = parent.Kernel.RealitySNITargets
 	}
 	if len(c.Kernel.CustomOutbound) == 0 {
 		c.Kernel.CustomOutbound = parent.Kernel.CustomOutbound

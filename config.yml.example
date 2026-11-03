@@ -40,3 +40,14 @@
 # realityTargetsFile / REALITY_TARGETS_FILE env vars override this setting.
 # kernel:
 #   reality_targets_file: "/etc/xboard-node/reality-targets.yml"
+
+# ── Xray REALITY: choose destination from the client's SNI ──
+# Include the panel's default REALITY server_name. Only these names are accepted.
+# Each target must support REALITY and accept its mapped SNI; restart after edits.
+# This takes precedence over reality_targets_file, applies only to Xray REALITY,
+# and needs no external proxy. Per-instance maps replace inherited maps.
+# kernel:
+#   type: xray
+#   reality_sni_targets:
+#     site.example.com: "127.0.0.1:48080"
+#     www.apple.com: "www.apple.com:443"
