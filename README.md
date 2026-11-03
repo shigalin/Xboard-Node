@@ -74,13 +74,18 @@ only `servername` / `serverName` changes. Updated Xboard subscriptions use the
 first name as their default SNI. Upgrade both Xboard and xboard-node before using
 multiple names. Each target must accept its SNI and support REALITY's handshake.
 
-The node uses a private Unix socket for internal forwarding. It does not need
-Nginx or an Xray-core patch, and does not terminate TLS. Fragmented ClientHello
+The node uses a local Unix socket for internal forwarding: on Linux an abstract
+socket, which has no file for `/tmp` cleaners to delete; elsewhere a socket in a
+private temporary directory. It does not need Nginx or an Xray-core patch, and
+does not terminate TLS. Fragmented ClientHello
 records are reassembled only to read SNI, then all original bytes are replayed
-unchanged. Unknown/absent SNI and non-TLS traffic are rejected; destinations are
-never constructed from unlisted client input. Initial ClientHello collection is
-bounded to 15 seconds and 256 KiB. Unchanged mappings share their router across overlapping reload generations,
-retaining REALITY probe-cache keys. The router closes all forwarding connections
+unchanged. Connections without a listed SNI (unknown or absent SNI, non-TLS or
+malformed input, or a ClientHello not complete within 15 seconds or 256 KiB)
+are replayed unchanged to the first listed name's destination, so probes see
+that site instead of a closed connection. Destinations are never constructed
+from unlisted client input. Unchanged mappings, including the first name, share
+their router across overlapping reload generations, retaining REALITY
+probe-cache keys. The router closes all forwarding connections
 when its last owning generation closes.
 
 The existing `reality_targets_file` can still override individual listed domains
@@ -89,7 +94,8 @@ every domain uses the one panel REALITY port (default `443`). A local site must
 have its own HTTPS listener; do not target the node's public REALITY listener.
 Malformed lists and invalid shared ports reject the new configuration without
 replacing a running instance. Single-name behavior is unchanged. This feature
-is for Xray; do not use comma-separated SNI with sing-box nodes.
+is for Xray; sing-box nodes reject a comma-separated SNI as invalid node
+configuration.
 
 ### Local REALITY websites
 

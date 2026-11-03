@@ -68,7 +68,7 @@ func (c *fragmentedHelloConn) Write(p []byte) (int, error) {
 func TestRealitySNIFragmentedClientHello(t *testing.T) {
 	site := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer site.Close()
-	r, err := startRealitySNIRouter(map[string]string{"one.example.com": site.Listener.Addr().String()})
+	r, err := startRealitySNIRouter(map[string]string{"one.example.com": site.Listener.Addr().String()}, site.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,18 +27,23 @@ func sniTestConfig(name string) M {
 	}}}}}
 }
 
-func TestRealitySNIRouterRoutesTLSAndRejectsUnknownNames(t *testing.T) {
+func TestRealitySNIRouterRoutesTLSAndFallsBackForUnlistedNames(t *testing.T) {
 	for _, network := range []string{"tcp", "unix"} {
 		t.Run(network, func(t *testing.T) {
 			// Each target accepts only its own SNI, so a fixed/wrong destination
-			// cannot accidentally satisfy the positive routing assertions.
+			// cannot accidentally satisfy the positive routing assertions. It
+			// records every foreign SNI it is shown.
 			targets := make(map[string]string)
+			foreign := make(map[string]chan string)
 			for _, name := range []string{"one.example.com", "two.example.com"} {
 				website := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					fmt.Fprint(w, name)
 				}))
+				seen := make(chan string, 8)
+				foreign[name] = seen
 				website.TLS = &tls.Config{GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 					if hello.ServerName != name {
+						seen <- hello.ServerName
 						return nil, fmt.Errorf("unexpected SNI")
 					}
 					return nil, nil
@@ -96,9 +103,19 @@ func TestRealitySNIRouterRoutesTLSAndRejectsUnknownNames(t *testing.T) {
 				resp, err := client.Get("https://127.0.0.1/")
 				transport.CloseIdleConnections()
 				if targets[name] == "" {
+					// Unlisted/absent SNI reaches the first site unchanged, which
+					// answers (here: rejects) it as it would a direct probe.
 					if err == nil {
 						resp.Body.Close()
-						t.Fatal("unlisted/absent SNI reached a target")
+						t.Fatal("first site accepted a foreign SNI")
+					}
+					select {
+					case got := <-foreign["one.example.com"]:
+						if got != name {
+							t.Fatalf("first site saw SNI %q, want %q", got, name)
+						}
+					case <-time.After(3 * time.Second):
+						t.Fatalf("SNI %q did not reach the first site", name)
 					}
 					continue
 				}
@@ -110,6 +127,23 @@ func TestRealitySNIRouterRoutesTLSAndRejectsUnknownNames(t *testing.T) {
 				if err != nil || string(body) != name {
 					t.Fatalf("SNI %s reached wrong target: %q, %v", name, body, err)
 				}
+			}
+			if len(foreign["two.example.com"]) != 0 {
+				t.Fatal("fallback traffic reached a site other than the first")
+			}
+			// Non-TLS input is replayed unchanged too, so the first site answers.
+			plain, err := net.Dial(network, addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plain.SetDeadline(time.Now().Add(3 * time.Second))
+			if _, err := io.WriteString(plain, "GET / HTTP/1.1\r\nHost: probe\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			reply, _ := io.ReadAll(plain)
+			plain.Close()
+			if !strings.HasPrefix(string(reply), "HTTP/1.0 400 Bad Request") {
+				t.Fatalf("non-TLS probe was not answered by the first site: %q", reply)
 			}
 			// Closing a generation must also end established, anonymous TLS
 			// forwards, which are intentionally absent from user/IP accounting.
@@ -142,11 +176,58 @@ func TestRealitySNIRouterRoutesTLSAndRejectsUnknownNames(t *testing.T) {
 					t.Fatal("closed router retained a connection")
 				}
 			}
-			if _, err := os.Stat(router.dir); !os.IsNotExist(err) {
-				t.Fatal("router socket directory remains after close")
+			if !realitySNIRouterGone(router.realitySNIRouter) {
+				t.Fatal("router socket remains after close")
 			}
 		})
 	}
+}
+
+// realitySNIRouterGone reports whether r was closed and released its socket:
+// the address refuses connections and any socket directory was removed.
+func realitySNIRouterGone(r *realitySNIRouter) bool {
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if !closed {
+		return false
+	}
+	if conn, err := net.Dial("unix", r.listener.Addr().String()); err == nil {
+		conn.Close()
+		return false
+	}
+	if r.dir == "" {
+		return true
+	}
+	_, err := os.Stat(r.dir)
+	return os.IsNotExist(err)
+}
+
+// realitySNISockets lists live router sockets: abstract names on Linux,
+// otherwise socket directories under dir.
+func realitySNISockets(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+	found := make(map[string]bool)
+	if runtime.GOOS == "linux" {
+		data, err := os.ReadFile("/proc/net/unix")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if fields := strings.Fields(line); len(fields) == 8 && strings.HasPrefix(fields[7], "@xb-sni-") {
+				found[fields[7]] = true
+			}
+		}
+		return found
+	}
+	paths, err := filepath.Glob(filepath.Join(dir, "xb-sni-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		found[path] = true
+	}
+	return found
 }
 
 func TestPanelRealitySNITargets(t *testing.T) {
@@ -206,7 +287,7 @@ func TestRealitySNIRouterLeasesReuseAndReleaseGenerations(t *testing.T) {
 	}
 	first.Close()
 	first.Close() // repeated core Close must not release the newer generation
-	if _, err := os.Stat(second.dir); err != nil {
+	if realitySNIRouterGone(second.realitySNIRouter) {
 		t.Fatal("old generation closed a router still used by the new one")
 	}
 	nc.TLSSettings["server_port"] = 8443
@@ -218,11 +299,20 @@ func TestRealitySNIRouterLeasesReuseAndReleaseGenerations(t *testing.T) {
 	if changed.realitySNIRouter == second.realitySNIRouter || second.targets["one.example.com"] != "one.example.com:443" {
 		t.Fatal("new mapping mutated the previous generation")
 	}
+	nc.TLSSettings["server_name"] = "two.example.com,one.example.com"
+	reordered, err := prepareRealitySNIRouting(sniTestConfig("unused"), nc, nil, changed.realitySNIRouter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reordered.Close() })
+	if reordered.realitySNIRouter == changed.realitySNIRouter || reordered.fallback != "two.example.com:8443" {
+		t.Fatal("a new first name must start a router with its fallback")
+	}
 	second.Close()
-	if _, err := os.Stat(second.dir); !os.IsNotExist(err) {
+	if !realitySNIRouterGone(second.realitySNIRouter) {
 		t.Fatal("last lease did not remove its router")
 	}
-	if _, err := os.Stat(changed.dir); err != nil {
+	if realitySNIRouterGone(changed.realitySNIRouter) {
 		t.Fatal("closing an old mapping affected the changed mapping")
 	}
 }
@@ -236,6 +326,17 @@ func TestRealitySNIRouterCleanedUpOnMainConfigFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	t.Setenv("TMPDIR", dir)
+	before := realitySNISockets(t, dir)
+	// The leak check must be able to see a live router on this platform.
+	visible, err := startRealitySNIRouter(nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := len(realitySNISockets(t, dir)) > len(before)
+	visible.Close()
+	if !seen {
+		t.Fatal("leak check cannot see a live SNI router")
+	}
 	server := New(config.KernelConfig{})
 	nc := &model.NodeSpec{Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: 443, Network: "tcp", TLS: 2,
 		TLSSettings: M{"server_name": "one.example.com,two.example.com", "private_key": "invalid-test-key", "short_id": "abcd"}}
@@ -243,8 +344,9 @@ func TestRealitySNIRouterCleanedUpOnMainConfigFailure(t *testing.T) {
 		server.Stop()
 		t.Fatal("invalid main REALITY config unexpectedly started")
 	}
-	paths, err := filepath.Glob(filepath.Join(dir, "xb-sni-*"))
-	if err != nil || len(paths) != 0 {
-		t.Fatal("failed main startup leaked the SNI router")
+	for socket := range realitySNISockets(t, dir) {
+		if !before[socket] {
+			t.Fatal("failed main startup leaked the SNI router")
+		}
 	}
 }

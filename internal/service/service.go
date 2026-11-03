@@ -1598,7 +1598,7 @@ func validateRuntimeCertConfig(spec *model.NodeSpec) error {
 	return nil
 }
 
-func validateRealityRequirements(spec *model.NodeSpec, _ string) error {
+func validateRealityRequirements(spec *model.NodeSpec, kernelType string) error {
 	if spec.TLSSettings == nil {
 		return fmt.Errorf("reality tls requires tls_settings")
 	}
@@ -1610,6 +1610,11 @@ func validateRealityRequirements(spec *model.NodeSpec, _ string) error {
 	}
 	if serverName == "" && dest == "" {
 		return fmt.Errorf("reality tls requires tls_settings.server_name or tls_settings.dest")
+	}
+	// Only Xray routes a comma-separated list; sing-box would start and then
+	// fail every handshake dialing the whole list as one host name.
+	if kernelType != "xray" && strings.Contains(serverName, ",") {
+		return fmt.Errorf("reality tls_settings.server_name with multiple names requires the xray kernel")
 	}
 	return nil
 }

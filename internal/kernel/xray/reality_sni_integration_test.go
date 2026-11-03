@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -30,14 +29,21 @@ import (
 
 func TestRealitySNIRoutingAuthenticatedTrafficAndLifecycle(t *testing.T) {
 	targets := make(map[string]string)
+	foreign := make(map[string]chan string)
 	for _, name := range []string{"one.example.com", "two.example.com"} {
 		website := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			fmt.Fprint(w, name)
 		}))
+		seen := make(chan string, 8)
+		foreign[name] = seen
 		website.EnableHTTP2 = true
 		website.TLS = &tls.Config{MinVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{tls.X25519},
 			GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 				if hello.ServerName != name {
+					select {
+					case seen <- hello.ServerName:
+					default:
+					}
 					return nil, fmt.Errorf("wrong SNI reached this target")
 				}
 				return nil, nil
@@ -127,7 +133,8 @@ func TestRealitySNIRoutingAuthenticatedTrafficAndLifecycle(t *testing.T) {
 	for _, name := range []string{"one.example.com", "two.example.com"} {
 		checkProxy(name, "abcd")
 	}
-	// Ordinary probes must also reach the site matching their SNI.
+	// Ordinary probes must also reach the site matching their SNI; an unknown
+	// SNI reaches the first site, which rejects it as it would directly.
 	for _, name := range []string{"one.example.com", "two.example.com", "unknown.example.com"} {
 		transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
@@ -137,7 +144,15 @@ func TestRealitySNIRoutingAuthenticatedTrafficAndLifecycle(t *testing.T) {
 		if name == "unknown.example.com" {
 			if err == nil {
 				response.Body.Close()
-				t.Fatal("unknown SNI reached a website")
+				t.Fatal("first website accepted an unknown SNI")
+			}
+			select {
+			case got := <-foreign["one.example.com"]:
+				if got != name {
+					t.Fatalf("first website saw SNI %q, want %q", got, name)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("unknown SNI did not reach the first website")
 			}
 		} else {
 			if err != nil {
@@ -150,6 +165,20 @@ func TestRealitySNIRoutingAuthenticatedTrafficAndLifecycle(t *testing.T) {
 			}
 		}
 		transport.CloseIdleConnections()
+	}
+	// Non-TLS probes pass through REALITY and the router to the first site.
+	plain, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(plain, "GET / HTTP/1.1\r\nHost: probe\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	reply, _ := io.ReadAll(plain)
+	plain.Close()
+	if !strings.HasPrefix(string(reply), "HTTP/1.0 400 Bad Request") {
+		t.Fatalf("non-TLS probe was not answered by the first website: %q", reply)
 	}
 	// A bad panel update leaves the old listener/router available.
 	bad := *nc
@@ -175,7 +204,7 @@ func TestRealitySNIRoutingAuthenticatedTrafficAndLifecycle(t *testing.T) {
 	for _, router := range []*realitySNIRouter{firstRouter, secondRouter} {
 		deadline := time.Now().Add(3 * time.Second)
 		for {
-			if _, err := os.Stat(router.dir); os.IsNotExist(err) {
+			if realitySNIRouterGone(router) {
 				break
 			}
 			if time.Now().After(deadline) {

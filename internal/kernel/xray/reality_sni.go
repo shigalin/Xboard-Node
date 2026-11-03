@@ -3,6 +3,7 @@ package xray
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,8 +29,9 @@ const realityHelloTimeout = 15 * time.Second
 // Xray instance (whose logger would replace the process-global log handler).
 type realitySNIRouter struct {
 	listener net.Listener
-	dir      string
+	dir      string // socket directory; empty for a Linux abstract socket
 	targets  map[string]string
+	fallback string // destination of the first listed name
 	ctx      context.Context
 	cancel   context.CancelFunc
 	mu       sync.Mutex
@@ -51,13 +54,13 @@ type realitySNIRouterLease struct {
 func (*realitySNIRouterLease) Type() interface{} { return (*realitySNIRouterLease)(nil) }
 func (*realitySNIRouterLease) Start() error      { return nil }
 
-func (r *realitySNIRouter) acquire(targets map[string]string) *realitySNIRouterLease {
+func (r *realitySNIRouter) acquire(targets map[string]string, fallback string) *realitySNIRouterLease {
 	if r == nil {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || !maps.Equal(r.targets, targets) {
+	if r.closed || r.fallback != fallback || !maps.Equal(r.targets, targets) {
 		return nil
 	}
 	r.refs++
@@ -99,7 +102,8 @@ func (r *realitySNIRouter) Close() error {
 
 // prepareRealitySNIRouting derives the allowlist and targets from the panel's
 // comma-separated server_name and shared server_port. The existing loopback
-// website map can still override individual targets. Single-name nodes retain
+// website map can still override individual targets. The first name's target
+// also answers connections without a listed SNI. Single-name nodes retain
 // their existing configuration; no second local SNI list is required.
 func prepareRealitySNIRouting(cfg M, nc *model.NodeSpec, localTargets map[string]string, previous *realitySNIRouter) (*realitySNIRouterLease, error) {
 	if nc == nil || nc.TLS != 2 {
@@ -122,13 +126,14 @@ func prepareRealitySNIRouting(cfg M, nc *model.NodeSpec, localTargets map[string
 	if err != nil {
 		return nil, err
 	}
-	lease := previous.acquire(targets)
+	fallback := targets[names[0]]
+	lease := previous.acquire(targets, fallback)
 	if lease == nil {
-		router, err := startRealitySNIRouter(targets)
+		router, err := startRealitySNIRouter(targets, fallback)
 		if err != nil {
 			return nil, err
 		}
-		lease = router.acquire(targets)
+		lease = router.acquire(targets, fallback)
 	}
 	reality["dest"] = lease.listener.Addr().String()
 	reality["serverNames"] = names
@@ -181,21 +186,37 @@ func realityDNSName(name string) bool {
 	return true
 }
 
-func startRealitySNIRouter(targets map[string]string) (*realitySNIRouter, error) {
+func startRealitySNIRouter(targets map[string]string, fallback string) (*realitySNIRouter, error) {
+	listener, dir, err := listenRealitySNI()
+	if err != nil {
+		return nil, fmt.Errorf("listen for REALITY SNI routing: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &realitySNIRouter{listener: listener, dir: dir, targets: targets, fallback: fallback, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{})}
+	r.wg.Add(1)
+	go r.serve()
+	return r, nil
+}
+
+// REALITY dials the router for every connection, so its address must stay
+// reachable for the router's lifetime. On Linux an abstract socket has no
+// filesystem entry that /tmp cleaners could unlink. Elsewhere the socket lives
+// in a private temporary directory, returned for removal on Close.
+func listenRealitySNI() (net.Listener, string, error) {
+	if runtime.GOOS == "linux" {
+		listener, err := net.Listen("unix", "@xb-sni-"+rand.Text())
+		return listener, "", err
+	}
 	dir, err := os.MkdirTemp("", "xb-sni-")
 	if err != nil {
-		return nil, fmt.Errorf("create REALITY SNI socket directory: %w", err)
+		return nil, "", fmt.Errorf("create socket directory: %w", err)
 	}
 	listener, err := net.Listen("unix", filepath.Join(dir, "route.sock"))
 	if err != nil {
 		os.RemoveAll(dir)
-		return nil, fmt.Errorf("listen for REALITY SNI routing: %w", err)
+		return nil, "", err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	r := &realitySNIRouter{listener: listener, dir: dir, targets: targets, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{})}
-	r.wg.Add(1)
-	go r.serve()
-	return r, nil
+	return listener, dir, nil
 }
 
 func (r *realitySNIRouter) track(conn net.Conn) bool {
@@ -238,12 +259,16 @@ func (r *realitySNIRouter) serve() {
 func (r *realitySNIRouter) forward(client net.Conn) {
 	client.SetReadDeadline(time.Now().Add(realityHelloTimeout))
 	name, hello, err := readRealityClientHello(r.ctx, client)
-	if err != nil {
+	if r.ctx.Err() != nil {
 		return
 	}
+	// Like a single-destination node, answer probes without a listed SNI
+	// (unknown or absent SNI, non-TLS, malformed, slow or oversized input) from
+	// a real site instead of closing. The fixed fallback never dials an address
+	// derived from unlisted client input.
 	dest := r.targets[name]
-	if dest == "" { // never dial an address derived from unlisted client input
-		return
+	if err != nil || dest == "" {
+		dest = r.fallback
 	}
 	upstream, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(r.ctx, "tcp", dest)
 	if err != nil || !r.track(upstream) {
@@ -281,6 +306,7 @@ var errRealityHelloCaptured = errors.New("REALITY ClientHello captured")
 // Let crypto/tls reassemble TLS records and parse ClientHello, but stop before
 // sending any TLS response. Replay every captured byte unchanged to the target.
 // Unlike generic sniffing, this supports fragmented records and slow arrivals.
+// On error, the bytes captured so far are still returned for replay.
 func readRealityClientHello(ctx context.Context, conn net.Conn) (string, []byte, error) {
 	recording := &realityHelloConn{Conn: conn}
 	var name string
@@ -290,7 +316,7 @@ func readRealityClientHello(ctx context.Context, conn net.Conn) (string, []byte,
 	}})
 	err := server.HandshakeContext(ctx)
 	if !errors.Is(err, errRealityHelloCaptured) || name == "" {
-		return "", nil, fmt.Errorf("missing or invalid REALITY SNI")
+		return "", recording.data, fmt.Errorf("missing or invalid REALITY SNI")
 	}
 	return name, recording.data, nil
 }

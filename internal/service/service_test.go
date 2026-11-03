@@ -249,6 +249,26 @@ func TestValidateNodeRuntimeAllowsSingboxRealityWithRequiredFields(t *testing.T)
 	}
 }
 
+func TestValidateNodeRuntimeRejectsRealitySNIListOutsideXray(t *testing.T) {
+	spec := &model.NodeSpec{
+		Protocol: "vless",
+		TLS:      2,
+		TLSSettings: map[string]any{
+			"private_key": "test-key",
+			"server_name": "one.example.com,two.example.com",
+		},
+	}
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
+	err := validateNodeRuntime(cfg, []string{"vless"}, spec, kernel.TLSCert{})
+	if err == nil || err.Error() != "reality tls_settings.server_name with multiple names requires the xray kernel" {
+		t.Fatalf("expected sing-box to reject a REALITY SNI list, got %v", err)
+	}
+	cfg.Kernel.Type = "xray"
+	if err := validateNodeRuntime(cfg, []string{"vless"}, spec, kernel.TLSCert{}); err != nil {
+		t.Fatalf("expected xray to accept a REALITY SNI list, got %v", err)
+	}
+}
+
 func TestValidateNodeRuntimeRejectsRealityWithoutTLSSettings(t *testing.T) {
 	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
 	err := validateNodeRuntime(cfg, []string{"vless"}, &model.NodeSpec{
