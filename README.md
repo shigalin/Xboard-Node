@@ -59,46 +59,37 @@ xbctl service restart
 
 Legacy single-panel config is fully compatible. Appending bindings auto-migrates to `instances` format. See `config.yml.example`.
 
-### REALITY destinations selected by client SNI (Xray)
+### REALITY destinations selected by panel SNI list (Xray)
 
-Set `kernel.reality_sni_targets` to let clients of the **same Xray REALITY node**
-choose among explicitly configured camouflage websites by changing their SNI:
+In the panel's existing REALITY **伪装站点(dest)** / SNI field, enter DNS names
+separated by ASCII commas, for example `site.example.com,www.apple.com`. Set the
+single REALITY **端口(port)** to `443` (or the shared target port). No additional
+node-side SNI list is needed.
 
-```yaml
-kernel:
-  type: xray
-  reality_sni_targets:
-    site.example.com: "127.0.0.1:48080"
-    www.apple.com: "www.apple.com:443"
-```
+The node API keeps the complete comma-separated string. xboard-node trims and
+normalizes the names, removes duplicates, and accepts each listed SNI. For each
+connection it forwards the original TLS handshake to `<client SNI>:<shared port>`.
+The client keeps its node address, connection port, UUID and REALITY credentials;
+only `servername` / `serverName` changes. Updated Xboard subscriptions use the
+first name as their default SNI. Upgrade both Xboard and xboard-node before using
+multiple names. Each target must accept its SNI and support REALITY's handshake.
 
-The map must include the panel's REALITY `server_name`, so the existing
-subscription keeps working. The client keeps its node address, port, UUID and
-REALITY credentials; only its `servername` / `serverName` changes. Each target
-must accept its mapped SNI and support REALITY's TLS handshake requirements.
-Use lowercase DNS names (IDNs in ASCII/Punycode) and an explicit destination
-port; IPv6 destinations use `[address]:port`. Names are normalized at load.
-Wildcards, IP-valued SNI names and malformed destinations are rejected.
+The node uses a private Unix socket for internal forwarding. It does not need
+Nginx or an Xray-core patch, and does not terminate TLS. Fragmented ClientHello
+records are reassembled only to read SNI, then all original bytes are replayed
+unchanged. Unknown/absent SNI and non-TLS traffic are rejected; destinations are
+never constructed from unlisted client input. Initial ClientHello collection is
+bounded to 15 seconds and 256 KiB. Unchanged mappings share their router across overlapping reload generations,
+retaining REALITY probe-cache keys. The router closes all forwarding connections
+when its last owning generation closes.
 
-The node starts an internal Xray router on a private Unix socket and forwards
-the original TLS handshake according to SNI. No Nginx, extra public listener,
-or Xray-core patch is needed. Unknown/absent SNI and non-TLS traffic are blocked;
-destinations are never constructed from arbitrary client input. Ordinary TLS
-probes for a listed SNI reach that SNI's website too. These handshake connections
-do not use the proxy users' custom routes or affect their device/IP counts.
-Explicit loopback targets are supported without relaxing the proxy's ordinary
-private-address restrictions. Do not point a target back to the node's own
-REALITY listener; a local site must have its own HTTPS listener in the same
-network namespace.
-
-This map applies only to Xray REALITY inbounds and takes precedence over the
-static destination, including `reality_targets_file`. A non-empty per-instance
-map replaces the inherited top-level map; an omitted/empty map inherits it.
-Restart the node after editing the YAML. Without this map, existing behavior
-is unchanged. sing-box is unaffected. Invalid maps fail configuration loading;
-a panel update whose default SNI is missing from the map fails without replacing
-the running Xray instance. Routers are closed with their owning instances,
-including draining generations after reload.
+The existing `reality_targets_file` can still override individual listed domains
+with local HTTPS addresses, including their ports. Without such an override,
+every domain uses the one panel REALITY port (default `443`). A local site must
+have its own HTTPS listener; do not target the node's public REALITY listener.
+Malformed lists and invalid shared ports reject the new configuration without
+replacing a running instance. Single-name behavior is unchanged. This feature
+is for Xray; do not use comma-separated SNI with sing-box nodes.
 
 ### Local REALITY websites
 

@@ -45,8 +45,9 @@ func TestRealitySNIRouterRoutesTLSAndRejectsUnknownNames(t *testing.T) {
 				t.Cleanup(website.Close)
 				targets[name] = website.Listener.Addr().String()
 			}
-			cfg := sniTestConfig("one.example.com")
-			router, err := prepareRealitySNIRouting(cfg, targets)
+			cfg := sniTestConfig("one.example.com,two.example.com")
+			nc := &model.NodeSpec{TLS: 2, TLSSettings: M{"server_name": "one.example.com,two.example.com"}}
+			router, err := prepareRealitySNIRouting(cfg, nc, targets, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -148,22 +149,81 @@ func TestRealitySNIRouterRoutesTLSAndRejectsUnknownNames(t *testing.T) {
 	}
 }
 
-func TestRealitySNIRoutingRequiresDefaultAndPreservesUnconfiguredNodes(t *testing.T) {
-	cfg := sniTestConfig("default.example.com")
-	if _, err := prepareRealitySNIRouting(cfg, map[string]string{"other.example.com": "127.0.0.1:443"}); err == nil {
-		t.Fatal("must not break the subscription's default SNI")
-	}
-	for _, cfg := range []M{sniTestConfig("default.example.com"), {"inbounds": []M{{"streamSettings": M{"security": "tls"}}}}} {
-		before, _ := marshalConfig(cfg)
-		router, err := prepareRealitySNIRouting(cfg, nil)
-		after, _ := marshalConfig(cfg)
-		if err != nil || router != nil || string(before) != string(after) {
-			t.Fatal("unset SNI routing changed the generated config")
+func TestPanelRealitySNITargets(t *testing.T) {
+	for _, port := range []any{nil, "", 443, float64(443), "443"} {
+		names, targets, err := panelRealitySNITargets(" One.example.com. , two.example.com,one.example.com", port, nil)
+		if err != nil || !reflect.DeepEqual(names, []string{"one.example.com", "two.example.com"}) ||
+			!reflect.DeepEqual(targets, map[string]string{"one.example.com": "one.example.com:443", "two.example.com": "two.example.com:443"}) {
+			t.Fatalf("unexpected panel mapping: %v, %v, %v", names, targets, err)
 		}
 	}
-	cfg = M{"inbounds": []M{{"streamSettings": M{"security": "tls"}}}}
-	if router, err := prepareRealitySNIRouting(cfg, map[string]string{"one.example.com": "127.0.0.1:443"}); err != nil || router != nil {
-		t.Fatal("SNI routing must apply only to REALITY")
+	_, targets, err := panelRealitySNITargets("one.example.com,two.example.com", 8443, map[string]string{"one.example.com": "127.0.0.1:48080"})
+	if err != nil || targets["one.example.com"] != "127.0.0.1:48080" || targets["two.example.com"] != "two.example.com:8443" {
+		t.Fatal("shared port or local override was lost")
+	}
+	for _, raw := range []string{"", "one.example.com,", ",one.example.com", "one.example.com,,two.example.com", "*.example.com,two.example.com", "127.0.0.1,two.example.com", "one.example.com:443,two.example.com"} {
+		if _, _, err := panelRealitySNITargets(raw, 443, nil); err == nil {
+			t.Fatalf("invalid SNI list accepted: %q", raw)
+		}
+	}
+	for _, port := range []any{0, -1, 65536, "443,8443", 443.5} {
+		if _, _, err := panelRealitySNITargets("one.example.com,two.example.com", port, nil); err == nil {
+			t.Fatal("invalid shared port accepted")
+		}
+	}
+}
+
+func TestRealitySNIRoutingPreservesSingleNameNodes(t *testing.T) {
+	cfg := sniTestConfig("one.example.com")
+	before, _ := marshalConfig(cfg)
+	nc := &model.NodeSpec{TLS: 2, TLSSettings: M{"server_name": "one.example.com"}}
+	router, err := prepareRealitySNIRouting(cfg, nc, nil, nil)
+	after, _ := marshalConfig(cfg)
+	if err != nil || router != nil || string(before) != string(after) {
+		t.Fatal("single-name node configuration changed")
+	}
+	nc.TLS = 1
+	nc.TLSSettings["server_name"] = "one.example.com,two.example.com"
+	if router, err := prepareRealitySNIRouting(cfg, nc, nil, nil); err != nil || router != nil {
+		t.Fatal("non-REALITY node changed")
+	}
+}
+
+func TestRealitySNIRouterLeasesReuseAndReleaseGenerations(t *testing.T) {
+	nc := &model.NodeSpec{TLS: 2, TLSSettings: M{"server_name": "one.example.com,two.example.com", "server_port": 443}}
+	first, err := prepareRealitySNIRouting(sniTestConfig("unused"), nc, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { first.Close() })
+	second, err := prepareRealitySNIRouting(sniTestConfig("unused"), nc, nil, first.realitySNIRouter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { second.Close() })
+	if first == second || first.realitySNIRouter != second.realitySNIRouter {
+		t.Fatal("generations need separate leases on the same unchanged router")
+	}
+	first.Close()
+	first.Close() // repeated core Close must not release the newer generation
+	if _, err := os.Stat(second.dir); err != nil {
+		t.Fatal("old generation closed a router still used by the new one")
+	}
+	nc.TLSSettings["server_port"] = 8443
+	changed, err := prepareRealitySNIRouting(sniTestConfig("unused"), nc, nil, second.realitySNIRouter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { changed.Close() })
+	if changed.realitySNIRouter == second.realitySNIRouter || second.targets["one.example.com"] != "one.example.com:443" {
+		t.Fatal("new mapping mutated the previous generation")
+	}
+	second.Close()
+	if _, err := os.Stat(second.dir); !os.IsNotExist(err) {
+		t.Fatal("last lease did not remove its router")
+	}
+	if _, err := os.Stat(changed.dir); err != nil {
+		t.Fatal("closing an old mapping affected the changed mapping")
 	}
 }
 
@@ -176,9 +236,9 @@ func TestRealitySNIRouterCleanedUpOnMainConfigFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	t.Setenv("TMPDIR", dir)
-	server := New(config.KernelConfig{RealitySNITargets: map[string]string{"one.example.com": "127.0.0.1:443"}})
+	server := New(config.KernelConfig{})
 	nc := &model.NodeSpec{Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: 443, Network: "tcp", TLS: 2,
-		TLSSettings: M{"server_name": "one.example.com", "private_key": "invalid-test-key", "short_id": "abcd"}}
+		TLSSettings: M{"server_name": "one.example.com,two.example.com", "private_key": "invalid-test-key", "short_id": "abcd"}}
 	if err := server.Start(nc, nil, kernel.TLSCert{}); err == nil {
 		server.Stop()
 		t.Fatal("invalid main REALITY config unexpectedly started")

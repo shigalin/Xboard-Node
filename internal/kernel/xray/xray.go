@@ -134,7 +134,15 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	// ── Phase 1: Build config and prepare optional SNI routing ───────────
 	x.ensureGeoData(nodeConfig)
 	cfgMap := buildConfig(x.cfg, nodeConfig, users, tls)
-	sniRouter, err := prepareRealitySNIRouting(cfgMap, x.cfg.RealitySNITargets)
+	x.mu.Lock()
+	var previousRouter *realitySNIRouter
+	if x.instance != nil {
+		if lease, ok := x.instance.GetFeature((*realitySNIRouterLease)(nil)).(*realitySNIRouterLease); ok {
+			previousRouter = lease.realitySNIRouter
+		}
+	}
+	x.mu.Unlock()
+	sniRouter, err := prepareRealitySNIRouting(cfgMap, nodeConfig, x.cfg.RealityTargets, previousRouter)
 	if err != nil {
 		return err
 	}

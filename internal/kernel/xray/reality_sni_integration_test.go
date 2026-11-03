@@ -62,23 +62,21 @@ func TestRealitySNIRoutingAuthenticatedTrafficAndLifecycle(t *testing.T) {
 	listener.Close()
 	const uuid = "11111111-1111-4111-8111-111111111111"
 	users := []model.UserSpec{{ID: 1, UUID: uuid}}
-	kcfg := config.KernelConfig{Type: "xray", LogLevel: "error", RealitySNITargets: targets,
-		// A conflicting static map must be replaced by dynamic SNI routing.
-		RealityTargets: map[string]string{"one.example.com": "127.0.0.1:1"},
-		CustomRoute:    []map[string]any{{"type": "field", "ip": []string{"127.0.0.1/32"}, "outboundTag": "direct"}},
+	kcfg := config.KernelConfig{Type: "xray", LogLevel: "error", RealityTargets: targets,
+		CustomRoute: []map[string]any{{"type": "field", "ip": []string{"127.0.0.1/32"}, "outboundTag": "direct"}},
 		CustomOutbound: []map[string]any{{"tag": "direct", "protocol": "freedom", "settings": M{
 			"finalRules": []M{{"action": "allow", "ip": []string{"127.0.0.1/32"}, "port": fmt.Sprint(upstreamPort)}}}}},
 	}
 	nc := &model.NodeSpec{Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: port, Network: "tcp", TLS: 2,
-		Flow: "xtls-rprx-vision", TLSSettings: M{"server_name": "one.example.com", "private_key": privateKey, "short_id": "abcd"}}
+		Flow: "xtls-rprx-vision", TLSSettings: M{"server_name": "one.example.com,two.example.com", "private_key": privateKey, "short_id": "abcd"}}
 	server := New(kcfg)
 	t.Cleanup(server.Stop)
 	if err := server.Start(nc, users, kernel.TLSCert{}); err != nil {
 		t.Fatal("could not start REALITY server", err)
 	}
 	first := server.instance
-	firstRouter := first.GetFeature((*realitySNIRouter)(nil)).(*realitySNIRouter)
-	if nc.TLSSettings["dest"] != nil || nc.TLSSettings["server_name"] != "one.example.com" {
+	firstRouter := first.GetFeature((*realitySNIRouterLease)(nil)).(*realitySNIRouterLease).realitySNIRouter
+	if nc.TLSSettings["dest"] != nil || nc.TLSSettings["server_name"] != "one.example.com,two.example.com" {
 		t.Fatal("panel input was mutated")
 	}
 	checkProxy := func(name, shortID string) {
@@ -155,7 +153,7 @@ func TestRealitySNIRoutingAuthenticatedTrafficAndLifecycle(t *testing.T) {
 	}
 	// A bad panel update leaves the old listener/router available.
 	bad := *nc
-	bad.TLSSettings = M{"server_name": "missing.example.com", "private_key": privateKey, "short_id": "abcd"}
+	bad.TLSSettings = M{"server_name": "one.example.com,,two.example.com", "private_key": privateKey, "short_id": "abcd"}
 	if err := server.Reload(&bad, users, kernel.TLSCert{}); err == nil || server.instance != first {
 		t.Fatal("invalid update replaced the running instance")
 	}
@@ -163,13 +161,13 @@ func TestRealitySNIRoutingAuthenticatedTrafficAndLifecycle(t *testing.T) {
 	// Start a replacement with fresh credentials, then verify Stop owns the
 	// current router and all routers retained by draining generations.
 	replacement := *nc
-	replacement.TLSSettings = M{"server_name": "one.example.com", "private_key": privateKey, "short_id": "beef"}
+	replacement.TLSSettings = M{"server_name": "one.example.com,two.example.com", "private_key": privateKey, "short_id": "beef"}
 	if err := server.Reload(&replacement, users, kernel.TLSCert{}); err != nil {
 		t.Fatal("reload failed", err)
 	}
-	secondRouter := server.instance.GetFeature((*realitySNIRouter)(nil)).(*realitySNIRouter)
-	if secondRouter.dir == firstRouter.dir {
-		t.Fatal("replacement must not reuse the draining generation's socket")
+	secondRouter := server.instance.GetFeature((*realitySNIRouterLease)(nil)).(*realitySNIRouterLease).realitySNIRouter
+	if secondRouter != firstRouter {
+		t.Fatal("unchanged target mapping must reuse its router and probe-cache key")
 	}
 	checkProxy("one.example.com", "beef")
 	checkProxy("two.example.com", "beef")
