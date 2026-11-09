@@ -72,9 +72,9 @@ type Xray struct {
 	inboundTag      string
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
-	// draining maps replaced instances that still carry connections to the
-	// users they served; their counters feed cumTraffic until the hard close.
-	draining        map[*xrayCore.Instance][]model.UserSpec
+	// draining keeps replaced instances reachable until their connections
+	// close and their final counters have been collected.
+	draining        map[*xrayCore.Instance]*drainingInstance
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
 
@@ -88,12 +88,28 @@ type Xray struct {
 	running atomic.Bool
 }
 
+type drainingInstance struct {
+	users    []model.UserSpec
+	done     chan struct{}
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func newDrainingInstance(users []model.UserSpec) *drainingInstance {
+	return &drainingInstance{users: users, done: make(chan struct{}), stop: make(chan struct{})}
+}
+
 func New(cfg config.KernelConfig) *Xray {
+	return NewWithDeviceManager(cfg, limiter.NewDeviceManager(time.Duration(cfg.DeviceLimitCooldown)*time.Second))
+}
+
+// NewWithDeviceManager preserves node admission state when switching kernels.
+func NewWithDeviceManager(cfg config.KernelConfig, devices *limiter.DeviceManager) *Xray {
 	return &Xray{
 		cfg:        cfg,
 		cumTraffic: make(map[int][2]int64),
-		draining:   make(map[*xrayCore.Instance][]model.UserSpec),
-		devices:    limiter.NewDeviceManager(time.Duration(cfg.DeviceLimitCooldown) * time.Second),
+		draining:   make(map[*xrayCore.Instance]*drainingInstance),
+		devices:    devices,
 	}
 }
 
@@ -157,14 +173,9 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 		kernel.LogRealityTarget(nodeConfig, x.cfg.RealityTargets)
 	}
 
-	data, err := marshalConfig(cfgMap)
+	pbConfig, err := parseConfig(cfgMap)
 	if err != nil {
 		return err
-	}
-
-	pbConfig, err := serial.LoadJSONConfig(bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("parse xray config: %w", err)
 	}
 
 	// ── Phase 2: Create instance (global lock for LD capture) ───────────
@@ -200,7 +211,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	oldLD := x.limitDispatcher
 	oldUsers := x.users
 	if old != nil {
-		x.draining[old] = oldUsers
+		x.draining[old] = newDrainingInstance(oldUsers)
 	}
 	x.instance = inst
 	x.limitDispatcher = ld
@@ -226,6 +237,25 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 		"protocol", nodeConfig.Protocol,
 	)
 	return nil
+}
+
+func parseConfig(cfgMap M) (*xrayCore.Config, error) {
+	data, err := marshalConfig(cfgMap)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := serial.LoadJSONConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("parse xray config: %w", err)
+	}
+	return cfg, nil
+}
+
+// CheckConfig checks generated configuration without binding the proxy listener.
+func (x *Xray) CheckConfig(spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	x.ensureGeoData(spec)
+	_, err := parseConfig(buildConfig(x.cfg, spec, users, tls))
+	return err
 }
 
 // Reload updates dispatcher limits and handles configuration changes.
@@ -261,17 +291,36 @@ func (x *Xray) Stop() {
 	inst := x.instance
 	ld := x.limitDispatcher
 	if inst != nil {
-		x.draining[inst] = x.users
+		x.draining[inst] = newDrainingInstance(x.users)
 	}
 	x.instance = nil
 	x.limitDispatcher = nil
+	pending := make([]*drainingInstance, 0, len(x.draining))
+	for _, state := range x.draining {
+		pending = append(pending, state)
+	}
 	x.mu.Unlock()
 
 	stopAccepting(inst)
-	if ld != nil {
-		drainConns(ld, drainTimeout)
-	}
 	x.closeOld(inst, ld)
+	// Stop covers both the current instance and any earlier hot reloads.
+	// Share one grace period, then wait for hard close and final accounting.
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+drain:
+	for _, state := range pending {
+		select {
+		case <-state.done:
+		case <-timer.C:
+			break drain
+		}
+	}
+	for _, state := range pending {
+		state.stopOnce.Do(func() { close(state.stop) })
+	}
+	for _, state := range pending {
+		<-state.done
+	}
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -287,10 +336,6 @@ func tlsEqual(a, b kernel.TLSCert) bool {
 // available. Admission tracks session lifetimes; byte accounting continues to
 // use xray-core's built-in counters.
 func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
-	if !x.running.Load() {
-		return nil, nil, 0, nil
-	}
-
 	x.mu.Lock()
 	ld := x.limitDispatcher
 	traffic, err = x.aggregateStats()
@@ -801,12 +846,17 @@ func (x *Xray) closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 	if inst == nil {
 		return
 	}
+	x.mu.Lock()
+	state := x.draining[inst]
+	x.mu.Unlock()
 	go func() {
+		defer close(state.done)
 		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
 		// We use a much longer timeout here than the default Stop() because
 		// it's running in background and doesn't block new user connections.
+		// Stop can end this grace period to finalize all replaced instances.
 		if ld != nil {
-			drainConns(ld, 5*time.Minute)
+			drainConns(ld, 5*time.Minute, state.stop)
 		}
 		// 2. Hard close
 		inst.Close()
@@ -814,22 +864,27 @@ func (x *Xray) closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 			ld.ResetConns()
 		}
 		x.mu.Lock()
-		x.collectStats(inst, x.draining[inst])
+		x.collectStats(inst, state.users)
 		delete(x.draining, inst)
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: old instance recycled")
 	}()
 }
 
-// drainConns waits up to timeout for the dispatcher's active connections to
-// reach zero. Used only during graceful Stop, not during hot-reload.
-func drainConns(ld *LimitDispatcher, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if ld.devices.ActiveCount() == 0 {
+// drainConns waits for connections to finish, bounded by timeout or Stop.
+func drainConns(ld *LimitDispatcher, timeout time.Duration, stop <-chan struct{}) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for ld.devices.ActiveCount() > 0 {
+		select {
+		case <-timer.C:
 			return
+		case <-stop:
+			return
+		case <-ticker.C:
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -839,8 +894,8 @@ func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 // draining connections carry is still reported. Must be called with x.mu held.
 func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 	x.collectStats(x.instance, x.users)
-	for inst, users := range x.draining {
-		x.collectStats(inst, users)
+	for inst, state := range x.draining {
+		x.collectStats(inst, state.users)
 	}
 	traffic := make(map[int][2]int64, len(x.cumTraffic))
 	for uid, cum := range x.cumTraffic {

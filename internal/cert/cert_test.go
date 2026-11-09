@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -175,7 +176,7 @@ func TestLoadPEMFromStorage_RejectsMismatchedPair(t *testing.T) {
 }
 
 // TestACMEFingerprint covers the config-equality logic that decides whether
-// Reconfigure must tear down a running certmagic instance.
+// Prepare can retain a running certmagic instance.
 func TestACMEFingerprint(t *testing.T) {
 	base := config.CertConfig{
 		CertMode:    "dns",
@@ -232,5 +233,70 @@ func TestACMEFingerprintEnvOrderStable(t *testing.T) {
 	}
 	if acmeFingerprint(a) != acmeFingerprint(b) {
 		t.Fatal("fingerprint not order-independent")
+	}
+}
+
+func TestPrepareCertificatePreservesActiveManager(t *testing.T) {
+	ctx := context.Background()
+	currentCert, currentKey := generateSelfSignedPair(t, "current.example.com")
+	cfg := config.CertConfig{CertMode: "content", CertContent: string(currentCert), KeyContent: string(currentKey), CertDir: t.TempDir()}
+	active := NewManager(cfg)
+	if err := active.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A failed replacement must not cancel an existing renewal worker either.
+	renewalCtx, cancel := context.WithCancel(ctx)
+	active.acmeCancel = cancel
+	active.acmeStarted = true
+	defer active.Stop()
+	for _, invalid := range []config.CertConfig{
+		{CertMode: "file", CertFile: filepath.Join(t.TempDir(), "missing.pem"), KeyFile: "missing.key"},
+		{CertMode: "content", CertContent: "invalid certificate", KeyContent: "invalid key"},
+	} {
+		if next, err := active.Prepare(ctx, invalid); err == nil || next != nil {
+			t.Fatal("invalid certificate was accepted")
+		}
+		if renewalCtx.Err() != nil || !active.acmeStarted || active.cfg.CertMode != cfg.CertMode {
+			t.Fatal("failed preparation changed the active manager")
+		}
+		if got := active.TLSCert(); string(got.CertPEM) != string(currentCert) || string(got.KeyPEM) != string(currentKey) {
+			t.Fatal("failed preparation changed active certificate material")
+		}
+	}
+	nextCert, nextKey := generateSelfSignedPair(t, "next.example.com")
+	next, err := active.Prepare(ctx, config.CertConfig{CertMode: "content", CertContent: string(nextCert), KeyContent: string(nextKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Stop()
+	if next == active || renewalCtx.Err() != nil || string(active.TLSCert().CertPEM) != string(currentCert) || string(next.TLSCert().CertPEM) != string(nextCert) {
+		t.Fatal("preparation must leave acceptance and old-manager shutdown to the caller")
+	}
+	path := filepath.Join(cfg.CertDir, "cert.pem")
+	if disk, err := os.ReadFile(path); err != nil || string(disk) != string(currentCert) {
+		t.Fatalf("candidate replaced the active PEM before acceptance: %v", err)
+	}
+	active.Stop()
+	active.Stop()
+	next.Commit()
+	if disk, err := os.ReadFile(path); err != nil || string(disk) != string(nextCert) {
+		t.Fatalf("accepted PEM was not persisted: %v", err)
+	}
+	if renewalCtx.Err() == nil || !next.HasCert() {
+		t.Fatal("retiring the old manager did not preserve the prepared replacement")
+	}
+}
+
+func TestPrepareUnchangedACMEKeepsRenewalWorker(t *testing.T) {
+	cfg := config.CertConfig{CertMode: "http", Domain: "example.com", CertDir: t.TempDir()}
+	active := NewManager(cfg)
+	active.acmeStarted = true
+	active.acmeFingerprint = acmeFingerprint(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	active.acmeCancel = cancel
+	defer active.Stop()
+	next, err := active.Prepare(context.Background(), cfg)
+	if err != nil || next != active || ctx.Err() != nil {
+		t.Fatal("unchanged ACME config replaced its renewal worker")
 	}
 }

@@ -127,6 +127,19 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 
 func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) (*NodeSpec, error) {
 	spec := NodeSpecFromPanel(nc)
+	if spec != nil {
+		// Both panel spellings describe the same Hysteria v2 inbound.
+		if spec.Protocol == "hysteria2" {
+			spec.Protocol = "hysteria"
+			spec.Version = 2
+		}
+		preferred := kcfg.Type
+		if preferred == "" {
+			preferred = spec.KernelType
+		}
+		kcfg.Type = ResolveKernelForNode(spec, preferred)
+		spec.KernelType = kcfg.Type
+	}
 	if err := ValidateNodeSpec(spec, kcfg); err != nil {
 		return nil, err
 	}

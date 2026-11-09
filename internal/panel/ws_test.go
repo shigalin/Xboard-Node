@@ -150,6 +150,24 @@ func TestWSClient_ConnectAndReceiveDataEvents(t *testing.T) {
 	}
 }
 
+func TestWSClientReceivesDeviceBansWithoutReplacingIPSnapshot(t *testing.T) {
+	const deadline = int64(1800000123456)
+	var received []WSEvent
+	ws := NewWSClient("", "", 1, WSClientConfig{}, func(event WSEvent) {
+		received = append(received, event)
+	}, nil, nil)
+	ws.handleMessage(wsMessage{
+		Event: WSEventSyncDevices,
+		Data:  json.RawMessage(`{"node_id":2,"device_bans":{"42":1800000123456}}`),
+	})
+	if len(received) != 1 || received[0].NodeID != 2 || received[0].DeviceBans[42] != deadline {
+		t.Fatalf("incorrect device ban event: %+v", received)
+	}
+	if received[0].DeviceUsers != nil {
+		t.Fatal("a ban push was decoded as an empty online IP snapshot")
+	}
+}
+
 func TestWSClient_ReconnectOnDisconnect(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 

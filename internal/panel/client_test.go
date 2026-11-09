@@ -262,6 +262,58 @@ func TestResetETags(t *testing.T) {
 	client.GetConfig()
 }
 
+func TestCachedConfigFollowsETag(t *testing.T) {
+	type reply struct {
+		etag     string
+		protocol string
+	}
+	var next reply
+	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		if next.etag != "" && r.Header.Get("If-None-Match") == next.etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		if next.etag != "" {
+			w.Header().Set("ETag", next.etag)
+		}
+		json.NewEncoder(w).Encode(NodeConfig{Protocol: next.protocol})
+	})
+	defer ts.Close()
+	cached := func() string {
+		t.Helper()
+		cfg, err := client.CachedConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg == nil {
+			return ""
+		}
+		return cfg.Protocol
+	}
+
+	next = reply{`"a"`, "vless"}
+	client.GetConfig()
+	if cfg, _ := client.GetConfig(); cfg != nil || cached() != "vless" {
+		t.Fatal("HTTP 304 did not resolve to the config behind the ETag")
+	}
+	next = reply{`"b"`, "trojan"}
+	client.GetConfig()
+	if cached() != "trojan" {
+		t.Fatal("cached body was not replaced together with its ETag")
+	}
+	next = reply{"", "vmess"}
+	client.GetConfig()
+	if cached() != "" {
+		t.Fatal("a response without ETag left a stale cached config")
+	}
+	next = reply{`"c"`, "ss"}
+	client.GetConfig()
+	client.ResetETags()
+	if cached() != "" {
+		t.Fatal("ResetETags kept the cached config")
+	}
+}
+
 func TestPushTraffic_ServerError(t *testing.T) {
 	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)

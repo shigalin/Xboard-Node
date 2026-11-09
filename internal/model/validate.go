@@ -56,12 +56,20 @@ func validateTransportKernel(network, kernelType string) error {
 	return nil
 }
 
-// ResolveKernelForTransport returns the kernel type required by the given
-// transport. If the configured kernel cannot handle the transport, it returns
-// the kernel that can. Otherwise it returns configuredKernel unchanged.
-// This is used in machine mode to auto-switch kernel per node.
-func ResolveKernelForTransport(network, configuredKernel string) string {
-	net := strings.ToLower(strings.TrimSpace(network))
+// ResolveKernelForNode applies the panel node's protocol and transport policy
+// without changing the configured preference for other nodes.
+func ResolveKernelForNode(n *NodeSpec, configuredKernel string) string {
+	if n == nil {
+		return configuredKernel
+	}
+	if normalized, err := normalizeKernelType(configuredKernel); err == nil {
+		configuredKernel = normalized
+	}
+	// Hysteria v2 is policy; v1 has no Xray inbound at all.
+	if configuredKernel == "xray" && (n.Protocol == "hysteria2" || n.Protocol == "hysteria") {
+		return "singbox"
+	}
+	net := strings.ToLower(strings.TrimSpace(n.Network))
 	if configuredKernel == "singbox" && singboxUnsupportedTransports[net] {
 		return "xray"
 	}

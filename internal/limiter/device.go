@@ -22,6 +22,7 @@ type deviceUser struct {
 	ips      map[string]int
 	conns    map[string]*DeviceLease
 	banUntil time.Time
+	panelBan bool
 }
 
 // deviceState is the admission state shared by every scope of a manager.
@@ -35,6 +36,8 @@ type deviceState struct {
 	identities   map[int]string // nil until the first successful user update
 	nextID       uint64
 	now          func() time.Time
+	pendingBans  map[int]int64 // nil when using local-only cooldown
+	banNotify    chan struct{}
 }
 
 // DeviceManager owns online IP admission and connection lifetimes for one node.
@@ -54,6 +57,7 @@ func NewDeviceManager(cooldown time.Duration) *DeviceManager {
 		deviceState: &deviceState{
 			users: make(map[int]*deviceUser), conns: make(map[string]*DeviceLease),
 			global: make(map[int]map[string]bool), cooldown: cooldown, now: time.Now,
+			banNotify: make(chan struct{}, 1),
 		},
 		scoped: make(map[string]*DeviceLease),
 	}
@@ -158,18 +162,98 @@ func (m *DeviceManager) Acquire(userID int, uuid, ip string, limit int) (*Device
 // checkLocked punishes a new session that exceeds the shared IP-set policy.
 // kicked reports a fresh breach, as opposed to a refusal during cooldown.
 func (m *DeviceManager) checkLocked(u *deviceUser, uid int, ip string, limit int) (closers []func(), kicked bool, err error) {
+	now := m.now()
+	if now.Before(u.banUntil) && (limit > 0 || m.pendingBans != nil) {
+		return nil, false, ErrDeviceLimit
+	}
 	if limit <= 0 {
 		return nil, false, nil
-	}
-	now := m.now()
-	if now.Before(u.banUntil) {
-		return nil, false, ErrDeviceLimit
 	}
 	if m.hasRoomLocked(u, uid, ip, limit, now) {
 		return nil, false, nil
 	}
+	return m.banLocked(uid, u, now), true, ErrDeviceLimit
+}
+
+func (m *DeviceManager) banLocked(uid int, u *deviceUser, now time.Time) []func() {
+	u.panelBan = false
 	u.banUntil = now.Add(m.cooldown)
-	return m.closeUserLocked(u), true, ErrDeviceLimit
+	if m.pendingBans != nil {
+		u.banUntil = now.Add(DefaultDeviceLimitCooldown).Truncate(time.Millisecond)
+		m.pendingBans[uid] = u.banUntil.UnixMilli()
+		select {
+		case m.banNotify <- struct{}{}:
+		default:
+		}
+	}
+	return m.closeUserLocked(u)
+}
+
+// ApplyDeviceBans installs authoritative deadlines without extending a ban on
+// receipt or clearing one when a snapshot omits the account.
+func (m *DeviceManager) ApplyDeviceBans(bans map[int]int64) {
+	if bans == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.pendingBans == nil {
+		m.pendingBans = make(map[int]int64)
+	}
+	now := m.now()
+	var closers []func()
+	for uid, timestamp := range bans {
+		until := time.UnixMilli(timestamp)
+		if !now.Before(until) {
+			continue
+		}
+		u := m.users[uid]
+		if u == nil {
+			u = &deviceUser{ips: make(map[string]int), conns: make(map[string]*DeviceLease)}
+			m.users[uid] = u
+		}
+		if u.panelBan && !until.After(u.banUntil) {
+			continue
+		}
+		delete(m.pendingBans, uid)
+		delete(m.global, uid)
+		u.panelBan = true
+		u.banUntil = until
+		closers = append(closers, m.closeUserLocked(u)...)
+	}
+	m.mu.Unlock()
+	closeDevices(closers)
+}
+
+func (m *DeviceManager) DeviceBanNotifications() <-chan struct{} { return m.banNotify }
+
+func (m *DeviceManager) PendingDeviceBans() map[int]int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now().UnixMilli()
+	pending := make(map[int]int64, len(m.pendingBans))
+	for uid, until := range m.pendingBans {
+		if until <= now {
+			delete(m.pendingBans, uid)
+		} else {
+			pending[uid] = until
+		}
+	}
+	return pending
+}
+
+// AcknowledgeDeviceBans runs after applying the panel response. A report still
+// pending at that point did not produce an active panel ban.
+func (m *DeviceManager) AcknowledgeDeviceBans(reports map[int]int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for uid, until := range reports {
+		if m.pendingBans[uid] == until {
+			delete(m.pendingBans, uid)
+			if u := m.users[uid]; u != nil && !u.panelBan && u.banUntil.UnixMilli() == until {
+				u.banUntil = time.Time{}
+			}
+		}
+	}
 }
 
 // logDeviceKick reports a breach that arms the cooldown. Refusals during the
@@ -209,7 +293,13 @@ func (m *DeviceManager) UpdateGlobalDevices(users map[int][]string) {
 		global[uid] = set
 	}
 	m.mu.Lock()
-	m.global, m.globalUpdate = global, m.now()
+	now := m.now()
+	for uid := range global {
+		if u := m.users[uid]; u != nil && u.panelBan && now.Before(u.banUntil) {
+			delete(global, uid)
+		}
+	}
+	m.global, m.globalUpdate = global, now
 	m.mu.Unlock()
 }
 
@@ -313,7 +403,9 @@ func (m *DeviceManager) identityAllowedLocked(uid int, uuid string) bool {
 	return ok && current == uuid
 }
 
-// CloseAll closes the leases acquired through this scope only.
+// CloseAll closes the leases acquired through this scope only and waits for
+// their transport callbacks, so shutdown can collect final traffic afterwards.
+// Unlike admission kicks, this is called only during kernel teardown.
 func (m *DeviceManager) CloseAll() {
 	m.mu.Lock()
 	closers := make([]func(), 0, len(m.scoped))
@@ -323,7 +415,9 @@ func (m *DeviceManager) CloseAll() {
 		}
 	}
 	m.mu.Unlock()
-	closeDevices(closers)
+	for _, close := range closers {
+		close()
+	}
 }
 
 func (m *DeviceManager) closeUserLocked(u *deviceUser) []func() {
@@ -417,14 +511,13 @@ func (l *DeviceLease) Rebind(uuid, ip string, limit int) error {
 		delete(u.ips, oldIP)
 	}
 	now := m.now()
-	banned := limit > 0 && now.Before(u.banUntil)
+	banned := now.Before(u.banUntil) && (limit > 0 || m.pendingBans != nil)
 	breach := limit > 0 && !banned && !m.hasRoomLocked(u, l.userID, ip, limit, now)
 	u.ips[oldIP]++
 	if banned || breach {
 		var closers []func()
 		if breach {
-			u.banUntil = now.Add(m.cooldown)
-			closers = m.closeUserLocked(u)
+			closers = m.banLocked(l.userID, u, now)
 		}
 		m.mu.Unlock()
 		if breach {

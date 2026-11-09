@@ -82,3 +82,50 @@ func TestNodeSpecFromPanelValidated(t *testing.T) {
 		}
 	})
 }
+
+func TestNodeSpecFromPanelValidatedResolvesKernel(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured string
+		node       panel.NodeConfig
+		wantKernel string
+	}{
+		{"hysteria v2", "xray", panel.NodeConfig{Protocol: "hysteria", Version: 2}, "singbox"},
+		{"hysteria2 alias", "xray", panel.NodeConfig{Protocol: "hysteria2"}, "singbox"},
+		{"xhttp", "singbox", panel.NodeConfig{Protocol: "vless", Network: "xhttp"}, "xray"},
+		{"splithttp", "singbox", panel.NodeConfig{Protocol: "vless", Network: "splithttp"}, "xray"},
+		{"compatible xray", "xray", panel.NodeConfig{Protocol: "vless", Network: "tcp"}, "xray"},
+		{"compatible singbox", "singbox", panel.NodeConfig{Protocol: "vless", Network: "ws"}, "singbox"},
+		{"hysteria v1", "xray", panel.NodeConfig{Protocol: "hysteria", Version: 1}, "singbox"},
+		{"hysteria v1 on singbox", "singbox", panel.NodeConfig{Protocol: "hysteria", Version: 1}, "singbox"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node, err := NodeSpecFromPanelValidated(&tc.node, config.KernelConfig{Type: tc.configured})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if node.KernelType != tc.wantKernel {
+				t.Fatalf("kernel = %q, want %q", node.KernelType, tc.wantKernel)
+			}
+			if tc.node.Protocol == "hysteria2" && (node.Protocol != "hysteria" || node.Version != 2) {
+				t.Fatalf("hysteria2 was not normalized: protocol=%q version=%d", node.Protocol, node.Version)
+			}
+		})
+	}
+}
+
+func TestNodeSpecFromPanelValidatedChecksSelectedKernelOutbounds(t *testing.T) {
+	outbound := panel.OutboundConfig{Tag: "hy2", Protocol: "hysteria2", Settings: map[string]any{"server": "2.2.2.2", "server_port": 8443}}
+	_, err := NodeSpecFromPanelValidated(&panel.NodeConfig{
+		Protocol: "hysteria", Version: 2, CustomOutbounds: []panel.OutboundConfig{outbound},
+	}, config.KernelConfig{Type: "xray"})
+	if err != nil {
+		t.Fatalf("sing-box outbound rejected after selecting sing-box: %v", err)
+	}
+	_, err = NodeSpecFromPanelValidated(&panel.NodeConfig{
+		Protocol: "vless", Network: "xhttp", CustomOutbounds: []panel.OutboundConfig{outbound},
+	}, config.KernelConfig{Type: "singbox"})
+	if err == nil || !strings.Contains(err.Error(), `protocol "hysteria2" is not supported by kernel "xray"`) {
+		t.Fatalf("expected selected Xray kernel to reject hysteria2 outbound, got %v", err)
+	}
+}

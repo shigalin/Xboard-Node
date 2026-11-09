@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -49,12 +50,16 @@ import (
 //  3. "file" (if both CertFile and KeyFile paths are provided)
 //  4. "none" (default)
 type Manager struct {
-	cfg config.CertConfig
+	cfg     config.CertConfig
+	pemMu   sync.Mutex
+	staged  bool
+	retired bool
 
 	// Atomic so the ACME renewal goroutine can swap without racing readers.
 	mat atomic.Pointer[certMaterial]
 
 	magic           *certmagic.Config
+	cache           *certmagic.Cache
 	renewed         atomic.Bool
 	acmeStarted     bool
 	acmeFingerprint string
@@ -72,11 +77,31 @@ func NewManager(cfg config.CertConfig) *Manager {
 	return &Manager{cfg: cfg}
 }
 
+// NewCandidate keeps prepared PEM out of the active files until Commit.
+func NewCandidate(cfg config.CertConfig) *Manager {
+	return &Manager{cfg: cfg, staged: true}
+}
+
+func (m *Manager) Commit() {
+	m.pemMu.Lock()
+	defer m.pemMu.Unlock()
+	if m.staged {
+		m.staged = false
+		if mat := m.mat.Load(); mat != nil {
+			m.persistPEM(mat.certPEM, mat.keyPEM)
+		}
+	}
+}
+
 // storePEM atomically swaps the in-memory cert material and persists to disk
 // so that restarts can reload without re-generating or re-requesting.
 func (m *Manager) storePEM(cert, key []byte) {
+	m.pemMu.Lock()
+	defer m.pemMu.Unlock()
 	m.mat.Store(&certMaterial{certPEM: cert, keyPEM: key})
-	m.persistPEM(cert, key)
+	if !m.staged && !m.retired {
+		m.persistPEM(cert, key)
+	}
 }
 
 // persistPEM writes cert/key to cert_dir for restart recovery.
@@ -134,45 +159,51 @@ func (m *Manager) loadPersistedPEM() bool {
 	return true
 }
 
-// Reconfigure applies a new cert configuration at runtime (e.g. from panel push).
-// Returns true when the PEM material changed (caller should restart kernel).
-func (m *Manager) Reconfigure(ctx context.Context, newCfg config.CertConfig) (bool, error) {
+// Prepare loads a replacement without changing the active manager. The caller
+// owns the returned manager and stops the old one only after accepting it.
+// An unchanged ACME configuration keeps its existing renewal worker.
+func (m *Manager) Prepare(ctx context.Context, newCfg config.CertConfig) (*Manager, error) {
 	if newCfg.CertDir == "" {
 		newCfg.CertDir = m.cfg.CertDir
 	}
-
-	// If ACME is running and the new config materially differs (or switches
-	// away from ACME), tear down the old certmagic instance first.
-	if m.acmeStarted {
-		newFp := acmeFingerprint(newCfg)
-		newMode := resolveModeFor(newCfg)
-		if newMode != "http" && newMode != "dns" || newFp != m.acmeFingerprint {
-			m.tearDownACME()
-		}
+	if m.ReusesACME(newCfg) {
+		return m, nil
 	}
-
-	oldTLS := m.TLSCert()
-	m.cfg = newCfg
-
-	if err := m.Start(ctx); err != nil {
-		return false, fmt.Errorf("cert reconfigure: %w", err)
+	next := NewCandidate(newCfg)
+	if err := next.Start(ctx); err != nil {
+		next.Stop()
+		return nil, fmt.Errorf("prepare certificate: %w", err)
 	}
-
-	newTLS := m.TLSCert()
-	return !pemEqual(oldTLS, newTLS), nil
+	return next, nil
 }
 
-// tearDownACME cancels the running certmagic background goroutines and clears
-// related state so a fresh ACME init can run.
-func (m *Manager) tearDownACME() {
+func (m *Manager) ReusesACME(cfg config.CertConfig) bool {
+	return m.acmeStarted && cfg.CertDir == m.cfg.CertDir &&
+		acmeFingerprint(cfg) == m.acmeFingerprint
+}
+
+func UsesACME(cfg config.CertConfig) bool {
+	mode := resolveModeFor(cfg)
+	return mode == "http" || mode == "dns"
+}
+
+// Stop releases the renewal worker and cache, including a partially started
+// candidate that failed preparation. Certificate bytes remain readable.
+func (m *Manager) Stop() {
+	m.pemMu.Lock()
+	m.retired = true
+	m.pemMu.Unlock()
 	if m.acmeCancel != nil {
 		m.acmeCancel()
 		m.acmeCancel = nil
 	}
+	if m.cache != nil {
+		m.cache.Stop()
+		m.cache = nil
+	}
 	m.magic = nil
 	m.acmeStarted = false
 	m.acmeFingerprint = ""
-	m.mat.Store(nil)
 }
 
 // acmeFingerprint produces a stable string capturing every config field that
@@ -192,6 +223,7 @@ func acmeFingerprint(cfg config.CertConfig) string {
 	b.WriteByte('|')
 	b.WriteString(strings.TrimSpace(cfg.DNSProvider))
 	b.WriteByte('|')
+	fmt.Fprintf(&b, "%d|", cfg.HTTPPort)
 	for _, k := range keys {
 		b.WriteString(k)
 		b.WriteByte('=')
@@ -203,7 +235,7 @@ func acmeFingerprint(cfg config.CertConfig) string {
 }
 
 // resolveModeFor mirrors (*Manager).resolveMode() for an arbitrary cfg, used
-// by Reconfigure to decide tear-down without mutating manager state.
+// by Prepare to decide whether an existing renewal worker can be retained.
 func resolveModeFor(cfg config.CertConfig) string {
 	mode := strings.ToLower(strings.TrimSpace(cfg.CertMode))
 	if mode != "" {
@@ -257,13 +289,11 @@ func (m *Manager) TLSCert() kernel.TLSCert {
 	return kernel.TLSCert{CertPEM: mat.certPEM, KeyPEM: mat.keyPEM}
 }
 
-// pemEqual reports whether two TLSCert values carry identical PEM content.
-func pemEqual(a, b kernel.TLSCert) bool {
-	return string(a.CertPEM) == string(b.CertPEM) && string(a.KeyPEM) == string(b.KeyPEM)
-}
-
 // Start initializes the cert manager based on the resolved mode.
 func (m *Manager) Start(ctx context.Context) error {
+	m.pemMu.Lock()
+	m.retired = false
+	m.pemMu.Unlock()
 	mode := m.resolveMode()
 
 	switch mode {
@@ -287,10 +317,6 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("unknown cert_mode: %q (supported: http, dns, self, file, content, none)", mode)
 	}
 }
-
-// Stop is a no-op: certmagic's background goroutine is cancelled via the
-// context passed to ManageAsync.
-func (m *Manager) Stop() {}
 
 // ─── Mode: file ────────────────────────────────────────────────────────────
 
@@ -391,7 +417,7 @@ func (m *Manager) startContent() error {
 // ─── Mode: http / dns (ACME) ──────────────────────────────────────────────
 
 func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solver) error {
-	// Idempotent for unchanged config: Reconfigure already tore down stale ACME state.
+	// Managers keep an immutable configuration while their ACME worker runs.
 	if m.acmeStarted {
 		return nil
 	}
@@ -412,6 +438,12 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 			return magic, nil
 		},
 	})
+	m.cache = cache
+	defer func() {
+		if !m.acmeStarted {
+			m.Stop()
+		}
+	}()
 
 	magic = certmagic.New(cache, certmagic.Config{
 		Storage: storage,
@@ -462,7 +494,7 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 	}
 	m.magic = magic
 
-	// Derived ctx so Reconfigure can cancel ACME background goroutines.
+	// Derived context lets Stop cancel this manager independently.
 	acmeCtx, acmeCancel := context.WithCancel(ctx)
 
 	if err := magic.ObtainCertSync(acmeCtx, m.cfg.Domain); err != nil {

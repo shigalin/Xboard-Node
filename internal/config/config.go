@@ -129,10 +129,8 @@ type KernelConfig struct {
 	// geo database files live somewhere other than config_dir.
 	GeoDataDir string `yaml:"geo_data_dir"`
 
-	// DeviceLimitCooldown is the punishment window, in seconds, applied after a
-	// user breaches the device (distinct source IP) limit: all of that user's
-	// connections are force-closed and every new connection is refused until
-	// the window expires.
+	// DeviceLimitCooldown is the local punishment window in seconds. Panels
+	// with global device bans use a shared 180-second window.
 	//   0  → use the default (180)
 	// Maximum 86400 (one day); larger values are rejected at load.
 	// Shared by the sing-box and xray kernels.

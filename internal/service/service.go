@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -19,8 +20,6 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/controlplane"
 	"github.com/cedar2025/xboard-node/internal/kernel"
-	"github.com/cedar2025/xboard-node/internal/kernel/singbox"
-	"github.com/cedar2025/xboard-node/internal/kernel/xray"
 	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/monitor"
@@ -39,13 +38,29 @@ type Service struct {
 	source       controlplane.Source
 	sink         controlplane.Sink
 	kernel       kernel.Kernel
+	kernelType   string
+	devices      *limiter.DeviceManager
 	tracker      *tracker.Tracker
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
 	cert         *cert.Manager
+	certTarget   *config.CertConfig
+	certReady    *cert.Manager
+	certInFlight bool
+	certRetryAt  time.Time
+	certResults  chan certificateResult
+
+	kernelRetryHash     string
+	kernelRetryAt       time.Time
+	kernelRetryFailures int
 
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
+	// pendingConfig has not passed runtime preparation yet. Keep lastConfig
+	// serving users while retrying this snapshot, including after HTTP 304.
+	pendingConfig *model.NodeSpec
+	// wsConfigRevision orders WS config events against in-flight polls.
+	wsConfigRevision uint64
 
 	// nodeLog is the logger with node context for this service instance.
 	nodeLog *nlog.NodeLog
@@ -55,6 +70,7 @@ type Service struct {
 	appliedState struct {
 		Config *model.NodeSpec
 		Users  []model.UserSpec
+		TLS    kernel.TLSCert
 	}
 
 	pushInterval int // seconds
@@ -114,7 +130,7 @@ type Service struct {
 	machineMailbox   *controlplane.NodeMailbox
 	machineMailboxCh <-chan struct{}
 
-	// metricsMu: lastUsers, lastConfig, wsClient, wsDisconnectAt (buildMetrics vs main loop).
+	// metricsMu: kernel, lastUsers, lastConfig, wsClient, wsDisconnectAt (metrics vs main loop).
 	metricsMu sync.RWMutex
 }
 
@@ -129,6 +145,9 @@ type pullResult struct {
 	deviceFetchRevision uint64
 	deviceUsers         map[int][]string
 	certChanged         bool
+	// currentConfig is what the panel still serves when it answered 304.
+	currentConfig    *model.NodeSpec
+	wsConfigRevision uint64
 }
 
 type deviceSnapshotResult struct {
@@ -234,16 +253,8 @@ func NewWithControlPlane(cfg *config.Config, cp controlplane.ControlPlane) *Serv
 func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	certMgr := cert.NewManager(cfg.Cert)
 
-	var k kernel.Kernel
-	switch cfg.Kernel.Type {
-	case "singbox":
-		k = singbox.New(cfg.Kernel)
-	case "xray":
-		k = xray.New(cfg.Kernel)
-	default:
-		nlog.Core().Warn("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
-		k = singbox.New(cfg.Kernel)
-	}
+	devices := limiter.NewDeviceManager(time.Duration(cfg.Kernel.DeviceLimitCooldown) * time.Second)
+	k := newKernel(cfg.Kernel, devices)
 
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
@@ -253,10 +264,13 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		source:                cp,
 		sink:                  cp,
 		kernel:                k,
+		kernelType:            cfg.Kernel.Type,
+		devices:               devices,
 		tracker:               tracker.New(),
 		limiter:               l,
 		speedTracker:          st,
 		cert:                  certMgr,
+		certResults:           make(chan certificateResult),
 		wsEvents:              make(chan controlplane.Event, 16),
 		wsStatusCh:            make(chan controlplane.StatusChange, 4),
 		pullResults:           make(chan pullResult, 1),
@@ -268,17 +282,25 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer s.setCertificateTarget(nil)
 	// Start cert manager (handles auto-TLS or manual cert verification)
 	if err := s.cert.Start(ctx); err != nil {
 		return fmt.Errorf("cert manager: %w", err)
 	}
-	defer s.cert.Stop()
+	defer func() { s.cert.Stop() }()
 
 	// Handshake: get WS config + initial data in one call
 	if err := s.initialSetup(ctx); err != nil {
 		return fmt.Errorf("initial setup: %w", err)
 	}
-	defer s.kernel.Stop()
+	defer func() { s.kernel.Stop() }()
+	if syncer, ok := s.source.(controlplane.DeviceBanSync); ok {
+		banCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go s.syncDeviceBans(banCtx, syncer)
+	}
 
 	// Set up tickers
 	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
@@ -350,6 +372,9 @@ func (s *Service) Run(ctx context.Context) error {
 		case result := <-s.pullResults:
 			s.applyPullResult(ctx, result)
 
+		case result := <-s.certResults:
+			s.handleCertificateResult(ctx, result)
+
 		case <-s.deviceReportDone:
 			if s.deviceWSResyncPending.Swap(false) {
 				s.reportDevices(ctx)
@@ -395,6 +420,16 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	if bootstrap.DeviceUsers != nil {
 		s.applyGlobalDevices(bootstrap.DeviceUsers)
 	}
+	if syncer, ok := s.source.(controlplane.DeviceBanSync); ok {
+		banCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		bans, err := syncer.SyncDeviceBans(banCtx, nil)
+		cancel()
+		if err != nil {
+			nlog.Core().Warn("initial device ban sync failed; continuing startup", "error", err)
+		} else {
+			s.devices.ApplyDeviceBans(bans)
+		}
+	}
 
 	if s.cfg.Node.PushInterval == 0 && bootstrap.PushInterval > 0 {
 		s.pushInterval = bootstrap.PushInterval
@@ -430,90 +465,16 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		}
 		return fmt.Errorf("initial config is nil")
 	}
-	if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), bootstrap.Config, s.cert.TLSCert()); err != nil {
-		return err
-	}
-
-	s.metricsMu.Lock()
-	s.lastConfig = bootstrap.Config
-	s.metricsMu.Unlock()
-	s.lastConfigHash = computeConfigHash(bootstrap.Config)
 	s.updateUserState(bootstrap.Users)
-
-	nlog.Core().Info("initial snapshot ready",
-		"protocol", bootstrap.Config.Protocol,
-		"port", bootstrap.Config.ServerPort,
-		"users", len(bootstrap.Users),
-	)
-
-	if len(bootstrap.Users) == 0 {
-		nlog.Core().Warn("no users, kernel will not start until users are available")
-		s.markMailboxReadyAndDrain(ctx)
-		return nil
-	}
-
-	s.applyRemoteOverrides(ctx, bootstrap.Config)
-	if !s.startKernel(bootstrap.Config, bootstrap.Users) {
-		return fmt.Errorf("start kernel")
+	if err := s.applyNodeConfig(ctx, bootstrap.Config); err != nil {
+		if !errors.Is(err, errCertificateUnavailable) {
+			return err
+		}
+		s.pendingConfig = bootstrap.Config
+		nlog.Core().Warn("waiting for a usable certificate before starting the kernel", "error", err)
 	}
 	s.markMailboxReadyAndDrain(ctx)
 	return nil
-}
-
-// applyRemoteOverrides updates service-level settings (log level, cert config)
-// from the panel's NodeConfig. Returns true if cert paths changed (kernel restart needed).
-func (s *Service) applyRemoteOverrides(ctx context.Context, nc *model.NodeSpec) bool {
-	if nc == nil {
-		return false
-	}
-
-	// Dynamic Log Level (Kernel)
-	if nc.KernelLogLevel != "" && nc.KernelLogLevel != s.cfg.Kernel.LogLevel {
-		nlog.Core().Info("cert: kernel log level override", "old", s.cfg.Kernel.LogLevel, "new", nc.KernelLogLevel)
-		s.cfg.Kernel.LogLevel = nc.KernelLogLevel
-	}
-
-	// Certificate configuration from panel (panel-first: takes precedence over local config)
-	if nc.CertConfig != nil {
-		return s.applyNodeCert(ctx, nc.CertConfig)
-	}
-
-	// Legacy fields (deprecated: prefer cert_config)
-	if nc.AutoTLS != s.cfg.Cert.AutoTLS {
-		nlog.Core().Info("cert: auto_tls policy changed (deprecated field)", "new", nc.AutoTLS)
-		s.cfg.Cert.AutoTLS = nc.AutoTLS
-	}
-	if nc.Domain != "" && nc.Domain != s.cfg.Cert.Domain {
-		s.cfg.Cert.Domain = nc.Domain
-	}
-
-	return false
-}
-
-// applyPanelCert converts a panel CertConfig into the local config format and
-// reconfigures the cert manager. Reports whether cert paths changed.
-func (s *Service) applyNodeCert(ctx context.Context, newCfg *config.CertConfig) bool {
-	if newCfg == nil {
-		return false
-	}
-	cfgCopy := *newCfg
-	cfgCopy.CertDir = s.cfg.Cert.CertDir
-
-	changed, err := s.cert.Reconfigure(ctx, cfgCopy)
-	if err != nil {
-		nlog.Core().Error("failed to apply runtime cert config", "mode", cfgCopy.CertMode, "error", err)
-		return false
-	}
-	s.cfg.Cert = cfgCopy
-	if changed {
-		msg := fmt.Sprintf("cert: material updated, has_cert=%v", s.cert.HasCert())
-		if s.nodeLog != nil {
-			s.nodeLog.Info(msg)
-		} else {
-			nlog.Core().Info(msg)
-		}
-	}
-	return changed
 }
 
 // startWSClient starts the push client goroutine if a client is configured.
@@ -552,8 +513,8 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 	if state.HasUsers {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncUsers, Users: state.Users})
 	}
-	if state.HasDevices {
-		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncDevices, DeviceUsers: state.DeviceUsers})
+	if state.HasDevices || len(state.DeviceBans) > 0 {
+		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncDevices, DeviceUsers: state.DeviceUsers, DeviceBans: state.DeviceBans})
 	}
 	if state.NeedsReconcile {
 		s.requestWSResync(ctx, "machine_mailbox_reconcile")
@@ -575,7 +536,10 @@ func (s *Service) requestWSResync(ctx context.Context, reason string) {
 func (s *Service) wsMetrics() map[string]interface{} {
 	status := monitor.Collect()
 	m := s.buildMetrics(status)
-	m["kernel_status"] = s.kernel.IsRunning()
+	s.metricsMu.RLock()
+	k := s.kernel
+	s.metricsMu.RUnlock()
+	m["kernel_status"] = k.IsRunning()
 	return m
 }
 
@@ -693,25 +657,15 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if event.Config == nil {
 			return
 		}
-		newConfigHash := computeConfigHash(event.Config)
-		if newConfigHash == s.lastConfigHash {
+		s.wsConfigRevision++
+		if computeConfigHash(event.Config) == s.lastConfigHash {
+			if s.pendingConfig != nil {
+				s.setCertificateTarget(nil)
+			}
+			s.pendingConfig = nil
 			return
 		}
-		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), event.Config, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn("ws config validation failed, ignoring update", "error", err)
-			return
-		}
-		// Initialize nodeLog on first config
-		if s.nodeLog == nil {
-			s.nodeLog = nlog.ForNode(event.Config.Protocol, event.Config.ServerPort)
-		}
-		s.nodeLog.Info("config update received")
-		s.metricsMu.Lock()
-		s.lastConfig = event.Config
-		s.metricsMu.Unlock()
-		s.lastConfigHash = newConfigHash
-		s.applyRemoteOverrides(ctx, event.Config)
-		s.applyChanges(ctx, true, false)
+		s.applyConfigUpdate(ctx, event.Config)
 
 	case controlplane.EventSyncUsers:
 		if event.Users == nil {
@@ -738,6 +692,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		s.applyUserDelta(ctx, event.DeltaAction, event.DeltaUsers)
 
 	case controlplane.EventSyncDevices:
+		s.devices.ApplyDeviceBans(event.DeviceBans)
 		// Sync global device state
 		if event.DeviceUsers != nil {
 			s.wsDeviceRevision++
@@ -766,7 +721,13 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 	}
 
 	currentConfigHash := s.lastConfigHash
+	if s.pendingConfig != nil {
+		// Do not discard a panel rollback to the still-active config: it
+		// supersedes the pending snapshot just like any other new response.
+		currentConfigHash = ""
+	}
 	currentWSUserRevision := s.wsUserRevision
+	currentWSConfigRevision := s.wsConfigRevision
 	currentWSDeviceRevision := s.wsDeviceRevision
 	currentDeviceFetchRevision := s.restDeviceFetchRevision.Add(1)
 	certChanged := s.cert.CertRenewed()
@@ -787,6 +748,8 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 			wsDeviceRevision:    currentWSDeviceRevision,
 			deviceFetchRevision: currentDeviceFetchRevision,
 			deviceUsers:         snapshot.DeviceUsers,
+			wsConfigRevision:    currentWSConfigRevision,
+			currentConfig:       snapshot.CurrentConfig,
 		}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
@@ -810,7 +773,6 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 // applyPullResult processes the result of an async pullViaAPI on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	s.wsResyncPending.Store(false)
-	configChanged := false
 	if result.deviceUsers != nil {
 		if result.wsDeviceRevision == s.wsDeviceRevision &&
 			result.deviceFetchRevision >= s.deviceFetchFloor.Load() &&
@@ -822,51 +784,65 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		}
 	}
 
-	if result.certChanged {
-		nlog.Core().Info("certificate renewed, kernel restart needed")
-		configChanged = true
-	}
-
-	if result.config != nil {
-		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn("runtime config validation failed", "error", err)
-			result.config = nil
-		} else {
-			configChanged = true
-			// Initialize or update node logger
-			if s.nodeLog == nil {
-				s.nodeLog = nlog.ForNode(result.config.Protocol, result.config.ServerPort)
+	if result.wsConfigRevision != s.wsConfigRevision {
+		// A WS config arrived while this poll was in flight; it is newer.
+		result.config = nil
+	} else if result.config != nil {
+		s.pendingConfig = result.config
+	} else if result.currentConfig != nil {
+		// HTTP 304 names the config the panel still serves. It supersedes a
+		// pending config after a rollback whose WS event was lost, and recovers
+		// a config whose earlier 200 was discarded because the poll failed.
+		current := computeConfigHash(result.currentConfig)
+		switch {
+		case s.pendingConfig != nil && current == computeConfigHash(s.pendingConfig):
+		case current == s.lastConfigHash:
+			if s.pendingConfig != nil {
+				s.setCertificateTarget(nil)
+				s.pendingConfig = nil
 			}
-			s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
-			s.metricsMu.Lock()
-			s.lastConfig = result.config
-			s.metricsMu.Unlock()
-			s.lastConfigHash = result.configHash
-			if s.applyRemoteOverrides(ctx, result.config) {
-				configChanged = true
-			}
+		default:
+			s.pendingConfig = result.currentConfig
 		}
+	}
+	spec := s.pendingConfig
+	retryCert := s.certTarget != nil && !s.certInFlight && !time.Now().Before(s.certRetryAt)
+	if spec == nil && (result.certChanged || retryCert || s.lastConfigHash == "") {
+		spec = s.lastConfig
 	}
 
 	if result.users != nil {
 		if result.wsUserRevision != s.wsUserRevision {
 			nlog.Core().Debug("discarding stale polled users after websocket update",
-				"poll_revision", result.wsUserRevision,
-				"current_revision", s.wsUserRevision)
-		} else {
-			usersChanged := result.userHash != s.lastUserHash
-
-			if usersChanged && !configChanged {
-				s.applyUserUpdate(ctx, result.users, result.userHash)
-			} else if usersChanged {
+				"poll_revision", result.wsUserRevision, "current_revision", s.wsUserRevision)
+		} else if result.userHash != s.lastUserHash {
+			if spec != nil && !s.kernel.IsRunning() {
 				s.updateUserState(result.users)
+			} else {
+				s.applyUserUpdate(ctx, result.users, result.userHash)
 			}
 		}
 	}
 
-	if configChanged {
-		s.applyChanges(ctx, true, false)
+	if spec != nil {
+		s.applyConfigUpdate(ctx, spec)
+		if s.pendingConfig != nil && s.lastConfig != nil && !s.kernel.IsRunning() &&
+			computeConfigHash(s.pendingConfig) != computeConfigHash(s.lastConfig) {
+			// The candidate is not usable yet; serve users with the active config.
+			s.ensureRunning()
+		}
 	}
+}
+
+func (s *Service) applyConfigUpdate(ctx context.Context, spec *model.NodeSpec) {
+	if err := s.applyNodeConfig(ctx, spec); err != nil {
+		s.pendingConfig = spec
+		if err != errCertificateUnavailable && err != errKernelSwitchDeferred {
+			nlog.Core().Warn("config update failed; retaining previous configuration", "error", err)
+		}
+		return
+	}
+	s.pendingConfig = nil
 }
 
 // ─── User state helpers ─────────────────────────────────────────────────────
@@ -917,13 +893,21 @@ func (s *Service) applyGlobalDevices(users map[int][]string) {
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
-	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
+	tls := s.cert.TLSCert()
+	if err := s.kernel.Start(nc, users, tls); err != nil {
 		nlog.Core().Error("failed to start kernel", "error", err)
 		return false
 	}
 
+	s.recordKernelStarted(nc, users, tls)
+	return true
+}
+
+func (s *Service) recordKernelStarted(nc *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) {
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
+	s.appliedState.TLS = tls
+	s.lastConfigHash = computeConfigHash(nc)
 
 	// Initialize node logger on first successful start
 	if s.nodeLog == nil {
@@ -934,7 +918,6 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 		s.nodeLog.Info(fullMsg)
 	})
 	s.nodeLog.Info(fmt.Sprintf("started, %d users", len(users)))
-	return true
 }
 
 // ensureRunning starts the kernel if it is not running and there are users +
@@ -1096,39 +1079,6 @@ func subtractUsers(base, delta []model.UserSpec) []model.UserSpec {
 		}
 	}
 	return out
-}
-
-// applyChanges applies config changes to the kernel. User-only changes are
-// handled by applyUserUpdate/applyUserDelta directly via the atomic user API.
-func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged bool) {
-	if !configChanged {
-		return
-	}
-
-	if s.lastConfig == nil || len(s.lastUsers) == 0 {
-		if len(s.lastUsers) == 0 {
-			s.kernel.Stop()
-			s.appliedState.Users = nil
-		}
-		return
-	}
-
-	// If config changed, delegate to kernel.Reload. The kernel implementation
-	// decides whether to hot-swap users, reconstruct inbounds, or restart itself.
-	if configChanged && s.kernel.IsRunning() {
-		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn(fmt.Sprintf("reload failed, restarting: %v", err))
-			s.startKernel(s.lastConfig, s.lastUsers)
-		} else {
-			s.appliedState.Config = s.lastConfig
-			s.appliedState.Users = s.lastUsers
-			if s.nodeLog != nil {
-				s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
-			}
-		}
-	} else if !s.kernel.IsRunning() {
-		s.startKernel(s.lastConfig, s.lastUsers)
-	}
 }
 
 func (s *Service) trackAndEnforce(ctx context.Context) {
@@ -1529,24 +1479,17 @@ func validateNodeRuntime(cfg *config.Config, kcfgSupported []string, spec *model
 	if err := validateTLSRequirements(spec, tls, cfgKernelType(cfg)); err != nil {
 		return err
 	}
-	if err := validateRuntimeCertConfig(spec); err != nil {
-		return err
+	if requiresTLSCertificate(spec) {
+		if err := validateRuntimeCertConfig(spec); err != nil {
+			return fmt.Errorf("%w: %v", errCertificateUnavailable, err)
+		}
 	}
 	return nil
 }
 
 func validateTLSRequirements(spec *model.NodeSpec, tls kernel.TLSCert, kernelType string) error {
-	needsCert := false
-	switch spec.Protocol {
-	case "hysteria", "hysteria2", "tuic", "anytls":
-		needsCert = true
-	case "trojan":
-		if spec.TLS != 2 {
-			needsCert = true
-		}
-	}
-	if needsCert && !hasUsableTLSConfig(spec, tls) {
-		return fmt.Errorf("protocol %q requires TLS certificate files", spec.Protocol)
+	if requiresTLSCertificate(spec) && !hasUsableTLSConfig(spec, tls) {
+		return fmt.Errorf("protocol %q requires TLS certificate files: %w", spec.Protocol, errCertificateUnavailable)
 	}
 	if spec.TLS == 2 {
 		if err := validateRealityRequirements(spec, kernelType); err != nil {
@@ -1554,6 +1497,20 @@ func validateTLSRequirements(spec *model.NodeSpec, tls kernel.TLSCert, kernelTyp
 		}
 	}
 	return nil
+}
+
+func requiresTLSCertificate(spec *model.NodeSpec) bool {
+	if spec.TLS == 1 {
+		return true
+	}
+	switch spec.Protocol {
+	case "hysteria", "hysteria2", "tuic", "anytls":
+		return true
+	case "trojan":
+		return spec.TLS != 2
+	default:
+		return false
+	}
 }
 
 func hasUsableTLSConfig(spec *model.NodeSpec, tls kernel.TLSCert) bool {

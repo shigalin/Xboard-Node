@@ -94,7 +94,11 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	snapshot := Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}
+	if configSnapshot == nil {
+		snapshot.CurrentConfig = cachedConfig(p.client, p.kcfg)
+	}
+	return snapshot, nil
 }
 
 func (p *PanelControlPlane) FetchDevices(ctx context.Context) (map[int][]string, error) {
@@ -104,6 +108,10 @@ func (p *PanelControlPlane) FetchDevices(ctx context.Context) (map[int][]string,
 	default:
 	}
 	return p.client.GetDevices()
+}
+
+func (p *PanelControlPlane) SyncDeviceBans(ctx context.Context, reports map[int]int64) (map[int]int64, error) {
+	return p.client.SyncDeviceBans(ctx, reports)
 }
 
 func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {
@@ -179,7 +187,7 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 }
 
 func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, error) {
-	translated := Event{Type: EventType(event.Type), DeltaAction: event.DeltaAction, DeviceUsers: event.DeviceUsers}
+	translated := Event{Type: EventType(event.Type), DeltaAction: event.DeltaAction, DeviceUsers: event.DeviceUsers, DeviceBans: event.DeviceBans}
 	if event.Config != nil {
 		var err error
 		translated.Config, err = model.NodeSpecFromPanelValidated(event.Config, kcfg)
@@ -200,4 +208,18 @@ func (p *panelPushClient) Run(ctx context.Context) { p.inner.Run(ctx) }
 func (p *panelPushClient) IsConnected() bool       { return p.inner.IsConnected() }
 func (p *panelPushClient) SendDeviceReport(devices map[int][]string, sequence int64) bool {
 	return p.inner.SendDeviceReport(devices, sequence)
+}
+
+// cachedConfig resolves an HTTP 304 to the config behind the client's ETag.
+// A cached body that no longer normalizes is reported as unknown.
+func cachedConfig(client *panel.Client, kcfg config.KernelConfig) *model.NodeSpec {
+	cached, err := client.CachedConfig()
+	if err != nil || cached == nil {
+		return nil
+	}
+	spec, err := model.NodeSpecFromPanelValidated(cached, kcfg)
+	if err != nil {
+		return nil
+	}
+	return spec
 }

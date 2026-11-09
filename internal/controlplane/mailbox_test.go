@@ -162,3 +162,18 @@ func TestNodeMailboxDeltaFailedApplyNotifies(t *testing.T) {
 		t.Fatal("expected NeedsReconcile for invalid delta action")
 	}
 }
+func TestNodeMailboxCoalescesDeviceBansIndependentlyFromIPSnapshots(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.Apply(Event{Type: EventSyncDevices, DeviceBans: map[int]int64{1: 200, 2: 150}})
+	mb.Apply(Event{Type: EventSyncDevices, DeviceBans: map[int]int64{1: 100, 3: 300}})
+	mb.Apply(Event{Type: EventSyncDevices, DeviceUsers: map[int][]string{1: {"192.0.2.1"}}})
+	mb.MarkReady()
+	state := mb.DrainIfReady()
+	if !state.HasDevices || len(state.DeviceBans) != 3 || state.DeviceBans[1] != 200 ||
+		state.DeviceBans[2] != 150 || state.DeviceBans[3] != 300 {
+		t.Fatalf("incorrect coalesced device state: %+v", state)
+	}
+	if next := mb.DrainIfReady(); next.DeviceBans != nil {
+		t.Fatal("drained bans were retained")
+	}
+}

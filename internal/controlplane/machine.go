@@ -118,7 +118,11 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll normalize: %w", err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	snapshot := Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}
+	if configSnapshot == nil {
+		snapshot.CurrentConfig = cachedConfig(p.client, p.kcfg)
+	}
+	return snapshot, nil
 }
 
 func (p *MachinePanelControlPlane) FetchDevices(ctx context.Context) (map[int][]string, error) {
@@ -128,6 +132,10 @@ func (p *MachinePanelControlPlane) FetchDevices(ctx context.Context) (map[int][]
 	default:
 	}
 	return p.client.GetDevices()
+}
+
+func (p *MachinePanelControlPlane) SyncDeviceBans(ctx context.Context, reports map[int]int64) (map[int]int64, error) {
+	return p.client.SyncDeviceBans(ctx, reports)
 }
 
 func (p *MachinePanelControlPlane) Discover(

@@ -147,6 +147,19 @@ func (t *Tracker) Process(
 	})
 }
 
+// ResetCounters starts a new kernel counter baseline while preserving traffic
+// that has already been collected for reporting.
+func (t *Tracker) ResetCounters() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastSeen = make(map[int][2]int64)
+	t.live.Store(&snapshot{
+		traffic:  copyTrafficMap(t.pendingTraffic),
+		aliveIPs: make(map[int]map[string]bool),
+		online:   make(map[int]int),
+	})
+}
+
 // FlushTraffic returns accumulated per-user traffic and resets the pending buffer.
 // Lock-free: reads from live snapshot, then acquires mu only to drain.
 func (t *Tracker) FlushTraffic() map[int][2]int64 {

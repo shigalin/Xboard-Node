@@ -1,5 +1,8 @@
 # Xboard Node Configuration
 # Top-level settings are inherited by all instances. Instance overrides take precedence.
+# For panel nodes, kernel.type is a preference: Hysteria v1/v2 switches xray -> singbox;
+# XHTTP/SplitHTTP switches singbox -> xray, including REST/WebSocket updates.
+# The YAML file is not rewritten; native custom configs must match the selected kernel.
 
 # ── Single node (simplest) ──
 # panel:
@@ -26,10 +29,9 @@
 #       level: "debug"   # override for this instance only
 
 # ── Device (IP) limit ──
-# Shared by sing-box and Xray: a user may use at most `device_limit`
-# distinct source IPs (pushed per user by the panel). When the limit is
-# breached, ALL of that user's connections are force-closed and every new
-# connection is refused for `device_limit_cooldown` seconds.
+# Shared by sing-box and Xray. Panels with global device bans enforce a
+# 180-second cooldown across their nodes. The setting below applies to
+# standalone nodes and nodes connected to panels without global device bans.
 # kernel:
 #   device_limit_cooldown: 180  # 0 = default (180s), max 86400 (1 day)
 

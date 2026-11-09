@@ -22,6 +22,7 @@ type Event struct {
 	DeltaAction string
 	DeltaUsers  []model.UserSpec
 	DeviceUsers map[int][]string
+	DeviceBans  map[int]int64 // user ID -> Unix milliseconds
 }
 
 type StatusChange struct {
@@ -49,6 +50,9 @@ type Snapshot struct {
 	Config      *model.NodeSpec
 	Users       []model.UserSpec
 	DeviceUsers map[int][]string
+	// CurrentConfig is the config still served by the panel when Config is
+	// nil because of HTTP 304. Nil when the source cannot tell.
+	CurrentConfig *model.NodeSpec
 }
 
 type ReportPayload struct {
@@ -84,6 +88,10 @@ type Source interface {
 // planes do not need to implement an endpoint they cannot use.
 type DeviceSnapshotSource interface {
 	FetchDevices(ctx context.Context) (map[int][]string, error)
+}
+
+type DeviceBanSync interface {
+	SyncDeviceBans(ctx context.Context, reports map[int]int64) (map[int]int64, error)
 }
 
 type Sink interface {

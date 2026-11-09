@@ -34,6 +34,7 @@ type WSEvent struct {
 
 	// Device sync fields
 	DeviceUsers map[int][]string // userID -> IPs (for sync.devices)
+	DeviceBans  map[int]int64    // userID -> Unix milliseconds (for sync.devices)
 	NodeID      int
 
 	// Machine node discovery fields (for sync.nodes)
@@ -75,6 +76,7 @@ type syncUserDeltaPayload struct {
 // syncDevicesPayload carries global device state from panel.
 type syncDevicesPayload struct {
 	Users     map[int][]string `json:"users"`
+	Bans      map[int]int64    `json:"device_bans"`
 	Timestamp int64            `json:"timestamp"`
 	NodeID    int              `json:"node_id"`
 }
@@ -435,6 +437,7 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 			return
 		}
 		event.DeviceUsers = p.Users
+		event.DeviceBans = p.Bans
 		event.NodeID = p.NodeID
 
 	case WSEventSyncNodes:

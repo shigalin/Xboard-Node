@@ -129,17 +129,22 @@ func (t *ConnTracker) RoutedFlow(context.Context, adapter.InboundContext, adapte
 }
 
 func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
+	traffic = t.trafficSnapshot()
+	aliveIPs, connCount = t.devices.Snapshot()
+	return
+}
+
+func (t *ConnTracker) trafficSnapshot() map[int][2]int64 {
 	t.usersMu.RLock()
-	traffic = make(map[int][2]int64, len(t.users))
+	defer t.usersMu.RUnlock()
+	traffic := make(map[int][2]int64, len(t.users))
 	for uid, us := range t.users {
 		up, down := us.upload.Load(), us.download.Load()
 		if up > 0 || down > 0 {
 			traffic[uid] = [2]int64{up, down}
 		}
 	}
-	t.usersMu.RUnlock()
-	aliveIPs, connCount = t.devices.Snapshot()
-	return
+	return traffic
 }
 
 func (t *ConnTracker) CloseByID(id string) bool { return t.devices.CloseByID(id) }

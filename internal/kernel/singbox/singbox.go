@@ -25,7 +25,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
-// drainTimeout is how long stop() waits for in-flight connections to finish
+// drainTimeout is how long recycling waits for in-flight connections to finish
 // naturally after closing all listen sockets, before hard-killing them.
 const drainTimeout = 5 * time.Second
 
@@ -50,6 +50,10 @@ type SingBox struct {
 	// Created fresh on every Start (full restart).
 	// Survives Reload (hot-swap) since live connections persist.
 	connTracker *ConnTracker
+	// Retain draining trackers until final accounting; retired totals remain
+	// cumulative across full restarts and readable after Stop.
+	draining   map[*box.Box]*drainingBox
+	cumTraffic map[int][2]int64
 
 	// devices is the admission state shared by every tracker of this kernel,
 	// so a restart neither forgets draining connections nor the panel snapshot.
@@ -64,9 +68,22 @@ type SingBox struct {
 	deviceLimitFunc func(string) (int, bool)
 }
 
+type drainingBox struct {
+	tracker *ConnTracker
+	done    chan struct{}
+}
+
 func New(cfg config.KernelConfig) *SingBox {
 	// A zero cooldown selects limiter.DefaultDeviceLimitCooldown.
-	return &SingBox{cfg: cfg, devices: limiter.NewDeviceManager(time.Duration(cfg.DeviceLimitCooldown) * time.Second)}
+	return NewWithDeviceManager(cfg, limiter.NewDeviceManager(time.Duration(cfg.DeviceLimitCooldown)*time.Second))
+}
+
+// NewWithDeviceManager preserves node admission state when switching kernels.
+func NewWithDeviceManager(cfg config.KernelConfig, devices *limiter.DeviceManager) *SingBox {
+	return &SingBox{
+		cfg: cfg, devices: devices,
+		draining: make(map[*box.Box]*drainingBox), cumTraffic: make(map[int][2]int64),
+	}
 }
 
 var _ kernel.Kernel = (*SingBox)(nil)
@@ -96,22 +113,8 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	defer s.mu.Unlock()
 
 	kernel.LogRealityTarget(nodeConfig, s.cfg.RealityTargets)
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
-	data, err := json.Marshal(cfgMap)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-
-	nlog.Core().Debug("sing-box config generated", "len", len(data))
-
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = include.Context(ctx)
-
-	opts, err := singJSON.UnmarshalExtendedContext[option.Options](ctx, data)
-	if err != nil {
-		cancel()
-		return fmt.Errorf("parse sing-box options: %w", err)
-	}
 
 	// Save old state before creating the new instance.
 	oldBox := s.box
@@ -119,13 +122,10 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	oldCtx := s.ctx
 	oldTracker := s.connTracker
 
-	instance, err := box.New(box.Options{
-		Context: ctx,
-		Options: opts,
-	})
+	instance, err := s.buildBox(ctx, nodeConfig, users, tls)
 	if err != nil {
 		cancel()
-		return fmt.Errorf("create sing-box instance: %w", err)
+		return err
 	}
 
 	// Attach a fresh tracker before Start so the first accepted connection is
@@ -161,18 +161,58 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.devices.UpdateUsers(users)
 
 	// Recycle old instance in background — drain then close.
-	if oldBox != nil {
-		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
-	}
+	s.retireBoxLocked(oldBox, oldCancel, oldCtx, oldTracker)
 
 	nlog.Core().Debug("sing-box started", "users", len(users))
 	return nil
 }
 
+func (s *SingBox) buildBox(ctx context.Context, spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) (*box.Box, error) {
+	data, err := json.Marshal(buildConfig(s.cfg, spec, users, tls))
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	nlog.Core().Debug("sing-box config generated", "len", len(data))
+	opts, err := singJSON.UnmarshalExtendedContext[option.Options](ctx, data)
+	if err != nil {
+		return nil, fmt.Errorf("parse sing-box options: %w", err)
+	}
+	instance, err := box.New(box.Options{Context: ctx, Options: opts})
+	if err != nil {
+		return nil, fmt.Errorf("create sing-box instance: %w", err)
+	}
+	return instance, nil
+}
+
+// CheckConfig checks generated configuration without binding the proxy listener.
+func (s *SingBox) CheckConfig(spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	instance, err := s.buildBox(include.Context(ctx), spec, users, tls)
+	if err != nil {
+		return err
+	}
+	_ = instance.Close()
+	return nil
+}
+
+// retireBoxLocked keeps the instance owned by this kernel until its connections
+// close and its counters have been added to the retired total. Requires s.mu.
+func (s *SingBox) retireBoxLocked(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, oldTracker *ConnTracker) {
+	if oldBox == nil {
+		return
+	}
+	state := &drainingBox{tracker: oldTracker, done: make(chan struct{})}
+	s.draining[oldBox] = state
+	go s.recycleOldBox(oldBox, oldCancel, oldCtx, state)
+}
+
 // recycleOldBox gracefully shuts down a previous sing-box instance in the
 // background. It closes listen sockets first, waits for connections to drain,
 // then hard-closes. This avoids blocking the new instance's startup.
-func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, oldTracker *ConnTracker) {
+func (s *SingBox) recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, state *drainingBox) {
+	defer close(state.done)
+	oldTracker := state.tracker
 	// Step 1: close listen sockets so no new connections arrive on old ports.
 	if im := service.FromContext[adapter.InboundManager](oldCtx); im != nil {
 		_ = im.Close()
@@ -197,6 +237,12 @@ func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context
 	if oldTracker != nil {
 		oldTracker.closeAll()
 	}
+	s.mu.Lock()
+	if oldTracker != nil {
+		addTraffic(s.cumTraffic, oldTracker.trafficSnapshot())
+	}
+	delete(s.draining, oldBox)
+	s.mu.Unlock()
 	nlog.Core().Debug("sing-box: old instance recycled")
 }
 
@@ -329,45 +375,21 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 
 func (s *SingBox) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.stop()
-}
-
-func (s *SingBox) stop() {
-	if s.box == nil {
-		return
-	}
-
-	// Step 1: close all listen sockets so no new connections are accepted.
-	// im.Close() sets m.started=false so the subsequent box.Close() call is a no-op
-	// for inbounds (avoids double-close), but box.Close() still tears down routers
-	// and outbounds.
-	if im := service.FromContext[adapter.InboundManager](s.ctx); im != nil {
-		_ = im.Close()
-	}
-
-	// Step 2: wait for in-flight connections to drain naturally (best-effort).
-	if s.connTracker != nil {
-		deadline := time.Now().Add(drainTimeout)
-		for time.Now().Before(deadline) {
-			if s.connTracker.ActiveCount() == 0 {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	// Step 3: hard-close everything that is still open.
-	s.box.Close()
+	s.retireBoxLocked(s.box, s.cancel, s.ctx, s.connTracker)
 	s.box = nil
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	if s.connTracker != nil {
-		s.connTracker.closeAll()
-	}
+	s.cancel = nil
 	s.ctx = nil
+	s.connTracker = nil
+	pending := make([]*drainingBox, 0, len(s.draining))
+	for _, state := range s.draining {
+		pending = append(pending, state)
+	}
+	s.mu.Unlock()
+	// Every instance drains concurrently with the same bounded grace period.
+	// Do not hold s.mu: recycling needs it to publish final counters.
+	for _, state := range pending {
+		<-state.done
+	}
 }
 
 func (s *SingBox) IsRunning() bool {
@@ -610,12 +632,27 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 
 // ─── Observability ──────────────────────────────────────────────────────────
 func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
-	ct := s.connTrackerSafe()
-	if ct == nil {
-		return nil, nil, 0, nil
+	s.mu.RLock()
+	traffic = make(map[int][2]int64, len(s.cumTraffic))
+	addTraffic(traffic, s.cumTraffic)
+	if s.connTracker != nil {
+		addTraffic(traffic, s.connTracker.trafficSnapshot())
 	}
-	traffic, aliveIPs, connCount = ct.GetUserTraffic()
+	for _, state := range s.draining {
+		if state.tracker != nil {
+			addTraffic(traffic, state.tracker.trafficSnapshot())
+		}
+	}
+	s.mu.RUnlock()
+	aliveIPs, connCount = s.devices.Snapshot()
 	return traffic, aliveIPs, connCount, nil
+}
+
+func addTraffic(total, delta map[int][2]int64) {
+	for uid, value := range delta {
+		current := total[uid]
+		total[uid] = [2]int64{current[0] + value[0], current[1] + value[1]}
+	}
 }
 
 // CloseConnection force-closes a specific connection by its ID.

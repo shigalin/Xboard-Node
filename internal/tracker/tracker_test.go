@@ -57,6 +57,20 @@ func TestProcess_CounterReset(t *testing.T) {
 	}
 }
 
+func TestResetCountersPreservesPendingTraffic(t *testing.T) {
+	tr := New()
+	tr.Process(map[int][2]int64{1: {100, 200}}, map[int]map[string]bool{1: {"192.0.2.1": true}}, 1)
+	tr.ResetCounters()
+	if tr.ActiveConnections() != 0 || len(tr.CurrentOnline()) != 0 {
+		t.Fatal("old kernel connections remained online after switching")
+	}
+	// New counters may already exceed the old values at the next tracking tick.
+	tr.Process(map[int][2]int64{1: {300, 500}}, nil, 0)
+	if got := tr.FlushTraffic()[1]; got != [2]int64{400, 700} {
+		t.Fatalf("traffic across kernel switch = %v, want [400 700]", got)
+	}
+}
+
 func TestProcess_UserDisappears(t *testing.T) {
 	tr := New()
 

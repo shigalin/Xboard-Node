@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,7 +37,10 @@ type Client struct {
 	machineID  int
 	httpClient *http.Client
 
+	// configETag and configBody always describe the same response, so a 304
+	// can be resolved to the config the panel is still serving.
 	configETag string
+	configBody []byte
 	userETag   string
 
 	apiSuccess atomic.Uint64
@@ -76,13 +80,6 @@ func (c *Client) ForNode(nodeID int) *Client {
 		machineID:  c.machineID,
 		httpClient: c.httpClient,
 	}
-}
-
-// ResetConfigETag clears the cached config ETag so the next GetConfig call
-// returns a full response instead of 304. Used by machine mode after a
-// pre-fetch to probe the transport type.
-func (c *Client) ResetConfigETag() {
-	c.configETag = ""
 }
 
 // Handshake calls the new v2 API to get WS config + initial data in one shot.
@@ -257,8 +254,32 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
 	}
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	cfg, err := decodeNodeConfig(body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Without an ETag the next request is unconditional, so no stale pair remains.
+	c.configETag, c.configBody = resp.Header.Get("ETag"), body
+	return cfg, nil
+}
+
+// CachedConfig decodes the config behind the cached ETag: what the panel is
+// still serving when GetConfig reports HTTP 304. It returns nil when unknown.
+func (c *Client) CachedConfig() (*NodeConfig, error) {
+	if c.configETag == "" || c.configBody == nil {
+		return nil, nil
+	}
+	return decodeNodeConfig(c.configBody)
+}
+
+func decodeNodeConfig(body []byte) (*NodeConfig, error) {
 	var raw map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("decode raw config: %w", err)
 	}
 
@@ -271,10 +292,6 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 	// Basic validation
 	if cfg.Protocol == "" {
 		return nil, fmt.Errorf("invalid config: missing protocol")
-	}
-
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		c.configETag = etag
 	}
 	return &cfg, nil
 }
@@ -330,6 +347,48 @@ func (c *Client) GetDevices() (map[int][]string, error) {
 		devices.Users = map[int][]string{}
 	}
 	return devices.Users, nil
+}
+
+// SyncDeviceBans reads active bans and, when present, submits local violations.
+// A nil result indicates a panel that does not implement the endpoint.
+func (c *Client) SyncDeviceBans(ctx context.Context, reports map[int]int64) (map[int]int64, error) {
+	method := http.MethodGet
+	var body []byte
+	if len(reports) != 0 {
+		method = http.MethodPost
+		payload := map[string]interface{}{"device_bans": reports}
+		c.injectAuth(payload)
+		var err error
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+	}
+	resp, err := c.doRequestContext(ctx, method, "/api/v2/server/device-bans", body, "")
+	if err != nil {
+		// net/http includes the authenticated request URL in transport errors.
+		if requestErr, ok := err.(*url.Error); ok {
+			err = requestErr.Err
+		}
+		return nil, err
+	}
+	defer drainAndClose(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("sync device bans: status %d", resp.StatusCode)
+	}
+	var result struct {
+		Bans map[int]int64 `json:"device_bans"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode device bans: %w", err)
+	}
+	if result.Bans == nil {
+		return nil, fmt.Errorf("sync device bans: missing device_bans")
+	}
+	return result.Bans, nil
 }
 
 // PushTraffic submits per-user traffic data
@@ -390,6 +449,7 @@ func (c *Client) PushStatus(cpu float64, mem, swap, disk [2]uint64) error {
 // ResetETags clears cached ETags, forcing full responses
 func (c *Client) ResetETags() {
 	c.configETag = ""
+	c.configBody = nil
 	c.userETag = ""
 }
 
@@ -486,6 +546,10 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 }
 
 func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
+	return c.doRequestContext(context.Background(), method, path, body, ifNoneMatch)
+}
+
+func (c *Client) doRequestContext(ctx context.Context, method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
 	fullURL := c.baseURL + path
 
 	var bodyReader io.Reader
@@ -500,7 +564,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 		bodyReader = bytes.NewReader(merged)
 	}
 
-	req, err := http.NewRequest(method, fullURL, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, err
 	}

@@ -11,6 +11,7 @@ type MailboxState struct {
 	Config         *model.NodeSpec
 	Users          []model.UserSpec
 	DeviceUsers    map[int][]string
+	DeviceBans     map[int]int64
 	HasConfig      bool
 	HasUsers       bool
 	HasDevices     bool
@@ -26,6 +27,7 @@ type NodeMailbox struct {
 	config           *model.NodeSpec
 	users            []model.UserSpec
 	deviceUsers      map[int][]string
+	deviceBans       map[int]int64
 	dirtyConfig      bool
 	dirtyUsers       bool
 	dirtyDevices     bool
@@ -84,6 +86,15 @@ func (m *NodeMailbox) Apply(event Event) {
 			m.dirtyDevices = true
 			changed = true
 		}
+		if len(event.DeviceBans) > 0 {
+			if m.deviceBans == nil {
+				m.deviceBans = make(map[int]int64, len(event.DeviceBans))
+			}
+			for uid, deadline := range event.DeviceBans {
+				m.deviceBans[uid] = max(m.deviceBans[uid], deadline)
+			}
+			changed = true
+		}
 	case EventSyncUserDelta:
 		if len(event.DeltaUsers) > 0 {
 			if !m.hasFullUserState {
@@ -136,6 +147,7 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 		state.HasDevices = true
 		m.dirtyDevices = false
 	}
+	state.DeviceBans, m.deviceBans = m.deviceBans, nil
 	m.needsReconcile = false
 	return state
 }

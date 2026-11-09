@@ -59,6 +59,10 @@ xbctl service restart
 
 Legacy single-panel config is fully compatible. Appending bindings auto-migrates to `instances` format. See `config.yml.example`.
 
+For panel-backed nodes, Hysteria (v1 and v2) always runs on `singbox` and XHTTP/SplitHTTP
+always runs on `xray`, regardless of `kernel.type`. A switch restarts the
+listener; kernel-native custom configs must match the selected kernel.
+
 ### REALITY destinations selected by panel SNI list (Xray)
 
 In the panel's existing REALITY **伪装站点(dest)** / SNI field, enter DNS names

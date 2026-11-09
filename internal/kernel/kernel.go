@@ -55,7 +55,8 @@ type Kernel interface {
 	// user set, binds listeners, and begins accepting connections.
 	// Calling Start on an already-running kernel stops the old instance first.
 	Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls TLSCert) error
-	// Stop gracefully shuts down the kernel, draining active connections.
+	// Stop gracefully shuts down the kernel, draining active connections and
+	// completing final traffic accounting before returning.
 	Stop()
 	// IsRunning returns whether the kernel is currently accepting connections.
 	IsRunning() bool
@@ -85,6 +86,7 @@ type Kernel interface {
 	// aliveIPs maps userID → set of source IPs currently connected.
 	// traffic maps userID → [upload, download] cumulative bytes.
 	// connCount is the total number of active connections (for metrics).
+	// Final cumulative counters remain readable after Stop.
 	GetUserTraffic(ctx context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error)
 	// CloseConnection terminates a specific connection by ID.
 	CloseConnection(ctx context.Context, connID string) error

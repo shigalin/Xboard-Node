@@ -417,7 +417,7 @@ func TestXrayCountsDrainingInstanceTraffic(t *testing.T) {
 	if err := old.AddFeature(oldMgr); err != nil {
 		t.Fatal(err)
 	}
-	x.draining[old] = []model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}}
+	x.draining[old] = newDrainingInstance([]model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}})
 	mustRegisterCounter(t, oldMgr, counterName(1, "uplink")).Add(5)
 	removed := mustRegisterCounter(t, oldMgr, counterName(2, "downlink"))
 	removed.Add(7)
@@ -448,5 +448,59 @@ func TestXrayCountsDrainingInstanceTraffic(t *testing.T) {
 	traffic, _, _, _ = x.GetUserTraffic(context.Background())
 	if traffic[2] != [2]int64{0, 10} {
 		t.Fatalf("final traffic of the closed instance = %v, want down 10", traffic[2])
+	}
+}
+
+func TestXrayStopFinalizesCurrentAndDrainingTraffic(t *testing.T) {
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
+	ld := newTestDispatcher()
+	x, mgr := newStatsBackedXray(t, users, ld)
+	current := mustRegisterCounter(t, mgr, counterName(1, "downlink"))
+	current.Add(10)
+	lease, err := ld.devices.Acquire(1, "", "192.0.2.1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Bind(func() {
+		current.Add(7) // bytes completed during final connection close
+		lease.Release()
+	})
+
+	oldLD := newTestDispatcher()
+	oldMgr := newStatsManager(t)
+	old := new(xrayCore.Instance)
+	if err := old.AddFeature(oldMgr); err != nil {
+		t.Fatal(err)
+	}
+	previous := mustRegisterCounter(t, oldMgr, counterName(1, "downlink"))
+	previous.Add(20)
+	oldLease, err := oldLD.devices.Acquire(1, "", "192.0.2.2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldLease.Bind(func() {
+		previous.Add(11)
+		oldLease.Release()
+	})
+	state := newDrainingInstance(users)
+	x.draining[old] = state
+	x.closeOld(old, oldLD)
+
+	done := make(chan struct{})
+	go func() { x.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(drainTimeout + 3*time.Second):
+		t.Fatal("Stop did not terminate the hot-reload drain and finalize traffic")
+	}
+	if x.IsRunning() || len(x.draining) != 0 {
+		t.Fatal("Stop returned before all instances were finalized")
+	}
+	for i := 0; i < 2; i++ {
+		traffic, _, connections, err := x.GetUserTraffic(context.Background())
+		if err != nil || traffic[1] != [2]int64{0, 48} || connections != 0 {
+			t.Fatalf("final traffic = %v, connections = %d, err = %v", traffic, connections, err)
+		}
+		x.Stop() // repeated Stop must neither lose nor double-count the totals
 	}
 }

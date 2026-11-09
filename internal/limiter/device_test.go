@@ -67,6 +67,82 @@ func TestDevicesStrictLimitKicksAndPunishesAllIPs(t *testing.T) {
 	}
 }
 
+func TestDeviceBanClosesSessionsAcrossNodesUntilSharedDeadline(t *testing.T) {
+	a, nowA := testDeviceManager()
+	b, nowB := testDeviceManager()
+	a.SetCooldown(10 * time.Minute)
+	a.ApplyDeviceBans(map[int]int64{})
+	b.ApplyDeviceBans(map[int]int64{})
+	first := mustAcquire(t, a, 1, "192.0.2.1", 1)
+	second := mustAcquire(t, b, 1, "198.51.100.2", 1)
+	unrelated := mustAcquire(t, b, 2, "198.51.100.2", 1)
+	defer unrelated.Release()
+	closedA, closedB := make(chan struct{}), make(chan struct{})
+	first.Bind(func() { close(closedA) })
+	second.Bind(func() { close(closedB) })
+
+	if _, err := a.Acquire(1, "", "198.51.100.2", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatalf("over-limit connection on A: %v", err)
+	}
+	select {
+	case <-a.DeviceBanNotifications():
+	default:
+		t.Fatal("local ban did not wake the reporter")
+	}
+	waitClosed(t, closedA)
+	report := a.PendingDeviceBans()
+	deadline := nowA.Add(180 * time.Second)
+	if len(report) != 1 || report[1] != deadline.UnixMilli() {
+		t.Fatalf("local report = %v, want a fixed 180-second deadline", report)
+	}
+
+	// Simulate A acknowledging the panel response and B receiving the same
+	// deadline later. Replayed and empty snapshots must not reset the timer.
+	a.UpdateGlobalDevices(map[int][]string{1: {"203.0.113.9"}})
+	a.ApplyDeviceBans(report)
+	*nowB = nowB.Add(40 * time.Second)
+	b.ApplyDeviceBans(report)
+	b.UpdateGlobalDevices(map[int][]string{1: {"203.0.113.9"}})
+	waitClosed(t, closedB)
+	if b.ActiveCount() != 1 {
+		t.Fatal("the ban affected an unrelated user")
+	}
+	if len(a.PendingDeviceBans()) != 0 || len(b.PendingDeviceBans()) != 0 {
+		t.Fatal("a shared ban was queued for publication again")
+	}
+	for _, m := range []*DeviceManager{a, b} {
+		m.ApplyDeviceBans(report)
+		m.ApplyDeviceBans(map[int]int64{})
+		if _, err := m.Acquire(1, "", "203.0.113.3", 0); !errors.Is(err, ErrDeviceLimit) {
+			t.Fatalf("shared ban was bypassed: %v", err)
+		}
+	}
+	*nowA, *nowB = deadline.Add(-time.Millisecond), deadline.Add(-time.Millisecond)
+	for _, m := range []*DeviceManager{a, b} {
+		if _, err := m.Acquire(1, "", "192.0.2.1", 1); !errors.Is(err, ErrDeviceLimit) {
+			t.Fatalf("ban expired early: %v", err)
+		}
+	}
+	*nowA, *nowB = deadline, deadline
+	for _, m := range []*DeviceManager{a, b} {
+		m.ApplyDeviceBans(report)
+		mustAcquire(t, m, 1, "192.0.2.1", 1).Release()
+	}
+}
+
+func TestDeviceBanRejectedByPanelClearsProvisionalCooldown(t *testing.T) {
+	m, _ := testDeviceManager()
+	m.ApplyDeviceBans(map[int]int64{})
+	mustAcquire(t, m, 1, "192.0.2.1", 1)
+	if _, err := m.Acquire(1, "", "198.51.100.2", 1); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatalf("over-limit connection: %v", err)
+	}
+	report := m.PendingDeviceBans()
+	m.ApplyDeviceBans(map[int]int64{})
+	m.AcknowledgeDeviceBans(report)
+	mustAcquire(t, m, 1, "192.0.2.1", 1).Release()
+}
+
 func TestDevicesGlobalUnionAndFreshness(t *testing.T) {
 	for _, mode := range []string{"fresh", "expired", "cleared"} {
 		t.Run(mode, func(t *testing.T) {
