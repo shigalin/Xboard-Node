@@ -38,9 +38,11 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		}
 		if nc.Multiplex.Brutal != nil {
 			multiplex.Brutal = &BrutalConfig{
-				Enabled:  nc.Multiplex.Brutal.Enabled,
-				UpMbps:   nc.Multiplex.Brutal.UpMbps,
-				DownMbps: nc.Multiplex.Brutal.DownMbps,
+				Enabled: nc.Multiplex.Brutal.Enabled,
+				// Client's side on the panel, server's side in NodeSpec:
+				// same swap as the Hysteria bandwidth below.
+				UpMbps:   nc.Multiplex.Brutal.DownMbps,
+				DownMbps: nc.Multiplex.Brutal.UpMbps,
 			}
 		}
 	}
@@ -200,9 +202,10 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 		}
 		if n.Multiplex.Brutal != nil {
 			multiplex.Brutal = &panel.BrutalConfig{
-				Enabled:  n.Multiplex.Brutal.Enabled,
-				UpMbps:   n.Multiplex.Brutal.UpMbps,
-				DownMbps: n.Multiplex.Brutal.DownMbps,
+				Enabled: n.Multiplex.Brutal.Enabled,
+				// Inverse of NodeSpecFromPanel: back to the client's side.
+				UpMbps:   n.Multiplex.Brutal.DownMbps,
+				DownMbps: n.Multiplex.Brutal.UpMbps,
 			}
 		}
 	}

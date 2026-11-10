@@ -142,3 +142,18 @@ func TestNodeSpecFromPanelBandwidthIsServerSide(t *testing.T) {
 		t.Fatalf("ToPanel did not restore the client's side: up %d / down %d", back.UpMbps, back.DownMbps)
 	}
 }
+
+func TestNodeSpecFromPanelMultiplexBrutalIsServerSide(t *testing.T) {
+	nc := &panel.NodeConfig{Protocol: "vless", ServerPort: 443, Multiplex: &panel.MultiplexConfig{
+		Enabled: true,
+		Brutal:  &panel.BrutalConfig{Enabled: true, UpMbps: 20, DownMbps: 100},
+	}}
+	spec := NodeSpecFromPanel(nc)
+	// Panel: client uploads 20, downloads 100. Server: uploads 100, downloads 20.
+	if got := spec.Multiplex.Brutal; got.UpMbps != 100 || got.DownMbps != 20 {
+		t.Fatalf("server-side brutal = up %d / down %d, want up 100 / down 20", got.UpMbps, got.DownMbps)
+	}
+	if back := spec.ToPanel().Multiplex.Brutal; back.UpMbps != 20 || back.DownMbps != 100 {
+		t.Fatalf("ToPanel did not restore the client's side: up %d / down %d", back.UpMbps, back.DownMbps)
+	}
+}

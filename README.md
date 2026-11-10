@@ -101,6 +101,7 @@ Hysteria v1 uses the `hysteria` ALPN by default. Update clients that explicitly
 set `h3`. Credential changes on a Hysteria v1 node rebuild its inbound and
 disconnect its current QUIC sessions. For panel-managed Hysteria nodes, the
 panel's download limit becomes the server's upload limit, and vice versa.
+The same swap applies to the panel's multiplex Brutal rates.
 Standalone bandwidth values are already server-side. Hysteria2 uses Brutal
 for server sends when the client advertises a nonzero receive rate. The
 server's upload limit caps that rate. A client advertising zero still uses
