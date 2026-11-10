@@ -353,7 +353,7 @@ func copyStrings(src []string) []string {
 }
 
 func mergeCustomSingbox(cfg M, kcfg config.KernelConfig) {
-	custom, err := kernel.LoadCustomConfig(kcfg.CustomConfig)
+	custom, err := kernel.ResolveCustomConfig(kcfg)
 	if err != nil {
 		nlog.Core().Error("failed to load custom sing-box config", "error", err)
 		return
@@ -649,6 +649,14 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 			})
 		}
 		base["users"] = userList
+		// Bandwidth hints enable Brutal; leaving them out keeps BBR. NodeSpec
+		// states the server's own bandwidth, as the inbound does.
+		if nc.UpMbps > 0 {
+			base["up_mbps"] = nc.UpMbps
+		}
+		if nc.DownMbps > 0 {
+			base["down_mbps"] = nc.DownMbps
+		}
 
 		if nc.Obfs != "" {
 			base["obfs"] = M{
@@ -680,9 +688,14 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 		nlog.Core().Warn("hysteria requires TLS certificate files on disk; configure cert_mode (self, file, http, dns, or content). Sing-box will not start this inbound without tls.")
 		return base
 	}
-	// Hysteria/Hysteria2 uses QUIC and requires ALPN; default to h3 if not set.
+	// QUIC requires ALPN. Hysteria2 clients offer h3; Hysteria v1 clients
+	// (including panel-generated ones) offer "hysteria" by default.
 	if _, ok := tls["alpn"]; !ok {
-		tls["alpn"] = []string{"h3"}
+		if nc.Version == 2 {
+			tls["alpn"] = []string{"h3"}
+		} else {
+			tls["alpn"] = []string{"hysteria"}
+		}
 	}
 	base["tls"] = tls
 	return base

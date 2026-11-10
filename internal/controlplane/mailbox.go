@@ -8,7 +8,10 @@ import (
 
 // MailboxState is the coalesced snapshot drained from a NodeMailbox.
 type MailboxState struct {
-	Config         *model.NodeSpec
+	Config *model.NodeSpec
+	// ConfigErr is set when the latest config event could not be applied to
+	// this node; any earlier buffered config was withdrawn with it.
+	ConfigErr      error
 	Users          []model.UserSpec
 	DeviceUsers    map[int][]string
 	DeviceBans     map[int]int64
@@ -25,6 +28,7 @@ type NodeMailbox struct {
 	mu               sync.Mutex
 	ready            bool
 	config           *model.NodeSpec
+	configErr        error
 	users            []model.UserSpec
 	deviceUsers      map[int][]string
 	deviceBans       map[int]int64
@@ -68,9 +72,17 @@ func (m *NodeMailbox) Apply(event Event) {
 
 	switch event.Type {
 	case EventSyncConfig:
-		if event.Config != nil {
+		if event.ConfigErr != nil {
+			// Latest wins: the panel replaced any buffered candidate with a
+			// config this node cannot run.
+			m.config = nil
+			m.dirtyConfig = false
+			m.configErr = event.ConfigErr
+			changed = true
+		} else if event.Config != nil {
 			m.config = cloneNodeSpec(event.Config)
 			m.dirtyConfig = true
+			m.configErr = nil
 			changed = true
 		}
 	case EventSyncUsers:
@@ -132,6 +144,7 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 		return MailboxState{}
 	}
 	state := MailboxState{NeedsReconcile: m.needsReconcile}
+	state.ConfigErr, m.configErr = m.configErr, nil
 	if m.dirtyConfig && m.config != nil {
 		state.Config = cloneNodeSpec(m.config)
 		state.HasConfig = true

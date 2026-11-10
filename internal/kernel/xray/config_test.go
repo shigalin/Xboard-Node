@@ -4,6 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -570,5 +573,74 @@ func TestExtractECHServerKeys(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tt.expect)
 			}
 		})
+	}
+}
+
+func TestApplyStreamSettings_XHTTPExtraDoesNotMutateSpec(t *testing.T) {
+	nc := testNodeSpec(&panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		Network:    "xhttp",
+		NetworkSettings: map[string]interface{}{
+			"path":  "/x",
+			"extra": map[string]interface{}{"xmux": []interface{}{}, "sockopt": map[string]interface{}{"tcpFastOpen": []interface{}{}, "mark": 1}},
+		},
+	})
+	before, _ := json.Marshal(nc)
+
+	base := M{}
+	applyStreamSettings(base, nc, kernel.TLSCert{})
+
+	after, _ := json.Marshal(nc)
+	if string(before) != string(after) {
+		t.Fatalf("spec mutated by config generation:\nbefore %s\nafter  %s", before, after)
+	}
+	extra := base["streamSettings"].(M)["xhttpSettings"].(M)["extra"].(map[string]interface{})
+	if _, ok := extra["xmux"]; ok {
+		t.Fatal("empty xmux array was not stripped from the generated config")
+	}
+	sockopt := extra["sockopt"].(map[string]interface{})
+	if _, ok := sockopt["tcpFastOpen"]; ok {
+		t.Fatal("nested empty array was not stripped from the generated config")
+	}
+	if sockopt["mark"] != 1 {
+		t.Fatalf("nested value lost: %v", sockopt)
+	}
+}
+
+func TestBuildTrojan_DefaultTLSDoesNotMutateSpec(t *testing.T) {
+	nc := testNodeSpec(&panel.NodeConfig{Protocol: "trojan", ServerPort: 443, TLS: 0})
+	before, _ := json.Marshal(nc)
+
+	inbound := buildTrojan(M{}, nc, testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+
+	after, _ := json.Marshal(nc)
+	if string(before) != string(after) {
+		t.Fatalf("spec mutated by config generation:\nbefore %s\nafter  %s", before, after)
+	}
+	if security := inbound["streamSettings"].(M)["security"]; security != "tls" {
+		t.Fatalf("trojan without tls flag but with certificates must default to TLS, got %v", security)
+	}
+}
+
+func TestMergeCustomXray_UsesServiceSnapshotOverFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "custom.json")
+	if err := os.WriteFile(path, []byte(`{"routing":{"rules":[{"domain":["from-file.example"],"outboundTag":"block"}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kcfg := config.KernelConfig{Type: "xray", CustomConfig: path, CustomConfigData: map[string]any{
+		"routing": map[string]any{"rules": []any{map[string]any{"domain": []any{"from-snapshot.example"}, "outboundTag": "block"}}},
+	}}
+	cfg := buildConfig(kcfg, testNodeSpec(&panel.NodeConfig{Protocol: "vless", ServerPort: 443}), testUsers, kernel.TLSCert{})
+	data, _ := json.Marshal(cfg)
+	if !strings.Contains(string(data), "from-snapshot.example") || strings.Contains(string(data), "from-file.example") {
+		t.Fatalf("expected the service snapshot to be merged instead of the file, got %s", data)
+	}
+	// An empty snapshot means "no custom config" even when the file exists.
+	kcfg.CustomConfigData = map[string]any{}
+	cfg = buildConfig(kcfg, testNodeSpec(&panel.NodeConfig{Protocol: "vless", ServerPort: 443}), testUsers, kernel.TLSCert{})
+	data, _ = json.Marshal(cfg)
+	if strings.Contains(string(data), "from-file.example") {
+		t.Fatalf("empty snapshot still merged the file: %s", data)
 	}
 }

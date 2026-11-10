@@ -2,7 +2,10 @@ package xray
 
 import (
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +28,26 @@ func sniTestConfig(name string) M {
 	return M{"inbounds": []M{{"streamSettings": M{"security": "reality", "realitySettings": M{
 		"serverNames": []string{name}, "dest": "unchanged.example.com:443",
 	}}}}}
+}
+
+func TestCheckConfigRejectsMalformedRealitySNIList(t *testing.T) {
+	key, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := New(config.KernelConfig{Type: "xray", ConfigDir: t.TempDir()})
+	spec := &model.NodeSpec{
+		Protocol: "vless", Network: "xhttp", ServerPort: 443, TLS: 2,
+		TLSSettings: M{
+			"server_name": "one.example.com,,two.example.com",
+			"private_key": base64.RawURLEncoding.EncodeToString(key.Bytes()),
+			"short_id":    "abcd",
+		},
+	}
+	users := []model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}}
+	if err := x.CheckConfig(spec, users, kernel.TLSCert{}); err == nil || !strings.Contains(err.Error(), "comma-separated DNS names") {
+		t.Fatalf("expected the malformed SNI list to fail preflight, got %v", err)
+	}
 }
 
 func TestRealitySNIRouterRoutesTLSAndFallsBackForUnlistedNames(t *testing.T) {

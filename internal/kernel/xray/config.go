@@ -117,7 +117,7 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 //   - policy, api: custom deep-merges
 //   - inbounds: NOT merged (panel-managed, authoritative)
 func mergeCustomXray(cfg M, kcfg config.KernelConfig) {
-	custom, err := kernel.LoadCustomConfig(kcfg.CustomConfig)
+	custom, err := kernel.ResolveCustomConfig(kcfg)
 	if err != nil {
 		nlog.Core().Error("failed to load custom xray config", "error", err)
 		return
@@ -299,8 +299,10 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 	// we should enable a default TLS config to ensure the inbound can start.
 	ss, _ := base["streamSettings"].(M)
 	if security, ok := ss["security"].(string); !ok || (security != "tls" && security != "reality") {
-		nc.TLS = 1 // Force internal state to trigger TLS build in applyStreamSettings
-		applyStreamSettings(base, nc, tc)
+		// Build TLS from a copy: the caller's spec is hashed for change detection.
+		withTLS := *nc
+		withTLS.TLS = 1
+		applyStreamSettings(base, &withTLS, tc)
 	}
 
 	return base
@@ -550,10 +552,11 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 			if v, ok := nc.NetworkSettings["extra"]; ok {
 				// PHP sends empty arrays [] instead of {} for empty objects;
 				// xray rejects [] for fields that expect objects (e.g. sockopt, tlsSettings).
-				// Recursively strip empty arrays from the extra map before passing to xray.
+				// Recursively strip empty arrays from a copy of the extra map: the
+				// spec itself is hashed for change detection and must stay as the
+				// panel sent it.
 				if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
-					sanitizeEmptyArrays(m)
-					xhttpSettings["extra"] = m
+					xhttpSettings["extra"] = sanitizeEmptyArrays(m)
 				}
 			}
 		}
@@ -817,17 +820,24 @@ func copyStrings(src []string) []string {
 // sanitizeEmptyArrays recursively removes empty slices from a map.
 // PHP encodes empty objects as [] instead of {}; xray-core rejects []
 // for fields that expect struct types (e.g. sockopt, tlsSettings).
-func sanitizeEmptyArrays(m map[string]interface{}) {
+// sanitizeEmptyArrays returns a copy of m without empty arrays, recursing into
+// nested maps. The input is left untouched.
+func sanitizeEmptyArrays(m map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(m))
 	for k, v := range m {
 		switch val := v.(type) {
 		case []interface{}:
 			if len(val) == 0 {
-				delete(m, k)
+				continue
 			}
+			out[k] = val
 		case map[string]interface{}:
-			sanitizeEmptyArrays(val)
+			out[k] = sanitizeEmptyArrays(val)
+		default:
+			out[k] = v
 		}
 	}
+	return out
 }
 
 // extractECHServerKeys extracts the ECH private key from tls_settings.ech

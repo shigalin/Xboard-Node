@@ -60,7 +60,6 @@ type Manager struct {
 
 	magic           *certmagic.Config
 	cache           *certmagic.Cache
-	renewed         atomic.Bool
 	acmeStarted     bool
 	acmeFingerprint string
 	acmeCancel      context.CancelFunc
@@ -278,7 +277,6 @@ func (m *Manager) HasCert() bool {
 	mat := m.mat.Load()
 	return mat != nil && len(mat.certPEM) > 0 && len(mat.keyPEM) > 0
 }
-func (m *Manager) CertRenewed() bool { return m.renewed.Swap(false) }
 
 // TLSCert returns the current PEM material as a kernel.TLSCert.
 func (m *Manager) TLSCert() kernel.TLSCert {
@@ -463,7 +461,6 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 				nlog.Core().Error("failed to reload cert after renewal", "error", err)
 				return nil
 			}
-			m.renewed.Store(true)
 			nlog.Core().Info("TLS certificate reloaded after renewal", "domain", m.cfg.Domain)
 			return nil
 		},

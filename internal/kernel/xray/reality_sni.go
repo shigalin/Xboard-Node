@@ -106,24 +106,8 @@ func (r *realitySNIRouter) Close() error {
 // also answers connections without a listed SNI. Single-name nodes retain
 // their existing configuration; no second local SNI list is required.
 func prepareRealitySNIRouting(cfg M, nc *model.NodeSpec, localTargets map[string]string, previous *realitySNIRouter) (*realitySNIRouterLease, error) {
-	if nc == nil || nc.TLS != 2 {
-		return nil, nil
-	}
-	raw, _ := nc.TLSSettings["server_name"].(string)
-	if !strings.Contains(raw, ",") {
-		return nil, nil
-	}
-	inbounds, _ := cfg["inbounds"].([]M)
-	if len(inbounds) != 1 {
-		return nil, fmt.Errorf("multiple REALITY SNI names require a REALITY inbound")
-	}
-	stream, _ := inbounds[0]["streamSettings"].(M)
-	reality, _ := stream["realitySettings"].(M)
-	if stream["security"] != "reality" || reality == nil {
-		return nil, fmt.Errorf("multiple REALITY SNI names require a REALITY inbound")
-	}
-	names, targets, err := panelRealitySNITargets(raw, nc.TLSSettings["server_port"], localTargets)
-	if err != nil {
+	reality, names, targets, err := resolveRealitySNIRouting(cfg, nc, localTargets)
+	if err != nil || reality == nil {
 		return nil, err
 	}
 	fallback := targets[names[0]]
@@ -138,6 +122,32 @@ func prepareRealitySNIRouting(cfg M, nc *model.NodeSpec, localTargets map[string
 	reality["dest"] = lease.listener.Addr().String()
 	reality["serverNames"] = names
 	return lease, nil
+}
+
+// resolveRealitySNIRouting validates the same settings for preflight and Start
+// without opening the forwarding socket.
+func resolveRealitySNIRouting(cfg M, nc *model.NodeSpec, localTargets map[string]string) (M, []string, map[string]string, error) {
+	if nc == nil || nc.TLS != 2 {
+		return nil, nil, nil, nil
+	}
+	raw, _ := nc.TLSSettings["server_name"].(string)
+	if !strings.Contains(raw, ",") {
+		return nil, nil, nil, nil
+	}
+	inbounds, _ := cfg["inbounds"].([]M)
+	if len(inbounds) != 1 {
+		return nil, nil, nil, fmt.Errorf("multiple REALITY SNI names require a REALITY inbound")
+	}
+	stream, _ := inbounds[0]["streamSettings"].(M)
+	reality, _ := stream["realitySettings"].(M)
+	if stream["security"] != "reality" || reality == nil {
+		return nil, nil, nil, fmt.Errorf("multiple REALITY SNI names require a REALITY inbound")
+	}
+	names, targets, err := panelRealitySNITargets(raw, nc.TLSSettings["server_port"], localTargets)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return reality, names, targets, nil
 }
 
 func panelRealitySNITargets(raw string, value any, localTargets map[string]string) ([]string, map[string]string, error) {

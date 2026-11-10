@@ -19,6 +19,9 @@ singbox.json
 .DS_Store
 Thumbs.db
 
+# Claude Code agent worktrees
+.claude/worktrees/
+
 # Go
 vendor/
 config.json

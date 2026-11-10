@@ -16,8 +16,11 @@ const (
 )
 
 type Event struct {
-	Type        EventType
-	Config      *model.NodeSpec
+	Type   EventType
+	Config *model.NodeSpec
+	// ConfigErr is set on a config event whose config does not validate for
+	// the selected kernel. Config is nil; the node keeps its active config.
+	ConfigErr   error
 	Users       []model.UserSpec
 	DeltaAction string
 	DeltaUsers  []model.UserSpec
@@ -50,9 +53,13 @@ type Snapshot struct {
 	Config      *model.NodeSpec
 	Users       []model.UserSpec
 	DeviceUsers map[int][]string
-	// CurrentConfig is the config still served by the panel when Config is
-	// nil because of HTTP 304. Nil when the source cannot tell.
+	// CurrentConfig is the config the panel serves when Config is nil: the
+	// body behind an HTTP 304, or a body that failed validation. Nil when
+	// the source cannot tell.
 	CurrentConfig *model.NodeSpec
+	// CurrentConfigErr is set when CurrentConfig does not validate for the
+	// selected kernel: the panel's config is known but cannot be applied.
+	CurrentConfigErr error
 }
 
 type ReportPayload struct {
@@ -88,6 +95,13 @@ type Source interface {
 // planes do not need to implement an endpoint they cannot use.
 type DeviceSnapshotSource interface {
 	FetchDevices(ctx context.Context) (map[int][]string, error)
+}
+
+// UserRefetcher makes the next poll return the panel's full user list even if
+// it is unchanged. The service uses it after it failed to apply a list the
+// panel has already cached behind an ETag. Called only between polls.
+type UserRefetcher interface {
+	ForgetUserETag()
 }
 
 type DeviceBanSync interface {

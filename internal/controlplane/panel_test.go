@@ -30,17 +30,26 @@ func TestPanelControlPlanePollRejectsInvalidCustomOutbounds(t *testing.T) {
 	defer server.Close()
 
 	cp := NewPanelControlPlane(config.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}, config.WSConfig{}, config.KernelConfig{Type: "singbox"})
-	_, err := cp.Poll(context.Background())
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	snapshot, err := cp.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("poll with an invalid config must still deliver users: %v", err)
 	}
-	if !strings.Contains(err.Error(), `poll config normalize: validate custom outbounds: custom_outbounds[0].proxy_tag references unknown outbound "missing"`) {
-		t.Fatalf("unexpected error: %v", err)
+	if snapshot.Config != nil {
+		t.Fatal("invalid config was returned as applicable")
+	}
+	if snapshot.CurrentConfig == nil || snapshot.CurrentConfig.ServerPort != 8388 {
+		t.Fatalf("invalid config was not reported as the panel's current config: %#v", snapshot.CurrentConfig)
+	}
+	if snapshot.CurrentConfigErr == nil || !strings.Contains(snapshot.CurrentConfigErr.Error(), `validate custom outbounds: custom_outbounds[0].proxy_tag references unknown outbound "missing"`) {
+		t.Fatalf("unexpected error: %v", snapshot.CurrentConfigErr)
+	}
+	if len(snapshot.Users) == 0 {
+		t.Fatal("users from the same poll were dropped")
 	}
 }
 
 func TestTranslateWSEventRejectsInvalidCustomOutbounds(t *testing.T) {
-	_, err := TranslateWSEvent(panelapi.WSEvent{
+	translated, err := TranslateWSEvent(panelapi.WSEvent{
 		Type: panelapi.WSEventSyncConfig,
 		Config: &panelapi.NodeConfig{
 			Protocol:   "shadowsocks",
@@ -50,11 +59,14 @@ func TestTranslateWSEventRejectsInvalidCustomOutbounds(t *testing.T) {
 			},
 		},
 	}, config.KernelConfig{Type: "singbox"})
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	if err != nil {
+		t.Fatalf("an invalid config event must still reach the service: %v", err)
 	}
-	if !strings.Contains(err.Error(), `translate node config: validate custom outbounds: custom_outbounds[0].proxy_tag references unknown outbound "missing"`) {
-		t.Fatalf("unexpected error: %v", err)
+	if translated.Config != nil {
+		t.Fatal("invalid config was translated as applicable")
+	}
+	if translated.ConfigErr == nil || !strings.Contains(translated.ConfigErr.Error(), `translate node config: validate custom outbounds: custom_outbounds[0].proxy_tag references unknown outbound "missing"`) {
+		t.Fatalf("unexpected error: %v", translated.ConfigErr)
 	}
 }
 
@@ -76,7 +88,7 @@ func newPanelTestServer(configBody string) *httptest.Server {
 }
 
 func TestTranslateWSEventRejectsUnsupportedProtocolForKernel(t *testing.T) {
-	_, err := TranslateWSEvent(panelapi.WSEvent{
+	translated, err := TranslateWSEvent(panelapi.WSEvent{
 		Type: panelapi.WSEventSyncConfig,
 		Config: &panelapi.NodeConfig{
 			Protocol:   "shadowsocks",
@@ -86,10 +98,10 @@ func TestTranslateWSEventRejectsUnsupportedProtocolForKernel(t *testing.T) {
 			},
 		},
 	}, config.KernelConfig{Type: "xray"})
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	if err != nil || translated.Config != nil {
+		t.Fatalf("expected an event carrying ConfigErr, got config=%v err=%v", translated.Config, err)
 	}
-	if !strings.Contains(err.Error(), `translate node config: validate custom outbounds: custom_outbounds[0].protocol "hysteria2" is not supported by kernel "xray"`) {
-		t.Fatalf("unexpected error: %v", err)
+	if translated.ConfigErr == nil || !strings.Contains(translated.ConfigErr.Error(), `translate node config: validate custom outbounds: custom_outbounds[0].protocol "hysteria2" is not supported by kernel "xray"`) {
+		t.Fatalf("unexpected error: %v", translated.ConfigErr)
 	}
 }

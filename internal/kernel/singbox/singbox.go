@@ -1,10 +1,11 @@
 package singbox
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -45,6 +46,21 @@ type SingBox struct {
 	users      []model.UserSpec
 	nodeConfig *model.NodeSpec
 	tls        kernel.TLSCert
+	// sharedKey identifies everything in the running config except the
+	// inbounds and the route rules: outbounds, dns and the rest. Reload can
+	// swap inbounds and rules in place; any other change needs a restart.
+	sharedKey string
+	// routeKey identifies the running route rules and rule sets.
+	routeKey string
+	// exclusive is set when the running config owns resources besides its
+	// inbounds that a second instance cannot share (clash_api or v2ray_api
+	// listeners, the cache_file lock, endpoints, services, certificate
+	// providers, tor data directories). Releasing only the inbounds would not
+	// let a replacement start.
+	exclusive bool
+	// released is set once ReleaseListeners closed the inbound manager. The
+	// box must not be changed in place after that; only Start or Stop.
+	released bool
 
 	// connTracker is our lightweight in-process byte/IP tracker.
 	// Created fresh on every Start (full restart).
@@ -109,12 +125,25 @@ func (s *SingBox) Protocols() []string {
 }
 
 func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	// A released instance normally keeps draining next to its replacement. One
+	// that owns exclusive resources cannot: the replacement would wait for them
+	// and fail. Listeners of such an instance are only released when a failed
+	// in-place change could not be rolled back, so close it completely first.
+	s.mu.Lock()
+	blocked := s.box != nil && s.released && s.exclusive
+	s.mu.Unlock()
+	if blocked {
+		s.Stop()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	kernel.LogRealityTarget(nodeConfig, s.cfg.RealityTargets)
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = include.Context(ctx)
+	registry := service.FromContext[adapter.InboundRegistry](ctx)
+	service.MustRegister[adapter.InboundRegistry](ctx, reloadInboundRegistry{registry})
 
 	// Save old state before creating the new instance.
 	oldBox := s.box
@@ -122,7 +151,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	oldCtx := s.ctx
 	oldTracker := s.connTracker
 
-	instance, err := s.buildBox(ctx, nodeConfig, users, tls)
+	instance, keys, err := s.buildBox(ctx, nodeConfig, users, tls)
 	if err != nil {
 		cancel()
 		return err
@@ -158,6 +187,8 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.nodeConfig = nodeConfig
 	s.tls = tls
 	s.connTracker = tracker
+	s.sharedKey, s.routeKey, s.exclusive = keys.shared, keys.route, keys.exclusive
+	s.released = false
 	s.devices.UpdateUsers(users)
 
 	// Recycle old instance in background — drain then close.
@@ -167,32 +198,338 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	return nil
 }
 
-func (s *SingBox) buildBox(ctx context.Context, spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) (*box.Box, error) {
-	data, err := json.Marshal(buildConfig(s.cfg, spec, users, tls))
+func (s *SingBox) buildBox(ctx context.Context, spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) (*box.Box, configKeys, error) {
+	cfgMap := buildConfig(s.cfg, spec, users, tls)
+	data, err := json.Marshal(cfgMap)
 	if err != nil {
-		return nil, fmt.Errorf("marshal config: %w", err)
+		return nil, configKeys{}, fmt.Errorf("marshal config: %w", err)
 	}
 	nlog.Core().Debug("sing-box config generated", "len", len(data))
 	opts, err := singJSON.UnmarshalExtendedContext[option.Options](ctx, data)
 	if err != nil {
-		return nil, fmt.Errorf("parse sing-box options: %w", err)
+		return nil, configKeys{}, fmt.Errorf("parse sing-box options: %w", err)
 	}
 	instance, err := box.New(box.Options{Context: ctx, Options: opts})
 	if err != nil {
-		return nil, fmt.Errorf("create sing-box instance: %w", err)
+		return nil, configKeys{}, fmt.Errorf("create sing-box instance: %w", err)
 	}
-	return instance, nil
+	return instance, keysOf(cfgMap), nil
+}
+
+// configKeys splits a generated config into the parts Reload treats
+// differently: route rules (swapped atomically) and everything else except
+// the inbounds (which needs a restart).
+type configKeys struct {
+	shared    string
+	route     string
+	inbounds  string
+	exclusive bool
+}
+
+func keysOf(cfgMap M) configKeys {
+	shared := make(M, len(cfgMap))
+	var rules M
+	for k, v := range cfgMap {
+		switch k {
+		case "inbounds":
+		case "route":
+			route, _ := v.(M)
+			rest := make(M, len(route))
+			rules = M{}
+			for rk, rv := range route {
+				if rk == "rules" || rk == "rule_set" {
+					rules[rk] = rv
+				} else {
+					rest[rk] = rv
+				}
+			}
+			shared[k] = rest
+		default:
+			shared[k] = v
+		}
+	}
+	sharedData, _ := json.Marshal(shared)
+	routeData, _ := json.Marshal(rules)
+	exclusive := false
+	for _, key := range []string{"experimental", "endpoints", "services", "certificate_providers"} {
+		if _, ok := cfgMap[key]; ok {
+			exclusive = true
+		}
+	}
+	if outbounds, err := json.Marshal(cfgMap["outbounds"]); err == nil {
+		var list []struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(outbounds, &list)
+		for _, outbound := range list {
+			if outbound.Type == "tor" { // locks its data directory
+				exclusive = true
+			}
+		}
+	}
+	return configKeys{
+		shared:    string(sharedData),
+		route:     string(routeData),
+		inbounds:  inboundsKey(cfgMap["inbounds"]),
+		exclusive: exclusive,
+	}
+}
+
+// unchangedInbounds reports, per tag, whether an inbound's generated config
+// is identical in both configs, users included.
+func unchangedInbounds(next, prev M) map[string]bool {
+	index := func(cfgMap M) map[string]string {
+		list, _ := cfgMap["inbounds"].([]M)
+		out := make(map[string]string, len(list))
+		for _, inbound := range list {
+			tag, _ := inbound["tag"].(string)
+			data, _ := json.Marshal(inbound)
+			out[tag] = string(data)
+		}
+		return out
+	}
+	after, before := index(next), index(prev)
+	same := make(map[string]bool, len(after))
+	for tag, data := range after {
+		same[tag] = before[tag] == data
+	}
+	return same
+}
+
+// inboundsKey serializes the inbounds without their user lists, so it
+// changes only when a listener itself has to be rebuilt.
+func inboundsKey(v any) string {
+	list, _ := v.([]M)
+	stripped := make([]M, 0, len(list))
+	for _, inbound := range list {
+		copied := make(M, len(inbound))
+		for k, val := range inbound {
+			if k != "users" {
+				copied[k] = val
+			}
+		}
+		stripped = append(stripped, copied)
+	}
+	data, _ := json.Marshal(stripped)
+	return string(data)
+}
+
+// errRestartRequired reports a change Reload cannot apply in place.
+var errRestartRequired = errors.New("configuration beyond inbounds and route rules changed; full restart required")
+
+// SetCustomConfig replaces the custom config snapshot used by later builds.
+// The service calls it after validating the file for this kernel; a kernel
+// that is rolled back keeps the snapshot it was running with.
+func (s *SingBox) SetCustomConfig(data map[string]any) {
+	s.mu.Lock()
+	s.cfg.CustomConfigData = data
+	s.mu.Unlock()
 }
 
 // CheckConfig checks generated configuration without binding the proxy listener.
 func (s *SingBox) CheckConfig(spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	instance, err := s.buildBox(include.Context(ctx), spec, users, tls)
+	instance, _, err := s.buildBox(include.Context(ctx), spec, users, tls)
 	if err != nil {
 		return err
 	}
 	_ = instance.Close()
+	return nil
+}
+
+// CanReplaceInPlace reports whether Start can bring up spec while the running
+// instance keeps serving. sing-box cannot bind a port twice, and a config with
+// exclusive resources cannot run twice at all.
+func (s *SingBox) CanReplaceInPlace(spec *model.NodeSpec) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.box == nil {
+		return true
+	}
+	if s.exclusive || s.released || s.nodeConfig == nil {
+		return false
+	}
+	// Generated sing-box inbounds bind the wildcard address.
+	return spec.ServerPort != s.nodeConfig.ServerPort
+}
+
+// ReleaseListeners stops accepting new connections on the running instance
+// without waiting for existing ones, so a replacement can bind the same
+// ports. The next Start retires the released instance and drains it in the
+// background. It reports false, and releases nothing, when the instance owns
+// other resources a replacement cannot share; the caller must Stop instead.
+// A released instance must only be replaced or stopped.
+func (s *SingBox) ReleaseListeners() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.box == nil || s.ctx == nil || s.exclusive {
+		return false
+	}
+	s.releaseListenersLocked()
+	return true
+}
+
+func (s *SingBox) releaseListenersLocked() {
+	if s.released {
+		return
+	}
+	if im := service.FromContext[adapter.InboundManager](s.ctx); im != nil {
+		_ = im.Close()
+	}
+	s.released = true
+}
+
+// parseOptionsLocked builds and parses the config for spec in the running
+// box's context. Requires s.mu.
+func (s *SingBox) parseOptionsLocked(spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) (M, option.Options, error) {
+	cfgMap := buildConfig(s.cfg, spec, users, tls)
+	data, err := json.Marshal(cfgMap)
+	if err != nil {
+		return nil, option.Options{}, fmt.Errorf("marshal config: %w", err)
+	}
+	opts, err := singJSON.UnmarshalExtendedContext[option.Options](s.ctx, data)
+	if err != nil {
+		return nil, option.Options{}, fmt.Errorf("parse options: %w", err)
+	}
+	return cfgMap, opts, nil
+}
+
+// updateInboundUsers swaps an inbound's users in place when it supports it.
+func updateInboundUsers(existing adapter.Inbound, inb option.Inbound) (bool, error) {
+	switch v := existing.(type) {
+	case adapter.UpdatableInbound[option.VMessUser]:
+		if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
+			return true, v.UpdateUsers(opts.Users)
+		}
+	case adapter.UpdatableInbound[option.VLESSUser]:
+		if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
+			return true, v.UpdateUsers(opts.Users)
+		}
+	case adapter.UpdatableInbound[option.TrojanUser]:
+		if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
+			return true, v.UpdateUsers(opts.Users)
+		}
+	case adapter.UpdatableInbound[option.Hysteria2User]:
+		if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
+			return true, v.UpdateUsers(opts.Users)
+		}
+	case adapter.UpdatableShadowsocksInbound:
+		if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
+			return true, v.UpdateUsersByOptions(opts.Users)
+		}
+	case adapter.UpdatableInbound[option.TUICUser]:
+		if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
+			return true, v.UpdateUsers(opts.Users)
+		}
+	case adapter.UpdatableInbound[option.AnyTLSUser]:
+		if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
+			return true, v.UpdateUsers(opts.Users)
+		}
+	case adapter.UpdatableInbound[option.MieruUser]:
+		if opts, ok := inb.Options.(*option.MieruInboundOptions); ok {
+			return true, v.UpdateUsers(opts.Users)
+		}
+	case adapter.UpdatableInbound[auth.User]:
+		switch opts := inb.Options.(type) {
+		case *option.NaiveInboundOptions:
+			return true, v.UpdateUsers(opts.Users)
+		case *option.SocksInboundOptions:
+			return true, v.UpdateUsers(opts.Users)
+		case *option.HTTPMixedInboundOptions:
+			return true, v.UpdateUsers(opts.Users)
+		}
+	}
+	return false, nil
+}
+
+func inboundTags(inbounds []option.Inbound) map[string]string {
+	tags := make(map[string]string, len(inbounds))
+	for _, inb := range inbounds {
+		tags[inb.Tag] = inb.Type
+	}
+	return tags
+}
+
+type createdInboundKey struct{}
+
+// reloadInboundRegistry gives a hot-reload caller ownership of the candidate
+// if the inbound manager fails to start it before registering it.
+type reloadInboundRegistry struct{ adapter.InboundRegistry }
+
+func (r reloadInboundRegistry) Create(ctx context.Context, router adapter.Router, logger singLog.ContextLogger, tag, kind string, options any) (adapter.Inbound, error) {
+	inbound, err := r.InboundRegistry.Create(ctx, router, logger, tag, kind, options)
+	if created, ok := ctx.Value(createdInboundKey{}).(*adapter.Inbound); ok {
+		*created = inbound
+	}
+	return inbound, err
+}
+
+// applyInboundsLocked brings the running inbounds to next. Inbounds are
+// updated in place when recreate is false and they support it; otherwise
+// they are removed and recreated (a TCP listener cannot be swapped
+// atomically). If any step fails, every inbound already touched is put back
+// to prev. If restoration also fails, stop accepting on the broken instance.
+// Requires s.mu.
+func (s *SingBox) applyInboundsLocked(next, prev []option.Inbound, recreate bool, unchanged map[string]bool) error {
+	im := service.FromContext[adapter.InboundManager](s.ctx)
+	router := service.FromContext[adapter.Router](s.ctx)
+	if im == nil || router == nil {
+		return fmt.Errorf("inbound manager or router not available")
+	}
+	nopFactory := singLog.NewNOPFactory()
+	apply := func(inb option.Inbound, inPlace bool) error {
+		if inPlace {
+			if existing, ok := im.Get(inb.Tag); ok && existing.Type() == inb.Type {
+				handled, err := updateInboundUsers(existing, inb)
+				if handled && err == nil {
+					return nil
+				}
+				if err != nil {
+					nlog.Core().Warn("incremental update failed, recreating inbound", "tag", inb.Tag, "error", err)
+				}
+			}
+		}
+		_ = im.Remove(inb.Tag) // ignore error when tag doesn't exist yet
+		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, inb.Tag))
+		var created adapter.Inbound
+		ctx := context.WithValue(s.ctx, createdInboundKey{}, &created)
+		err := im.Create(ctx, router, logger, inb.Tag, inb.Type, inb.Options)
+		if err != nil && created != nil {
+			_ = created.Close()
+		}
+		return err
+	}
+	previous := make(map[string]option.Inbound, len(prev))
+	for _, inb := range prev {
+		previous[inb.Tag] = inb
+	}
+	for i, inb := range next {
+		if unchanged[inb.Tag] {
+			// Identical config: nothing to do. Inbounds without in-place user
+			// updates (Hysteria v1) would otherwise be recreated for nothing,
+			// closing every QUIC session on their socket.
+			continue
+		}
+		err := apply(inb, !recreate)
+		if err == nil {
+			continue
+		}
+		var restoreErr error
+		for _, touched := range next[:i+1] {
+			if unchanged[touched.Tag] {
+				continue
+			}
+			if old, ok := previous[touched.Tag]; ok {
+				restoreErr = errors.Join(restoreErr, apply(old, !recreate))
+			}
+		}
+		if restoreErr != nil {
+			s.releaseListenersLocked()
+			return fmt.Errorf("recreate inbound %s: %w; restore previous inbounds: %w", inb.Tag, err, restoreErr)
+		}
+		return fmt.Errorf("recreate inbound %s: %w", inb.Tag, err)
+	}
 	return nil
 }
 
@@ -246,9 +583,11 @@ func (s *SingBox) recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, o
 	nlog.Core().Debug("sing-box: old instance recycled")
 }
 
-// Reload hot-swaps the inbound users and routing rules without restarting the box.
-// Routes, outbounds, and the connTracker stay alive so in-flight connections
-// continue to be tracked correctly.
+// Reload hot-swaps the inbounds and route rules without restarting the box.
+// Outbounds and the connTracker stay alive so in-flight connections continue
+// to be tracked correctly. Any other change returns errRestartRequired
+// without touching the running box; the caller rebuilds instead. A failed
+// reload leaves the previous inbounds and rules in place.
 func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -256,107 +595,56 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	if s.box == nil {
 		return fmt.Errorf("not running")
 	}
+	if s.released {
+		return errRestartRequired
+	}
 
 	kernel.LogRealityTarget(nodeConfig, s.cfg.RealityTargets)
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
-	data, err := json.Marshal(cfgMap)
+	cfgMap, opts, err := s.parseOptionsLocked(nodeConfig, users, tls)
 	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+		return err
 	}
-
-	opts, err := singJSON.UnmarshalExtendedContext[option.Options](s.ctx, data)
+	prevMap, prevOpts, err := s.parseOptionsLocked(s.nodeConfig, s.users, s.tls)
 	if err != nil {
-		return fmt.Errorf("parse options: %w", err)
+		return err
 	}
-
-	im := service.FromContext[adapter.InboundManager](s.ctx)
-	if im == nil {
-		return fmt.Errorf("inbound manager not available")
+	// Inbounds and route rules can be swapped in place. Outbounds, DNS and the
+	// rest stay as built, so a change there needs a restart; so does a change
+	// in which inbounds exist (a protocol switch).
+	keys := keysOf(cfgMap)
+	if keys.shared != s.sharedKey || !maps.Equal(inboundTags(opts.Inbounds), inboundTags(prevOpts.Inbounds)) {
+		return errRestartRequired
 	}
-
-	router := service.FromContext[adapter.Router](s.ctx)
-	if router == nil {
-		return fmt.Errorf("router not available")
+	// Validate the complete config before touching the running box, so a
+	// rejected candidate leaves the running listeners exactly as they were.
+	checkCtx, checkCancel := context.WithCancel(context.Background())
+	check, _, err := s.buildBox(include.Context(checkCtx), nodeConfig, users, tls)
+	if err != nil {
+		checkCancel()
+		return err
 	}
+	_ = check.Close()
+	checkCancel()
 
-	// Update routing rules
-	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-		nlog.Core().Debug("routing reload failed", "error", err)
-	} else {
-		nlog.Core().Debug("sing-box routing reloaded")
+	// Recreate a listener only when the listener itself changed (port, TLS,
+	// transport, ...). Users are swapped in place, and a route-only change
+	// leaves the inbound alone, so QUIC sessions on its socket survive.
+	recreate := keys.inbounds != keysOf(prevMap).inbounds
+	unchanged := unchangedInbounds(cfgMap, prevMap)
+	if err := s.applyInboundsLocked(opts.Inbounds, prevOpts.Inbounds, recreate, unchanged); err != nil {
+		return err
 	}
-
-	nopFactory := singLog.NewNOPFactory()
-
-	// Configuration hash check for inbound reconstruction
-	tlsChanged := !bytes.Equal(s.tls.CertPEM, tls.CertPEM) || !bytes.Equal(s.tls.KeyPEM, tls.KeyPEM)
-	configChanged := tlsChanged || s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, users) != kernel.ComputeHash(s.nodeConfig, s.users)
-
-	for _, inb := range opts.Inbounds {
-		tag := inb.Tag
-		if !configChanged {
-			if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-				var err error
-				switch v := existing.(type) {
-				case adapter.UpdatableInbound[option.VMessUser]:
-					if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.VLESSUser]:
-					if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.TrojanUser]:
-					if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.Hysteria2User]:
-					if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableShadowsocksInbound:
-					if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
-						err = v.UpdateUsersByOptions(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.TUICUser]:
-					if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.AnyTLSUser]:
-					if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.MieruUser]:
-					if opts, ok := inb.Options.(*option.MieruInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[auth.User]:
-					switch opts := inb.Options.(type) {
-					case *option.NaiveInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					case *option.SocksInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					case *option.HTTPMixedInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					}
-				}
-				if err == nil {
-					continue
-				}
-				nlog.Core().Warn("incremental update failed, falling back to recreate", "tag", tag, "error", err)
+	if keys.route != s.routeKey {
+		router := service.FromContext[adapter.Router](s.ctx)
+		// UpdateRules swaps all rules or none.
+		if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
+			if restoreErr := s.applyInboundsLocked(prevOpts.Inbounds, opts.Inbounds, recreate, unchanged); restoreErr != nil {
+				s.releaseListenersLocked()
+				return fmt.Errorf("update route rules: %w; restore previous inbounds: %w", err, restoreErr)
 			}
+			return fmt.Errorf("update route rules: %w", err)
 		}
-
-		// Config mismatch or incremental update failure: Reconstruct Inbound.
-		// Remove the existing inbound first so im.Create() can bind the same port.
-		// im.Create() cannot atomically swap a TCP listener — it tries to start the
-		// new socket before the old one is closed, causing "address already in use".
-		// The brief listen gap (< 1 ms) is far less disruptive than a full restart.
-		_ = im.Remove(tag) // ignore error when tag doesn't exist yet
-		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
-		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
-			return fmt.Errorf("recreate inbound %s: %w", tag, err)
-		}
+		s.routeKey = keys.route
 	}
 
 	// Trackers remain registered on the Router (which survives ReloadUsers).
@@ -395,7 +683,7 @@ func (s *SingBox) Stop() {
 func (s *SingBox) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.box != nil
+	return s.box != nil && !s.released
 }
 
 // connTrackerLocked returns the connTracker under a read-optimised lock.
@@ -447,6 +735,9 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	if s.box == nil {
 		return 0, fmt.Errorf("not running")
 	}
+	if s.released {
+		return 0, fmt.Errorf("listeners released")
+	}
 
 	existing := make(map[int]struct{}, len(s.users))
 	for _, u := range s.users {
@@ -479,6 +770,9 @@ func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	if s.box == nil {
 		return 0, fmt.Errorf("not running")
+	}
+	if s.released {
+		return 0, fmt.Errorf("listeners released")
 	}
 
 	removeSet := make(map[int]struct{}, len(users))
@@ -514,6 +808,9 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 	if s.box == nil {
 		return 0, 0, fmt.Errorf("not running")
 	}
+	if s.released {
+		return 0, 0, fmt.Errorf("listeners released")
+	}
 
 	toAdd, toRemove := kernel.UserDiff(s.users, users)
 	added, removed = len(toAdd), len(toRemove)
@@ -539,87 +836,16 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 // reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
 // Must be called with s.mu held.
 func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
-	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls)
-	data, err := json.Marshal(cfgMap)
+	cfgMap, opts, err := s.parseOptionsLocked(s.nodeConfig, users, s.tls)
 	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+		return err
 	}
-
-	opts, err := singJSON.UnmarshalExtendedContext[option.Options](s.ctx, data)
+	prevMap, prevOpts, err := s.parseOptionsLocked(s.nodeConfig, s.users, s.tls)
 	if err != nil {
-		return fmt.Errorf("parse options: %w", err)
+		return err
 	}
-
-	im := service.FromContext[adapter.InboundManager](s.ctx)
-	if im == nil {
-		return fmt.Errorf("inbound manager not available")
-	}
-
-	router := service.FromContext[adapter.Router](s.ctx)
-	if router == nil {
-		return fmt.Errorf("router not available")
-	}
-
-	nopFactory := singLog.NewNOPFactory()
-
-	for _, inb := range opts.Inbounds {
-		tag := inb.Tag
-		if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-			var err error
-			switch v := existing.(type) {
-			case adapter.UpdatableInbound[option.VMessUser]:
-				if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.VLESSUser]:
-				if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.TrojanUser]:
-				if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.Hysteria2User]:
-				if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableShadowsocksInbound:
-				if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
-					err = v.UpdateUsersByOptions(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.TUICUser]:
-				if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.AnyTLSUser]:
-				if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.MieruUser]:
-				if opts, ok := inb.Options.(*option.MieruInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[auth.User]:
-				switch opts := inb.Options.(type) {
-				case *option.NaiveInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				case *option.SocksInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				case *option.HTTPMixedInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				}
-			}
-			if err == nil {
-				continue
-			}
-			nlog.Core().Warn("incremental update failed, recreating inbound", "tag", tag, "error", err)
-		}
-
-		_ = im.Remove(tag)
-		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
-		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
-			return fmt.Errorf("recreate inbound %s: %w", tag, err)
-		}
+	if err := s.applyInboundsLocked(opts.Inbounds, prevOpts.Inbounds, false, unchangedInbounds(cfgMap, prevMap)); err != nil {
+		return err
 	}
 
 	if s.connTracker != nil {

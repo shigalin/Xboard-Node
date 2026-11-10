@@ -25,15 +25,17 @@ build-all: build-linux build-linux-arm64
 # Run tests
 # ./... rather than ./internal/...: cmd/ holds tests too (e.g. the xbctl
 # config write-back regression) and they must not be skipped.
+# -p 1: several packages start kernels on ports they probed as free; run in
+# parallel, one package can take a port between another's probe and its bind.
 test:
-	go test -v -race -count=1 ./...
+	go test -v -race -count=1 -p 1 ./...
 
 # Run tests that need the kernel build tags (e.g. the REALITY integration test,
 # which starts both kernels and requires with_utls).
 # No -race here: it enables checkptr, and sing-vmess' Vision connection does
 # unsafe pointer arithmetic that checkptr aborts the process on.
 test-tagged:
-	go test -count=1 -tags "with_quic with_utls with_wireguard with_clash_api" ./...
+	go test -count=1 -p 1 -tags "with_quic with_utls with_wireguard with_clash_api" ./...
 
 # Clean build artifacts
 clean:

@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -175,5 +176,29 @@ func TestNodeMailboxCoalescesDeviceBansIndependentlyFromIPSnapshots(t *testing.T
 	}
 	if next := mb.DrainIfReady(); next.DeviceBans != nil {
 		t.Fatal("drained bans were retained")
+	}
+}
+
+func TestNodeMailboxInvalidConfigWithdrawsBufferedCandidate(t *testing.T) {
+	mb := NewNodeMailbox()
+	candidate := &model.NodeSpec{Protocol: "vless", ServerPort: 10020}
+	mb.Apply(Event{Type: EventSyncConfig, Config: candidate})
+	mb.Apply(Event{Type: EventSyncConfig, ConfigErr: errors.New("translate node config: unsupported")})
+
+	mb.MarkReady()
+	state := mb.DrainIfReady()
+	if state.HasConfig || state.Config != nil {
+		t.Fatalf("withdrawn candidate was still delivered: %+v", state.Config)
+	}
+	if state.ConfigErr == nil {
+		t.Fatal("invalid config was not reported")
+	}
+
+	// A later valid config clears the error.
+	replacement := &model.NodeSpec{Protocol: "vless", ServerPort: 10030}
+	mb.Apply(Event{Type: EventSyncConfig, Config: replacement})
+	state = mb.DrainIfReady()
+	if state.ConfigErr != nil || !state.HasConfig || state.Config.ServerPort != 10030 {
+		t.Fatalf("valid config after an invalid one was not delivered cleanly: %+v err=%v", state.Config, state.ConfigErr)
 	}
 }

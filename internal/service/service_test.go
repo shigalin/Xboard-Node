@@ -18,8 +18,13 @@ type fakeKernel struct {
 	running bool
 
 	startErr  error
-	updateErr error
-	addErr    error
+	reloadErr error
+	// startHook, when set, decides each Start's result instead of startErr.
+	startHook   func(*model.NodeSpec, []model.UserSpec) error
+	reloadCalls int
+	lastStart   *model.NodeSpec
+	updateErr   error
+	addErr      error
 
 	startCalls  int
 	updateCalls int
@@ -32,6 +37,14 @@ type fakeKernel struct {
 
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
+
+	customConfig     map[string]any
+	customConfigSets int
+}
+
+func (f *fakeKernel) SetCustomConfig(data map[string]any) {
+	f.customConfig = data
+	f.customConfigSets++
 }
 
 func (f *fakeKernel) Name() string                      { return "fake" }
@@ -40,17 +53,23 @@ func (f *fakeKernel) Capabilities() kernel.Capabilities { return kernel.Capabili
 func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
 	f.startCalls++
-	if f.startErr != nil {
+	if f.startHook != nil {
+		if err := f.startHook(nodeConfig, users); err != nil {
+			return err
+		}
+	} else if f.startErr != nil {
 		return f.startErr
 	}
 	f.running = true
+	f.lastStart = nodeConfig
 	return nil
 }
 func (f *fakeKernel) Stop()           { f.running = false }
 func (f *fakeKernel) IsRunning() bool { return f.running }
 func (f *fakeKernel) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
-	return nil
+	f.reloadCalls++
+	return f.reloadErr
 }
 func (f *fakeKernel) AddUsers(users []model.UserSpec) (int, error) {
 	f.addCalls++
@@ -154,8 +173,13 @@ func TestApplyUserUpdateRestoresStateWhenKernelAndRestartFail(t *testing.T) {
 	newUsers := []model.UserSpec{{ID: 2, UUID: "uuid-new", SpeedLimit: 8}}
 	s.applyUserUpdate(context.Background(), newUsers, computeUserHash(newUsers))
 
+	// The rebuild tries to replace the listener in place. When that fails the
+	// running kernel is left alone: stopping it would not help the new config.
 	if got := k.startCalls; got != 1 {
 		t.Fatalf("Start call count = %d, want 1", got)
+	}
+	if !k.IsRunning() {
+		t.Fatal("failed in-place rebuild stopped the running kernel")
 	}
 	if len(s.lastUsers) != 1 || s.lastUsers[0].UUID != "uuid-old" {
 		t.Fatalf("lastUsers = %#v, want restored old users", s.lastUsers)

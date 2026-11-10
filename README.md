@@ -61,7 +61,10 @@ Legacy single-panel config is fully compatible. Appending bindings auto-migrates
 
 For panel-backed nodes, Hysteria (v1 and v2) always runs on `singbox` and XHTTP/SplitHTTP
 always runs on `xray`, regardless of `kernel.type`. A switch restarts the
-listener; kernel-native custom configs must match the selected kernel.
+listener. Use a `kernel.custom_config` file written for the selected kernel.
+When applying a config or starting a kernel, the node rejects recognized
+foreign options such as `route`, `routing`, and kernel-specific DNS fields.
+Edits to the file take effect on the next config apply or kernel start.
 
 ### REALITY destinations selected by panel SNI list (Xray)
 

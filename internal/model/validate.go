@@ -21,10 +21,17 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 		return fmt.Errorf("normalize kernel type: %w", err)
 	}
 
-	additionalOutboundSources, err := collectAdditionalOutboundTagSources(kcfg.CustomConfig, kcfg.CustomOutbound)
-	if err != nil {
-		return fmt.Errorf("collect additional outbound tags: %w", err)
+	customConfig := kcfg.CustomConfigData
+	if customConfig == nil {
+		customConfig, err = decodeCustomConfig(kcfg.CustomConfig)
+		if err != nil {
+			return fmt.Errorf("collect additional outbound tags: %w", err)
+		}
 	}
+	if err := validateCustomConfigKernel(kcfg.CustomConfig, customConfig, kernelType); err != nil {
+		return err
+	}
+	additionalOutboundSources := collectAdditionalOutboundTagSources(customConfig, kcfg.CustomOutbound)
 	if err := validateOutboundTagCollisions(n.CustomOutbounds, additionalOutboundSources); err != nil {
 		return fmt.Errorf("validate outbound tags: %w", err)
 	}

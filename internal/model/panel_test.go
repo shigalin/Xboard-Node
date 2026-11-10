@@ -129,3 +129,16 @@ func TestNodeSpecFromPanelValidatedChecksSelectedKernelOutbounds(t *testing.T) {
 		t.Fatalf("expected selected Xray kernel to reject hysteria2 outbound, got %v", err)
 	}
 }
+
+func TestNodeSpecFromPanelBandwidthIsServerSide(t *testing.T) {
+	nc := &panel.NodeConfig{Protocol: "hysteria", Version: 2, ServerPort: 443, UpMbps: 20, DownMbps: 100}
+	spec := NodeSpecFromPanel(nc)
+	// Panel: client uploads 20, downloads 100. Server: uploads 100, downloads 20.
+	if spec.UpMbps != 100 || spec.DownMbps != 20 {
+		t.Fatalf("server-side bandwidth = up %d / down %d, want up 100 / down 20", spec.UpMbps, spec.DownMbps)
+	}
+	back := spec.ToPanel()
+	if back.UpMbps != 20 || back.DownMbps != 100 {
+		t.Fatalf("ToPanel did not restore the client's side: up %d / down %d", back.UpMbps, back.DownMbps)
+	}
+}

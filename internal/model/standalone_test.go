@@ -47,3 +47,17 @@ func TestNodeSpecFromStandalone(t *testing.T) {
 		t.Fatalf("users: %#v", users)
 	}
 }
+
+func TestNodeSpecFromStandaloneKeepsServerSideBandwidth(t *testing.T) {
+	cfg := &config.Config{
+		Kernel: config.KernelConfig{Type: "singbox"},
+		Standalone: &config.StandaloneConfig{Enabled: true, Node: config.StandaloneNodeConfig{
+			Protocol: "hysteria", Version: 1, ServerPort: 443, UpMbps: 20, DownMbps: 100,
+		}},
+	}
+	spec := NodeSpecFromStandalone(cfg)
+	// A standalone config already describes the server: no direction swap.
+	if spec.UpMbps != 20 || spec.DownMbps != 100 {
+		t.Fatalf("standalone bandwidth changed: up %d / down %d, want up 20 / down 100", spec.UpMbps, spec.DownMbps)
+	}
+}

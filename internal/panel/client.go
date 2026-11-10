@@ -446,6 +446,13 @@ func (c *Client) PushStatus(cpu float64, mem, swap, disk [2]uint64) error {
 	return c.postJSON("/api/v1/server/UniProxy/status", payload)
 }
 
+// ForgetUserETag makes the next user request unconditional, so the panel
+// sends its full current list even if it has not changed since the last one.
+// Not safe to call while a poll is using the client.
+func (c *Client) ForgetUserETag() {
+	c.userETag = ""
+}
+
 // ResetETags clears cached ETags, forcing full responses
 func (c *Client) ResetETags() {
 	c.configETag = ""

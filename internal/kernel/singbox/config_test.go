@@ -2,7 +2,10 @@ package singbox
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -336,6 +339,27 @@ func TestBuildInbound_Hysteria2(t *testing.T) {
 
 	tls := inbound["tls"].(M)
 	assertMapValue(t, tls, "enabled", true)
+	if alpn, ok := tls["alpn"].([]string); !ok || len(alpn) != 1 || alpn[0] != "h3" {
+		t.Fatalf("hysteria2 alpn = %v, want [h3]", tls["alpn"])
+	}
+	if _, ok := inbound["up_mbps"]; ok {
+		t.Fatal("up_mbps emitted without a panel value")
+	}
+}
+
+func TestBuildInbound_Hysteria2_Bandwidth(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "hysteria",
+		ServerPort: 444,
+		Version:    2,
+		UpMbps:     100,
+		DownMbps:   200,
+	}
+	inbound := buildInbound(testNodeSpec(nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	assertMapValue(t, inbound, "type", "hysteria2")
+	// Panel values are the client's up/down; the inbound's up is the server's send rate.
+	assertMapValue(t, inbound, "up_mbps", 200)
+	assertMapValue(t, inbound, "down_mbps", 100)
 }
 
 func TestBuildInbound_Hysteria2_WithObfs(t *testing.T) {
@@ -362,11 +386,30 @@ func TestBuildInbound_Hysteria1(t *testing.T) {
 	}
 	inbound := buildInbound(testNodeSpec(nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
 	assertMapValue(t, inbound, "type", "hysteria")
-	assertMapValue(t, inbound, "up_mbps", 100)
-	assertMapValue(t, inbound, "down_mbps", 200)
+	assertMapValue(t, inbound, "up_mbps", 200)
+	assertMapValue(t, inbound, "down_mbps", 100)
 
 	users := inbound["users"].([]M)
 	assertMapValue(t, users[0], "auth_str", "aaaaaaaa-1111-2222-3333-444444444444")
+
+	tls := inbound["tls"].(M)
+	if alpn, ok := tls["alpn"].([]string); !ok || len(alpn) != 1 || alpn[0] != "hysteria" {
+		t.Fatalf("hysteria v1 alpn = %v, want [hysteria]", tls["alpn"])
+	}
+}
+
+func TestBuildInbound_Hysteria1_PanelALPNWins(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:    "hysteria",
+		ServerPort:  444,
+		Version:     1,
+		TLSSettings: map[string]interface{}{"alpn": []string{"custom"}},
+	}
+	inbound := buildInbound(testNodeSpec(nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	tls := inbound["tls"].(M)
+	if alpn, ok := tls["alpn"].([]string); !ok || len(alpn) != 1 || alpn[0] != "custom" {
+		t.Fatalf("panel alpn overridden: %v", tls["alpn"])
+	}
 }
 
 // --- TUIC ---
@@ -885,5 +928,20 @@ func TestExtractECHInbound(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMergeCustomSingbox_UsesServiceSnapshotOverFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "custom.json")
+	if err := os.WriteFile(path, []byte(`{"route":{"rules":[{"domain_suffix":["from-file.example"],"action":"reject"}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kcfg := config.KernelConfig{Type: "singbox", CustomConfig: path, CustomConfigData: map[string]any{
+		"route": map[string]any{"rules": []any{map[string]any{"domain_suffix": []any{"from-snapshot.example"}, "action": "reject"}}},
+	}}
+	cfg := buildConfig(kcfg, testNodeSpec(&panel.NodeConfig{Protocol: "vless", ServerPort: 443}), testUsers, kernel.TLSCert{})
+	data, _ := json.Marshal(cfg)
+	if !strings.Contains(string(data), "from-snapshot.example") || strings.Contains(string(data), "from-file.example") {
+		t.Fatalf("expected the service snapshot to be merged instead of the file, got %s", data)
 	}
 }

@@ -40,6 +40,8 @@ func NewMachinePanelControlPlane(
 	}
 }
 
+func (p *MachinePanelControlPlane) ForgetUserETag() { p.client.ForgetUserETag() }
+
 func (p *MachinePanelControlPlane) SupportsPolling() bool       { return true }
 func (p *MachinePanelControlPlane) SupportsDiscovery() bool     { return false }
 func (p *MachinePanelControlPlane) SupportsReporting() bool     { return true }
@@ -114,13 +116,11 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, ctx.Err()
 	default:
 	}
-	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll normalize: %w", err)
-	}
-	snapshot := Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}
+	snapshot := Snapshot{Users: model.UserSpecsFromPanel(users)}
 	if configSnapshot == nil {
-		snapshot.CurrentConfig = cachedConfig(p.client, p.kcfg)
+		snapshot.CurrentConfig, snapshot.CurrentConfigErr = cachedConfig(p.client, p.kcfg)
+	} else {
+		snapshot.Config, snapshot.CurrentConfig, snapshot.CurrentConfigErr = resolveConfig(configSnapshot, p.kcfg)
 	}
 	return snapshot, nil
 }

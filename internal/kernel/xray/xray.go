@@ -251,10 +251,28 @@ func parseConfig(cfgMap M) (*xrayCore.Config, error) {
 	return cfg, nil
 }
 
+// SetCustomConfig replaces the custom config snapshot used by later builds.
+// The service calls it after validating the file for this kernel; a kernel
+// that is rolled back keeps the snapshot it was running with.
+func (x *Xray) SetCustomConfig(data map[string]any) {
+	x.mu.Lock()
+	x.cfg.CustomConfigData = data
+	x.mu.Unlock()
+}
+
 // CheckConfig checks generated configuration without binding the proxy listener.
 func (x *Xray) CheckConfig(spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	x.ensureGeoData(spec)
-	_, err := parseConfig(buildConfig(x.cfg, spec, users, tls))
+	cfg := buildConfig(x.cfg, spec, users, tls)
+	reality, names, targets, err := resolveRealitySNIRouting(cfg, spec, x.cfg.RealityTargets)
+	if err != nil {
+		return err
+	}
+	if reality != nil {
+		reality["dest"] = targets[names[0]]
+		reality["serverNames"] = names
+	}
+	_, err = parseConfig(cfg)
 	return err
 }
 

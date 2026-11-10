@@ -150,6 +150,13 @@ type KernelConfig struct {
 	// Compatible with V2bX OriginalPath format.
 	CustomConfig string `yaml:"custom_config"`
 
+	// CustomConfigData is the decoded content of CustomConfig as it was
+	// loaded and validated by the service. When set (an empty map means "no
+	// file"), kernels merge this snapshot instead of reading CustomConfig
+	// from disk, so a kernel restart or rollback reuses exactly the content
+	// it was validated with. Runtime only; never read from YAML.
+	CustomConfigData map[string]any `yaml:"-"`
+
 	// RealityTargetsFile is the path to an SNI -> loopback host:port mapping.
 	// Overridden by the realityTargetsFile / REALITY_TARGETS_FILE env vars.
 	// Leaving it empty disables the feature.

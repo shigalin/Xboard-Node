@@ -87,33 +87,36 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 	}
 
 	return &NodeSpec{
-		Protocol:            nc.Protocol,
-		ListenIP:            nc.ListenIP,
-		ServerPort:          nc.ServerPort,
-		Network:             nc.Network,
-		NetworkSettings:     cloneAnyMap(nc.NetworkSettings),
-		Routes:              routes,
-		KernelType:          nc.KernelType,
-		KernelLogLevel:      nc.KernelLogLevel,
-		CustomOutbounds:     outbounds,
-		CustomRoutes:        cloneMapSlice(nc.CustomRoutes),
-		CustomRouteRules:    customRouteRules,
-		CertConfig:          certCfg,
-		AutoTLS:             nc.AutoTLS,
-		Domain:              nc.Domain,
-		Cipher:              nc.Cipher,
-		Plugin:              nc.Plugin,
-		PluginOpt:           nc.PluginOpt,
-		ServerKey:           nc.ServerKey,
-		TLS:                 nc.TLS,
-		Flow:                nc.Flow,
-		Decryption:          nc.Decryption,
-		TLSSettings:         cloneAnyMap(nc.TLSSettings),
-		Host:                nc.Host,
-		ServerName:          nc.ServerName,
-		Version:             nc.Version,
-		UpMbps:              nc.UpMbps,
-		DownMbps:            nc.DownMbps,
+		Protocol:         nc.Protocol,
+		ListenIP:         nc.ListenIP,
+		ServerPort:       nc.ServerPort,
+		Network:          nc.Network,
+		NetworkSettings:  cloneAnyMap(nc.NetworkSettings),
+		Routes:           routes,
+		KernelType:       nc.KernelType,
+		KernelLogLevel:   nc.KernelLogLevel,
+		CustomOutbounds:  outbounds,
+		CustomRoutes:     cloneMapSlice(nc.CustomRoutes),
+		CustomRouteRules: customRouteRules,
+		CertConfig:       certCfg,
+		AutoTLS:          nc.AutoTLS,
+		Domain:           nc.Domain,
+		Cipher:           nc.Cipher,
+		Plugin:           nc.Plugin,
+		PluginOpt:        nc.PluginOpt,
+		ServerKey:        nc.ServerKey,
+		TLS:              nc.TLS,
+		Flow:             nc.Flow,
+		Decryption:       nc.Decryption,
+		TLSSettings:      cloneAnyMap(nc.TLSSettings),
+		Host:             nc.Host,
+		ServerName:       nc.ServerName,
+		Version:          nc.Version,
+		// The panel states Hysteria bandwidth from the client's side (the same
+		// values go into client configs). NodeSpec, like a standalone config,
+		// states the server's own bandwidth: its upload is the client's download.
+		UpMbps:              nc.DownMbps,
+		DownMbps:            nc.UpMbps,
 		Obfs:                nc.Obfs,
 		ObfsPassword:        nc.ObfsPassword,
 		CongestionControl:   nc.CongestionControl,
@@ -125,7 +128,9 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 	}
 }
 
-func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) (*NodeSpec, error) {
+// NodeSpecFromPanelResolved normalizes a panel config and selects its kernel
+// without validating it. The returned kernel config names the selected kernel.
+func NodeSpecFromPanelResolved(nc *panel.NodeConfig, kcfg config.KernelConfig) (*NodeSpec, config.KernelConfig) {
 	spec := NodeSpecFromPanel(nc)
 	if spec != nil {
 		// Both panel spellings describe the same Hysteria v2 inbound.
@@ -140,6 +145,11 @@ func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) 
 		kcfg.Type = ResolveKernelForNode(spec, preferred)
 		spec.KernelType = kcfg.Type
 	}
+	return spec, kcfg
+}
+
+func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) (*NodeSpec, error) {
+	spec, kcfg := NodeSpecFromPanelResolved(nc, kcfg)
 	if err := ValidateNodeSpec(spec, kcfg); err != nil {
 		return nil, err
 	}
@@ -239,33 +249,34 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 	}
 
 	return &panel.NodeConfig{
-		Protocol:            n.Protocol,
-		ListenIP:            n.ListenIP,
-		ServerPort:          n.ServerPort,
-		Network:             n.Network,
-		NetworkSettings:     cloneAnyMap(n.NetworkSettings),
-		Routes:              routes,
-		KernelType:          n.KernelType,
-		KernelLogLevel:      n.KernelLogLevel,
-		CustomOutbounds:     outbounds,
-		CustomRoutes:        cloneMapSlice(n.CustomRoutes),
-		CustomRouteRules:    customRouteRules,
-		CertConfig:          certCfg,
-		AutoTLS:             n.AutoTLS,
-		Domain:              n.Domain,
-		Cipher:              n.Cipher,
-		Plugin:              n.Plugin,
-		PluginOpt:           n.PluginOpt,
-		ServerKey:           n.ServerKey,
-		TLS:                 n.TLS,
-		Flow:                n.Flow,
-		Decryption:          n.Decryption,
-		TLSSettings:         cloneAnyMap(n.TLSSettings),
-		Host:                n.Host,
-		ServerName:          n.ServerName,
-		Version:             n.Version,
-		UpMbps:              n.UpMbps,
-		DownMbps:            n.DownMbps,
+		Protocol:         n.Protocol,
+		ListenIP:         n.ListenIP,
+		ServerPort:       n.ServerPort,
+		Network:          n.Network,
+		NetworkSettings:  cloneAnyMap(n.NetworkSettings),
+		Routes:           routes,
+		KernelType:       n.KernelType,
+		KernelLogLevel:   n.KernelLogLevel,
+		CustomOutbounds:  outbounds,
+		CustomRoutes:     cloneMapSlice(n.CustomRoutes),
+		CustomRouteRules: customRouteRules,
+		CertConfig:       certCfg,
+		AutoTLS:          n.AutoTLS,
+		Domain:           n.Domain,
+		Cipher:           n.Cipher,
+		Plugin:           n.Plugin,
+		PluginOpt:        n.PluginOpt,
+		ServerKey:        n.ServerKey,
+		TLS:              n.TLS,
+		Flow:             n.Flow,
+		Decryption:       n.Decryption,
+		TLSSettings:      cloneAnyMap(n.TLSSettings),
+		Host:             n.Host,
+		ServerName:       n.ServerName,
+		Version:          n.Version,
+		// Inverse of NodeSpecFromPanel: back to the client's side.
+		UpMbps:              n.DownMbps,
+		DownMbps:            n.UpMbps,
 		Obfs:                n.Obfs,
 		ObfsPassword:        n.ObfsPassword,
 		CongestionControl:   n.CongestionControl,

@@ -6,9 +6,23 @@ import (
 	"os"
 	"strings"
 
+	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"gopkg.in/yaml.v3"
 )
+
+// ResolveCustomConfig returns the custom config a kernel should merge: the
+// snapshot the service loaded into kcfg when present, otherwise the file at
+// kcfg.CustomConfig. A nil result means there is nothing to merge.
+func ResolveCustomConfig(kcfg config.KernelConfig) (map[string]any, error) {
+	if kcfg.CustomConfigData != nil {
+		if len(kcfg.CustomConfigData) == 0 {
+			return nil, nil
+		}
+		return kcfg.CustomConfigData, nil
+	}
+	return LoadCustomConfig(kcfg.CustomConfig)
+}
 
 // LoadCustomConfig reads a custom config file (JSON or YAML) and returns it
 // as a generic map. Returns nil if path is empty or file does not exist.

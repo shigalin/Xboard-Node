@@ -90,16 +90,16 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, ctx.Err()
 	default:
 	}
-	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
-	}
-	snapshot := Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}
+	snapshot := Snapshot{Users: model.UserSpecsFromPanel(users)}
 	if configSnapshot == nil {
-		snapshot.CurrentConfig = cachedConfig(p.client, p.kcfg)
+		snapshot.CurrentConfig, snapshot.CurrentConfigErr = cachedConfig(p.client, p.kcfg)
+	} else {
+		snapshot.Config, snapshot.CurrentConfig, snapshot.CurrentConfigErr = resolveConfig(configSnapshot, p.kcfg)
 	}
 	return snapshot, nil
 }
+
+func (p *PanelControlPlane) ForgetUserETag() { p.client.ForgetUserETag() }
 
 func (p *PanelControlPlane) FetchDevices(ctx context.Context) (map[int][]string, error) {
 	select {
@@ -190,9 +190,11 @@ func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, err
 	translated := Event{Type: EventType(event.Type), DeltaAction: event.DeltaAction, DeviceUsers: event.DeviceUsers, DeviceBans: event.DeviceBans}
 	if event.Config != nil {
 		var err error
-		translated.Config, err = model.NodeSpecFromPanelValidated(event.Config, kcfg)
+		translated.Config, _, err = resolveConfig(event.Config, kcfg)
 		if err != nil {
-			return Event{}, fmt.Errorf("translate node config: %w", err)
+			// The service must still learn that the panel moved on: an
+			// earlier candidate is stale even though this one is unusable.
+			translated.ConfigErr = fmt.Errorf("translate node config: %w", err)
 		}
 	}
 	if event.Users != nil {
@@ -210,16 +212,29 @@ func (p *panelPushClient) SendDeviceReport(devices map[int][]string, sequence in
 	return p.inner.SendDeviceReport(devices, sequence)
 }
 
+// resolveConfig normalizes a panel config for the selected kernel. A valid
+// config is returned as applicable; one that fails validation is returned
+// as the config the panel currently serves, together with the error, so the
+// caller can tell that the panel replaced its config with one this node
+// cannot run.
+func resolveConfig(nc *panel.NodeConfig, kcfg config.KernelConfig) (applicable, current *model.NodeSpec, err error) {
+	spec, kcfg := model.NodeSpecFromPanelResolved(nc, kcfg)
+	if err := model.ValidateNodeSpec(spec, kcfg); err != nil {
+		return nil, spec, err
+	}
+	return spec, nil, nil
+}
+
 // cachedConfig resolves an HTTP 304 to the config behind the client's ETag.
-// A cached body that no longer normalizes is reported as unknown.
-func cachedConfig(client *panel.Client, kcfg config.KernelConfig) *model.NodeSpec {
+// A body that no longer decodes is reported as unknown.
+func cachedConfig(client *panel.Client, kcfg config.KernelConfig) (*model.NodeSpec, error) {
 	cached, err := client.CachedConfig()
 	if err != nil || cached == nil {
-		return nil
+		return nil, nil
 	}
-	spec, err := model.NodeSpecFromPanelValidated(cached, kcfg)
+	applicable, current, err := resolveConfig(cached, kcfg)
 	if err != nil {
-		return nil
+		return current, err
 	}
-	return spec
+	return applicable, nil
 }
