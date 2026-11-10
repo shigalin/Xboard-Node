@@ -241,17 +241,16 @@ func (m *DeviceManager) PendingDeviceBans() map[int]int64 {
 	return pending
 }
 
-// AcknowledgeDeviceBans runs after applying the panel response. A report still
-// pending at that point did not produce an active panel ban.
+// AcknowledgeDeviceBans runs after applying the panel response and stops
+// re-sending the delivered reports. A report the panel did not turn into an
+// active ban keeps its local cooldown: the panel compares deadlines against
+// its own clock, so a node whose clock differs cannot tell a refusal from skew.
 func (m *DeviceManager) AcknowledgeDeviceBans(reports map[int]int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for uid, until := range reports {
 		if m.pendingBans[uid] == until {
 			delete(m.pendingBans, uid)
-			if u := m.users[uid]; u != nil && !u.panelBan && u.banUntil.UnixMilli() == until {
-				u.banUntil = time.Time{}
-			}
 		}
 	}
 }

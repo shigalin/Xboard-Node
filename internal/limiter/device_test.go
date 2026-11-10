@@ -130,17 +130,36 @@ func TestDeviceBanClosesSessionsAcrossNodesUntilSharedDeadline(t *testing.T) {
 	}
 }
 
-func TestDeviceBanRejectedByPanelClearsProvisionalCooldown(t *testing.T) {
-	m, _ := testDeviceManager()
-	m.ApplyDeviceBans(map[int]int64{})
-	mustAcquire(t, m, 1, "192.0.2.1", 1)
-	if _, err := m.Acquire(1, "", "198.51.100.2", 1); !errors.Is(err, ErrDeviceLimit) {
-		t.Fatalf("over-limit connection: %v", err)
+// The panel judges reported deadlines by its own clock. A node whose clock is
+// off sees its report refused (node behind) or answered with a deadline that
+// has already passed locally (node ahead); neither may void the cooldown.
+func TestDeviceBanUnconfirmedByPanelKeepsLocalCooldown(t *testing.T) {
+	for name, response := range map[string]func(now time.Time) map[int]int64{
+		"refused":         func(time.Time) map[int]int64 { return map[int]int64{} },
+		"already expired": func(now time.Time) map[int]int64 { return map[int]int64{1: now.Add(-20 * time.Second).UnixMilli()} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, now := testDeviceManager()
+			m.ApplyDeviceBans(map[int]int64{})
+			mustAcquire(t, m, 1, "192.0.2.1", 1)
+			if _, err := m.Acquire(1, "", "198.51.100.2", 1); !errors.Is(err, ErrDeviceLimit) {
+				t.Fatalf("over-limit connection: %v", err)
+			}
+			report := m.PendingDeviceBans()
+			deadline := time.UnixMilli(report[1])
+			m.ApplyDeviceBans(response(*now))
+			m.AcknowledgeDeviceBans(report)
+			if len(m.PendingDeviceBans()) != 0 {
+				t.Fatal("a delivered report was queued again")
+			}
+			*now = deadline.Add(-time.Millisecond)
+			if _, err := m.Acquire(1, "", "192.0.2.1", 1); !errors.Is(err, ErrDeviceLimit) {
+				t.Fatalf("cooldown ended early: %v", err)
+			}
+			*now = deadline
+			mustAcquire(t, m, 1, "192.0.2.1", 1).Release()
+		})
 	}
-	report := m.PendingDeviceBans()
-	m.ApplyDeviceBans(map[int]int64{})
-	m.AcknowledgeDeviceBans(report)
-	mustAcquire(t, m, 1, "192.0.2.1", 1).Release()
 }
 
 func TestDevicesGlobalUnionAndFreshness(t *testing.T) {
