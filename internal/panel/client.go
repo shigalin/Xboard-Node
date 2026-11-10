@@ -238,6 +238,13 @@ func (c *Client) userPath() string {
 	return "/api/v1/server/UniProxy/user"
 }
 
+// InvalidConfigError means the panel returned a config body that could not be
+// decoded. A request failure does not establish what config the panel serves.
+type InvalidConfigError struct{ cause error }
+
+func (e *InvalidConfigError) Error() string { return e.cause.Error() }
+func (e *InvalidConfigError) Unwrap() error { return e.cause }
+
 // GetConfig fetches node configuration. Returns nil if not modified (304).
 func (c *Client) GetConfig() (*NodeConfig, error) {
 	resp, err := c.doRequest("GET", c.configPath(), nil, c.configETag)
@@ -258,13 +265,12 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	// Keep the actual response, including an invalid body, behind its ETag.
+	c.configETag, c.configBody = resp.Header.Get("ETag"), body
 	cfg, err := decodeNodeConfig(body)
 	if err != nil {
-		return nil, err
+		return nil, &InvalidConfigError{cause: err}
 	}
-
-	// Without an ETag the next request is unconditional, so no stale pair remains.
-	c.configETag, c.configBody = resp.Header.Get("ETag"), body
 	return cfg, nil
 }
 

@@ -66,6 +66,19 @@ When applying a config or starting a kernel, the node rejects recognized
 foreign options such as `route`, `routing`, and kernel-specific DNS fields.
 Edits to the file take effect on the next config apply or kernel start.
 
+In machine mode, use `nodes[].node_id` and `nodes[].kernel.custom_config`
+to supply a separate native file for a discovered node. Entries override the
+matching node's settings. The panel still controls which nodes are discovered.
+
+Hysteria v1 uses the `hysteria` ALPN by default. Update clients that explicitly
+set `h3`. Credential changes on a Hysteria v1 node rebuild its inbound and
+disconnect its current QUIC sessions. For panel-managed Hysteria nodes, the
+panel's download limit becomes the server's upload limit, and vice versa.
+Standalone bandwidth values are already server-side. Hysteria2 uses Brutal
+for server sends when the client advertises a nonzero receive rate. The
+server's upload limit caps that rate. A client advertising zero still uses
+the server's BBR path.
+
 ### REALITY destinations selected by panel SNI list (Xray)
 
 In the panel's existing REALITY **伪装站点(dest)** / SNI field, enter DNS names

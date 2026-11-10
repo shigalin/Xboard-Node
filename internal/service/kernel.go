@@ -98,31 +98,11 @@ func (s *Service) applyNodeConfig(ctx context.Context, spec *model.NodeSpec) err
 		s.kernel.Stop()
 	} else if s.kernel.IsRunning() {
 		if !unchanged {
-			// While an earlier attempt for this exact config is backing off, do
-			// not touch the running listener at all.
-			if s.rebuildDeferred(rebuildKey(spec, customConfig, tls)) {
-				return errKernelSwitchDeferred
-			}
-			reloaded := false
-			if s.appliedState.Config != nil && spec.ServerPort == s.appliedState.Config.ServerPort &&
-				sameCustomConfig(customConfig, s.appliedState.CustomConfig) {
-				// Hot reload only covers listener-level changes; kernels report
-				// anything wider as an error and the config is rebuilt instead.
-				// Port moves go straight to a rebuild so the new port can be
-				// opened before the serving listener is released.
-				if err := s.kernel.Reload(spec, s.lastUsers, tls); err == nil {
-					reloaded = true
-				} else {
-					nlog.Core().Info("hot reload not possible, rebuilding kernel", "reason", err)
+			if err := s.reloadRunningKernel(spec, tls, customConfig, &s.rebuildRetry); err != nil {
+				if errors.Is(err, errKernelSwitchDeferred) {
+					return errKernelSwitchDeferred
 				}
-			}
-			if !reloaded {
-				if err := s.rebuildKernel(spec, s.lastUsers, s.lastUsers, tls, customConfig); err != nil {
-					if errors.Is(err, errKernelSwitchDeferred) {
-						return errKernelSwitchDeferred
-					}
-					return fmt.Errorf("reload kernel: %w", err)
-				}
+				return fmt.Errorf("reload kernel: %w", err)
 			}
 		}
 	} else {
@@ -150,7 +130,7 @@ func (s *Service) applyNodeConfig(ctx context.Context, spec *model.NodeSpec) err
 		// A different config now works: earlier failures no longer say
 		// anything about the next attempt. A no-op re-apply proves nothing.
 		s.kernelRetryHash, s.kernelRetryFailures, s.kernelRetryAt = "", 0, time.Time{}
-		s.rebuildRetryKey, s.rebuildRetryFailures, s.rebuildRetryAt = "", 0, time.Time{}
+		s.rebuildRetry, s.certRenewRetry, s.userRebuildRetry = rebuildBackoff{}, rebuildBackoff{}, rebuildBackoff{}
 	}
 	if s.kernel.IsRunning() {
 		if !unchanged {
@@ -161,6 +141,23 @@ func (s *Service) applyNodeConfig(ctx context.Context, spec *model.NodeSpec) err
 		s.appliedState.Users = nil
 	}
 	return nil
+}
+
+func (s *Service) reloadRunningKernel(spec *model.NodeSpec, tls kernel.TLSCert, customConfig map[string]any, retry *rebuildBackoff) error {
+	if retry.deferred(rebuildKey(spec, customConfig)) {
+		return errKernelSwitchDeferred
+	}
+	// Port moves go straight to a rebuild so the new port can be opened
+	// before releasing the listener that is serving.
+	if s.appliedState.Config != nil && spec.ServerPort == s.appliedState.Config.ServerPort &&
+		sameCustomConfig(customConfig, s.appliedState.CustomConfig) {
+		if err := s.kernel.Reload(spec, s.lastUsers, tls); err == nil {
+			return nil
+		} else {
+			nlog.Core().Info("hot reload not possible, rebuilding kernel", "reason", err)
+		}
+	}
+	return s.rebuildKernel(spec, s.lastUsers, s.lastUsers, tls, customConfig, retry)
 }
 
 func sameKernelConfig(a, b *model.NodeSpec) bool {
@@ -231,32 +228,34 @@ func (s *Service) switchKernel(ctx context.Context, next kernel.Kernel, kind str
 	return nil
 }
 
-// rebuildKey identifies what a failed rebuild was attempted with. Users are
-// left out on purpose: routine user churn must not reset the backoff of a
-// configuration that keeps failing.
-func rebuildKey(spec *model.NodeSpec, customConfig map[string]any, tls kernel.TLSCert) string {
+// rebuildKey identifies the requested configuration. Changes to users or
+// renewed PEM must not reset the backoff of a pending config that keeps failing.
+func rebuildKey(spec *model.NodeSpec, customConfig map[string]any) string {
 	h := sha256.New()
 	io.WriteString(h, computeConfigHash(spec))
 	custom, _ := json.Marshal(customConfig)
 	h.Write(custom)
-	h.Write(tls.CertPEM)
-	h.Write(tls.KeyPEM)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func (s *Service) rebuildDeferred(key string) bool {
-	return key == s.rebuildRetryKey && time.Now().Before(s.rebuildRetryAt)
+type rebuildBackoff struct {
+	key      string
+	retryAt  time.Time
+	failures int
 }
 
-// rebuildFailed records a failed rebuild attempt and returns the backoff.
-func (s *Service) rebuildFailed(key string) time.Duration {
-	if key != s.rebuildRetryKey {
-		s.rebuildRetryFailures = 0
+func (r *rebuildBackoff) deferred(key string) bool {
+	return key == r.key && time.Now().Before(r.retryAt)
+}
+
+func (r *rebuildBackoff) failed(key string) time.Duration {
+	if key != r.key {
+		r.failures = 0
 	}
-	delay := kernelSwitchRetryDelays[min(s.rebuildRetryFailures, len(kernelSwitchRetryDelays)-1)]
-	s.rebuildRetryFailures++
-	s.rebuildRetryKey = key
-	s.rebuildRetryAt = time.Now().Add(delay)
+	delay := kernelSwitchRetryDelays[min(r.failures, len(kernelSwitchRetryDelays)-1)]
+	r.failures++
+	r.key = key
+	r.retryAt = time.Now().Add(delay)
 	return delay
 }
 
@@ -268,11 +267,11 @@ func (s *Service) rebuildFailed(key string) time.Duration {
 // starts, and if it fails the previous one (restoreUsers, the applied config,
 // TLS and custom_config snapshot) is started again. Interrupting attempts back
 // off like kernel switches do.
-func (s *Service) rebuildKernel(spec *model.NodeSpec, users, restoreUsers []model.UserSpec, tls kernel.TLSCert, customConfig map[string]any) error {
+func (s *Service) rebuildKernel(spec *model.NodeSpec, users, restoreUsers []model.UserSpec, tls kernel.TLSCert, customConfig map[string]any, retry *rebuildBackoff) error {
 	k := s.kernel
 	restoreSnapshot := func() { setKernelCustomConfig(k, s.appliedState.CustomConfig) }
-	retryKey := rebuildKey(spec, customConfig, tls)
-	if s.rebuildDeferred(retryKey) {
+	retryKey := rebuildKey(spec, customConfig)
+	if retry.deferred(retryKey) {
 		return errKernelSwitchDeferred
 	}
 	setKernelCustomConfig(k, customConfig)
@@ -298,9 +297,9 @@ func (s *Service) rebuildKernel(spec *model.NodeSpec, users, restoreUsers []mode
 		// The new config cannot start even next to the running one, so
 		// stopping the running one would not help: leave it serving.
 		restoreSnapshot()
-		delay := s.rebuildFailed(retryKey)
+		delay := retry.failed(retryKey)
 		nlog.Core().Warn("kernel rebuild failed; previous configuration still running",
-			"kernel", s.kernelType, "failures", s.rebuildRetryFailures, "retry_after", delay)
+			"kernel", s.kernelType, "failures", retry.failures, "retry_after", delay)
 		return fmt.Errorf("start %s: %w", s.kernelType, err)
 	}
 
@@ -314,11 +313,13 @@ func (s *Service) rebuildKernel(spec *model.NodeSpec, users, restoreUsers []mode
 	err := k.Start(spec, users, tls)
 	if err == nil {
 		s.appliedState.CustomConfig = customConfig
-		s.rebuildRetryKey, s.rebuildRetryFailures, s.rebuildRetryAt = "", 0, time.Time{}
+		if retry.key == retryKey {
+			*retry = rebuildBackoff{}
+		}
 		return nil
 	}
 	restoreSnapshot()
-	delay := s.rebuildFailed(retryKey)
+	delay := retry.failed(retryKey)
 	previous := s.appliedState.Config
 	if previous == nil || len(restoreUsers) == 0 {
 		// Nothing to restore: do not report a kernel without listeners as running.
@@ -336,7 +337,7 @@ func (s *Service) rebuildKernel(spec *model.NodeSpec, users, restoreUsers []mode
 		setKernelCustomConfig(k, customConfig)
 		if retryErr := k.Start(spec, users, tls); retryErr == nil {
 			s.appliedState.CustomConfig = customConfig
-			s.rebuildRetryKey, s.rebuildRetryFailures, s.rebuildRetryAt = "", 0, time.Time{}
+			*retry = rebuildBackoff{}
 			return nil
 		}
 		restoreSnapshot()
@@ -348,7 +349,7 @@ func (s *Service) rebuildKernel(spec *model.NodeSpec, users, restoreUsers []mode
 		return fmt.Errorf("start %s: %w; restore previous config: %w", s.kernelType, err, restoreErr)
 	}
 	nlog.Core().Warn("kernel rebuild failed; previous configuration restored",
-		"kernel", s.kernelType, "failures", s.rebuildRetryFailures, "retry_after", delay)
+		"kernel", s.kernelType, "failures", retry.failures, "retry_after", delay)
 	return fmt.Errorf("start %s: %w", s.kernelType, err)
 }
 

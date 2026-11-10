@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -649,8 +650,8 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 			})
 		}
 		base["users"] = userList
-		// Bandwidth hints enable Brutal; leaving them out keeps BBR. NodeSpec
-		// states the server's own bandwidth, as the inbound does.
+		// NodeSpec uses server-side directions. The send cap limits Brutal
+		// when the client advertises a receive rate; otherwise the server uses BBR.
 		if nc.UpMbps > 0 {
 			base["up_mbps"] = nc.UpMbps
 		}
@@ -667,6 +668,10 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 	} else {
 		base["type"] = "hysteria"
 
+		// The order of these credentials has no effect on authentication.
+		// Keep it stable so a route-only reload cannot rebind the QUIC socket.
+		users := slices.Clone(users)
+		slices.SortFunc(users, func(a, b model.UserSpec) int { return strings.Compare(a.UUID, b.UUID) })
 		userList := make([]M, 0, len(users))
 		for _, u := range users {
 			userList = append(userList, M{

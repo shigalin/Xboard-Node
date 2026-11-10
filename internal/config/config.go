@@ -35,12 +35,13 @@ type Config struct {
 	// Nodes enables multi-node mode. When set, Panel.NodeID is ignored and
 	// one service instance is started per entry. All entries share the same
 	// panel URL/token, kernel type, log settings and runtime tuning.
+	// In machine mode these entries only override discovered nodes by ID.
 	Nodes []NodeEntry `yaml:"nodes,omitempty"`
 
 	// Machine enables machine mode: a single process manages all nodes
 	// bound to this machine on the panel. Nodes are discovered dynamically
-	// via GET /api/v2/server/machine/nodes. When set, Panel.NodeID, Nodes
-	// and Panel.Token are ignored; the machine token is used instead.
+	// via GET /api/v2/server/machine/nodes. When set, Panel.NodeID and
+	// Panel.Token are ignored; the machine token is used instead.
 	Machine *MachineConfig `yaml:"machine,omitempty"`
 }
 
@@ -52,7 +53,7 @@ type MachineConfig struct {
 	TokenEnv  string `yaml:"token_env,omitempty"`
 }
 
-// NodeEntry describes a single node in multi-node mode.
+// NodeEntry describes a multi-node binding or overrides for a discovered node.
 type NodeEntry struct {
 	NodeID   int    `yaml:"node_id"`
 	NodeType string `yaml:"node_type,omitempty"`
@@ -761,9 +762,6 @@ func (c *Config) validate() error {
 		if c.Machine.Token == "" {
 			return fmt.Errorf("machine.token is required")
 		}
-		if len(c.Nodes) > 0 {
-			return fmt.Errorf("machine mode and nodes: are mutually exclusive")
-		}
 	} else {
 		if c.Panel.URL == "" {
 			return fmt.Errorf("panel.url is required")
@@ -775,11 +773,16 @@ func (c *Config) validate() error {
 		if len(c.Nodes) == 0 && c.Panel.NodeID <= 0 {
 			return fmt.Errorf("panel.node_id must be positive (or use 'nodes:' for multi-node)")
 		}
-		for i, n := range c.Nodes {
-			if n.NodeID <= 0 {
-				return fmt.Errorf("nodes[%d].node_id must be positive", i)
-			}
+	}
+	seenNodes := make(map[int]bool, len(c.Nodes))
+	for i, n := range c.Nodes {
+		if n.NodeID <= 0 {
+			return fmt.Errorf("nodes[%d].node_id must be positive", i)
 		}
+		if c.IsMachineMode() && seenNodes[n.NodeID] {
+			return fmt.Errorf("nodes[%d].node_id duplicates machine node %d", i, n.NodeID)
+		}
+		seenNodes[n.NodeID] = true
 	}
 	switch c.Kernel.Type {
 	case "singbox", "xray":
@@ -815,7 +818,7 @@ func (c *Config) validate() error {
 // Multi-node mode: returns one derived *Config per NodeEntry, each inheriting
 // shared settings and applying per-node overrides.
 func (c *Config) ExpandNodes() []*Config {
-	if len(c.Nodes) == 0 {
+	if len(c.Nodes) == 0 || c.IsMachineMode() {
 		return []*Config{c}
 	}
 
@@ -826,38 +829,11 @@ func (c *Config) ExpandNodes() []*Config {
 		nodeCfg.Panel.NodeID = entry.NodeID
 		nodeCfg.Panel.NodeType = entry.NodeType
 
-		// Per-node kernel overrides
-		if entry.Kernel != nil {
-			if entry.Kernel.ConfigDir != "" {
-				nodeCfg.Kernel.ConfigDir = entry.Kernel.ConfigDir
-				if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
-					// GeoDataDir was defaulted to ConfigDir — keep it pointing at
-					// the new ConfigDir unless the user set it explicitly.
-					nodeCfg.Kernel.GeoDataDir = entry.Kernel.ConfigDir
-				}
-			}
-			if entry.Kernel.GeoDataDir != "" {
-				nodeCfg.Kernel.GeoDataDir = entry.Kernel.GeoDataDir
-			}
-			if entry.Kernel.LogLevel != "" {
-				nodeCfg.Kernel.LogLevel = entry.Kernel.LogLevel
-			}
-			if entry.Kernel.CustomConfig != "" {
-				nodeCfg.Kernel.CustomConfig = entry.Kernel.CustomConfig
-			}
-		} else {
+		if entry.Kernel == nil {
 			// Auto-derive a unique config_dir per node to avoid conflicts.
 			nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, entry.NodeID)
-			if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
-				// Share the geo data dir with the base dir to avoid re-downloading.
-				nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
-			}
 		}
-
-		// Per-node cert overrides
-		if entry.Cert != nil {
-			nodeCfg.Cert = *entry.Cert
-		}
+		nodeCfg.applyNodeOverrides(entry, c.Kernel.ConfigDir)
 		if nodeCfg.Cert.CertDir == "" {
 			nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
 		}
@@ -865,6 +841,29 @@ func (c *Config) ExpandNodes() []*Config {
 		result = append(result, &nodeCfg)
 	}
 	return result
+}
+
+func (c *Config) applyNodeOverrides(entry NodeEntry, baseConfigDir string) {
+	if k := entry.Kernel; k != nil {
+		if k.ConfigDir != "" {
+			c.Kernel.ConfigDir = k.ConfigDir
+			if c.Kernel.GeoDataDir == baseConfigDir {
+				c.Kernel.GeoDataDir = k.ConfigDir
+			}
+		}
+		if k.GeoDataDir != "" {
+			c.Kernel.GeoDataDir = k.GeoDataDir
+		}
+		if k.LogLevel != "" {
+			c.Kernel.LogLevel = k.LogLevel
+		}
+		if k.CustomConfig != "" {
+			c.Kernel.CustomConfig = k.CustomConfig
+		}
+	}
+	if entry.Cert != nil {
+		c.Cert = *entry.Cert
+	}
 }
 
 func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
@@ -876,10 +875,16 @@ func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
 	nodeCfg.Panel.MachineID = c.Machine.MachineID
 
 	nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, nodeID)
-	if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
-		nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
+	nodeCfg.Cert.CertDir = ""
+	for _, entry := range c.Nodes {
+		if entry.NodeID == nodeID {
+			nodeCfg.applyNodeOverrides(entry, c.Kernel.ConfigDir)
+			break
+		}
 	}
-	nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
+	if nodeCfg.Cert.CertDir == "" {
+		nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
+	}
 
 	return &nodeCfg
 }
@@ -959,6 +964,13 @@ func ValidateStartupLayout(instances []*Config) error {
 			if path := strings.TrimSpace(instance.Kernel.CustomConfig); path != "" {
 				if _, err := os.Stat(path); err != nil {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
+				}
+			}
+			for _, entry := range instance.Nodes {
+				if entry.Kernel != nil && strings.TrimSpace(entry.Kernel.CustomConfig) != "" {
+					if _, err := os.Stat(entry.Kernel.CustomConfig); err != nil {
+						return fmt.Errorf("kernel.custom_config %q for %s/node-%d: %w", entry.Kernel.CustomConfig, owner, entry.NodeID, err)
+					}
 				}
 			}
 			continue

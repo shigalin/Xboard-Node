@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -77,26 +78,43 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 }
 
 func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("poll config: %w", err)
+	return pollPanel(ctx, p.client, p.kcfg)
+}
+
+func pollPanel(ctx context.Context, client *panel.Client, kcfg config.KernelConfig) (Snapshot, error) {
+	configSnapshot, configErr := client.GetConfig()
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
 	}
-	users, err := p.client.GetUsers()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("poll users: %w", err)
+	users, userErr := client.GetUsers()
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
 	}
-	select {
-	case <-ctx.Done():
-		return Snapshot{}, ctx.Err()
-	default:
-	}
+
 	snapshot := Snapshot{Users: model.UserSpecsFromPanel(users)}
-	if configSnapshot == nil {
-		snapshot.CurrentConfig, snapshot.CurrentConfigErr = cachedConfig(p.client, p.kcfg)
-	} else {
-		snapshot.Config, snapshot.CurrentConfig, snapshot.CurrentConfigErr = resolveConfig(configSnapshot, p.kcfg)
+	var invalid *panel.InvalidConfigError
+	switch {
+	case errors.As(configErr, &invalid):
+		snapshot.CurrentConfigErr = invalid
+	case configErr != nil:
+		configErr = fmt.Errorf("poll config: %w", configErr)
+	case configSnapshot == nil:
+		snapshot.CurrentConfig, snapshot.CurrentConfigErr = cachedConfig(client, kcfg)
+	default:
+		snapshot.Config, snapshot.CurrentConfig, snapshot.CurrentConfigErr = resolveConfig(configSnapshot, kcfg)
 	}
-	return snapshot, nil
+	if userErr != nil {
+		// A new config may supersede the pending one even when the user
+		// fetch failed. Report it as known, but not yet applicable.
+		if snapshot.Config != nil {
+			snapshot.CurrentConfig, snapshot.Config = snapshot.Config, nil
+		}
+		userErr = fmt.Errorf("poll users: %w", userErr)
+	}
+	if invalid != nil {
+		configErr = nil
+	}
+	return snapshot, errors.Join(configErr, userErr)
 }
 
 func (p *PanelControlPlane) ForgetUserETag() { p.client.ForgetUserETag() }
@@ -226,11 +244,10 @@ func resolveConfig(nc *panel.NodeConfig, kcfg config.KernelConfig) (applicable, 
 }
 
 // cachedConfig resolves an HTTP 304 to the config behind the client's ETag.
-// A body that no longer decodes is reported as unknown.
 func cachedConfig(client *panel.Client, kcfg config.KernelConfig) (*model.NodeSpec, error) {
 	cached, err := client.CachedConfig()
 	if err != nil || cached == nil {
-		return nil, nil
+		return nil, err
 	}
 	applicable, current, err := resolveConfig(cached, kcfg)
 	if err != nil {

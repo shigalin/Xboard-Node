@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"time"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/include"
 	singLog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -213,7 +215,83 @@ func (s *SingBox) buildBox(ctx context.Context, spec *model.NodeSpec, users []mo
 	if err != nil {
 		return nil, configKeys{}, fmt.Errorf("create sing-box instance: %w", err)
 	}
+	if err := checkDependencies(ctx, opts); err != nil {
+		_ = instance.Close()
+		return nil, configKeys{}, err
+	}
 	return instance, keysOf(cfgMap), nil
+}
+
+// The managers resolve dependencies during Start. Check their graphs before a
+// same-port rebuild has to release the running listener.
+func checkDependencies(ctx context.Context, opts option.Options) error {
+	outbounds := service.FromContext[adapter.OutboundManager](ctx)
+	endpoints := service.FromContext[adapter.EndpointManager](ctx)
+	outboundGraph := make(map[string][]string)
+	for _, outbound := range outbounds.Outbounds() {
+		outboundGraph[outbound.Tag()] = outbound.Dependencies()
+	}
+	for _, endpoint := range endpoints.Endpoints() {
+		outboundGraph[endpoint.Tag()] = endpoint.Dependencies()
+	}
+	var finalOutbound string
+	if opts.Route != nil {
+		finalOutbound = opts.Route.Final
+	}
+	if err := checkDependencyGraph("outbound", outboundGraph, finalOutbound); err != nil {
+		return err
+	}
+	if opts.DNS == nil {
+		return nil
+	}
+	dns := service.FromContext[adapter.DNSTransportManager](ctx)
+	dnsGraph := make(map[string][]string)
+	for _, transport := range dns.Transports() {
+		dnsGraph[transport.Tag()] = transport.Dependencies()
+		// DNS transport dependencies name resolvers. Its detour references
+		// the separate outbound graph and is also resolved at startup.
+		if referrer, ok := transport.(adapter.Referrer); ok {
+			for _, tag := range referrer.References() {
+				if err := dialer.InitializeDetour(dialer.NewDetour(outbounds, tag, false)); err != nil {
+					return fmt.Errorf("DNS server %q: %w", transport.Tag(), err)
+				}
+			}
+		}
+	}
+	return checkDependencyGraph("DNS server", dnsGraph, opts.DNS.Final)
+}
+
+func checkDependencyGraph(kind string, graph map[string][]string, final string) error {
+	if _, ok := graph[final]; final != "" && !ok {
+		return fmt.Errorf("default %s %q not found", kind, final)
+	}
+	finished := make(map[string]bool, len(graph))
+	var visit func(string) error
+	visit = func(tag string) error {
+		if done, seen := finished[tag]; seen {
+			if !done {
+				return fmt.Errorf("circular %s dependency at %q", kind, tag)
+			}
+			return nil
+		}
+		finished[tag] = false
+		for _, name := range graph[tag] {
+			if _, ok := graph[name]; !ok {
+				return fmt.Errorf("%s %q depends on missing %s %q", kind, tag, kind, name)
+			}
+			if err := visit(name); err != nil {
+				return err
+			}
+		}
+		finished[tag] = true
+		return nil
+	}
+	for _, tag := range slices.Sorted(maps.Keys(graph)) {
+		if err := visit(tag); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // configKeys splits a generated config into the parts Reload treats
@@ -465,30 +543,42 @@ func (r reloadInboundRegistry) Create(ctx context.Context, router adapter.Router
 	return inbound, err
 }
 
-// applyInboundsLocked brings the running inbounds to next. Inbounds are
-// updated in place when recreate is false and they support it; otherwise
-// they are removed and recreated (a TCP listener cannot be swapped
-// atomically). If any step fails, every inbound already touched is put back
-// to prev. If restoration also fails, stop accepting on the broken instance.
+type inboundUpdateMode uint8
+
+const (
+	updateUsersOnly inboundUpdateMode = iota
+	updateOrRecreate
+	recreateInbound
+)
+
+var errInboundUserUpdateUnsupported = errors.New("inbound requires a rebuild to update users")
+
+// applyInboundsLocked brings the running inbounds to next. User operations
+// only use native user updates. A configuration reload may also rebind.
+// If a step fails, restore every inbound already touched to prev. If
+// restoration also fails, stop accepting on the broken instance.
 // Requires s.mu.
-func (s *SingBox) applyInboundsLocked(next, prev []option.Inbound, recreate bool, unchanged map[string]bool) error {
+func (s *SingBox) applyInboundsLocked(next, prev []option.Inbound, mode inboundUpdateMode, unchanged map[string]bool) error {
 	im := service.FromContext[adapter.InboundManager](s.ctx)
 	router := service.FromContext[adapter.Router](s.ctx)
 	if im == nil || router == nil {
 		return fmt.Errorf("inbound manager or router not available")
 	}
 	nopFactory := singLog.NewNOPFactory()
-	apply := func(inb option.Inbound, inPlace bool) error {
-		if inPlace {
+	apply := func(inb option.Inbound) error {
+		if mode != recreateInbound {
 			if existing, ok := im.Get(inb.Tag); ok && existing.Type() == inb.Type {
 				handled, err := updateInboundUsers(existing, inb)
-				if handled && err == nil {
-					return nil
+				if handled && (err == nil || mode == updateUsersOnly) {
+					return err
 				}
 				if err != nil {
 					nlog.Core().Warn("incremental update failed, recreating inbound", "tag", inb.Tag, "error", err)
 				}
 			}
+		}
+		if mode == updateUsersOnly {
+			return errInboundUserUpdateUnsupported
 		}
 		_ = im.Remove(inb.Tag) // ignore error when tag doesn't exist yet
 		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, inb.Tag))
@@ -511,24 +601,28 @@ func (s *SingBox) applyInboundsLocked(next, prev []option.Inbound, recreate bool
 			// closing every QUIC session on their socket.
 			continue
 		}
-		err := apply(inb, !recreate)
+		err := apply(inb)
 		if err == nil {
 			continue
 		}
+		touchedCount := i + 1
+		if errors.Is(err, errInboundUserUpdateUnsupported) {
+			touchedCount = i // No native update was attempted for this inbound.
+		}
 		var restoreErr error
-		for _, touched := range next[:i+1] {
+		for _, touched := range next[:touchedCount] {
 			if unchanged[touched.Tag] {
 				continue
 			}
 			if old, ok := previous[touched.Tag]; ok {
-				restoreErr = errors.Join(restoreErr, apply(old, !recreate))
+				restoreErr = errors.Join(restoreErr, apply(old))
 			}
 		}
 		if restoreErr != nil {
 			s.releaseListenersLocked()
-			return fmt.Errorf("recreate inbound %s: %w; restore previous inbounds: %w", inb.Tag, err, restoreErr)
+			return fmt.Errorf("update inbound %s: %w; restore previous inbounds: %w", inb.Tag, err, restoreErr)
 		}
-		return fmt.Errorf("recreate inbound %s: %w", inb.Tag, err)
+		return fmt.Errorf("update inbound %s: %w", inb.Tag, err)
 	}
 	return nil
 }
@@ -629,16 +723,19 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	// Recreate a listener only when the listener itself changed (port, TLS,
 	// transport, ...). Users are swapped in place, and a route-only change
 	// leaves the inbound alone, so QUIC sessions on its socket survive.
-	recreate := keys.inbounds != keysOf(prevMap).inbounds
+	mode := updateOrRecreate
+	if keys.inbounds != keysOf(prevMap).inbounds {
+		mode = recreateInbound
+	}
 	unchanged := unchangedInbounds(cfgMap, prevMap)
-	if err := s.applyInboundsLocked(opts.Inbounds, prevOpts.Inbounds, recreate, unchanged); err != nil {
+	if err := s.applyInboundsLocked(opts.Inbounds, prevOpts.Inbounds, mode, unchanged); err != nil {
 		return err
 	}
 	if keys.route != s.routeKey {
 		router := service.FromContext[adapter.Router](s.ctx)
 		// UpdateRules swaps all rules or none.
 		if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-			if restoreErr := s.applyInboundsLocked(prevOpts.Inbounds, opts.Inbounds, recreate, unchanged); restoreErr != nil {
+			if restoreErr := s.applyInboundsLocked(prevOpts.Inbounds, opts.Inbounds, mode, unchanged); restoreErr != nil {
 				s.releaseListenersLocked()
 				return fmt.Errorf("update route rules: %w; restore previous inbounds: %w", err, restoreErr)
 			}
@@ -844,7 +941,7 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 	if err != nil {
 		return err
 	}
-	if err := s.applyInboundsLocked(opts.Inbounds, prevOpts.Inbounds, false, unchangedInbounds(cfgMap, prevMap)); err != nil {
+	if err := s.applyInboundsLocked(opts.Inbounds, prevOpts.Inbounds, updateUsersOnly, unchangedInbounds(cfgMap, prevMap)); err != nil {
 		return err
 	}
 

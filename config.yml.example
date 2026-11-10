@@ -28,6 +28,20 @@
 #     log:
 #       level: "debug"   # override for this instance only
 
+# ── Machine mode with per-node kernel overrides ──
+# panel:
+#   url: "https://panel.example.com"
+# machine:
+#   machine_id: 2
+#   token: "machine-token"
+# kernel:
+#   type: "xray"
+#   custom_config: "/etc/xboard-node/xray.json"
+# nodes:                       # overrides only; bindings come from the panel
+#   - node_id: 3               # a discovered Hysteria node
+#     kernel:
+#       custom_config: "/etc/xboard-node/sing-box.json"
+
 # ── Device (IP) limit ──
 # Shared by sing-box and Xray. Panels with global device bans enforce a
 # 180-second cooldown across their nodes. The setting below applies to

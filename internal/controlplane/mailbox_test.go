@@ -22,7 +22,7 @@ func TestNodeMailboxLatestStateAndNotifyCollapse(t *testing.T) {
 	}
 
 	mb.MarkReady()
-	state := mb.DrainIfReady()
+	state := mb.DrainIfReady(nil)
 	if !state.HasConfig || state.Config == nil {
 		t.Fatal("expected config state")
 	}
@@ -39,14 +39,14 @@ func TestNodeMailboxFullUsersOverwriteAndDeltaBeforeBaseline(t *testing.T) {
 		DeltaUsers:  []model.UserSpec{{ID: 1, UUID: "u1"}},
 	})
 	mb.MarkReady()
-	state := mb.DrainIfReady()
+	state := mb.DrainIfReady(nil)
 	if !state.NeedsReconcile {
 		t.Fatal("expected reconcile when delta arrives before baseline")
 	}
 
 	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 1, UUID: "u1"}}})
 	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 2, UUID: "u2"}}})
-	state = mb.DrainIfReady()
+	state = mb.DrainIfReady(nil)
 	if !state.HasUsers {
 		t.Fatal("expected users snapshot")
 	}
@@ -60,7 +60,7 @@ func TestNodeMailboxDevicesLatestWins(t *testing.T) {
 	mb.Apply(Event{Type: EventSyncDevices, DeviceUsers: map[int][]string{1: {"1.1.1.1"}}})
 	mb.Apply(Event{Type: EventSyncDevices, DeviceUsers: map[int][]string{1: {"2.2.2.2"}}})
 	mb.MarkReady()
-	state := mb.DrainIfReady()
+	state := mb.DrainIfReady(nil)
 	if !state.HasDevices {
 		t.Fatal("expected devices state")
 	}
@@ -92,15 +92,15 @@ func TestNodeMailboxReconcileNotifies(t *testing.T) {
 		t.Fatal("expected notify on reconcile path")
 	}
 
-	state := mb.DrainIfReady()
+	state := mb.DrainIfReady(nil)
 	if !state.NeedsReconcile {
 		t.Fatal("expected NeedsReconcile")
 	}
 }
 
-func TestNodeMailboxSeedBaselineEnablesDelta(t *testing.T) {
+func TestNodeMailboxDrainsDeltaAgainstCurrentUsers(t *testing.T) {
 	mb := NewNodeMailbox()
-	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, nil)
+	baseline := []model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}
 	mb.MarkReady()
 
 	// Drain MarkReady notify
@@ -122,9 +122,9 @@ func TestNodeMailboxSeedBaselineEnablesDelta(t *testing.T) {
 		t.Fatal("expected notify after delta")
 	}
 
-	state := mb.DrainIfReady()
+	state := mb.DrainIfReady(baseline)
 	if state.NeedsReconcile {
-		t.Fatal("should not need reconcile after seeded baseline")
+		t.Fatal("should not need reconcile with a current baseline")
 	}
 	if !state.HasUsers {
 		t.Fatal("expected users")
@@ -136,7 +136,6 @@ func TestNodeMailboxSeedBaselineEnablesDelta(t *testing.T) {
 
 func TestNodeMailboxDeltaFailedApplyNotifies(t *testing.T) {
 	mb := NewNodeMailbox()
-	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, nil)
 	mb.MarkReady()
 
 	// Drain MarkReady notify
@@ -158,7 +157,7 @@ func TestNodeMailboxDeltaFailedApplyNotifies(t *testing.T) {
 		t.Fatal("expected notify on failed delta apply")
 	}
 
-	state := mb.DrainIfReady()
+	state := mb.DrainIfReady(nil)
 	if !state.NeedsReconcile {
 		t.Fatal("expected NeedsReconcile for invalid delta action")
 	}
@@ -169,12 +168,12 @@ func TestNodeMailboxCoalescesDeviceBansIndependentlyFromIPSnapshots(t *testing.T
 	mb.Apply(Event{Type: EventSyncDevices, DeviceBans: map[int]int64{1: 100, 3: 300}})
 	mb.Apply(Event{Type: EventSyncDevices, DeviceUsers: map[int][]string{1: {"192.0.2.1"}}})
 	mb.MarkReady()
-	state := mb.DrainIfReady()
+	state := mb.DrainIfReady(nil)
 	if !state.HasDevices || len(state.DeviceBans) != 3 || state.DeviceBans[1] != 200 ||
 		state.DeviceBans[2] != 150 || state.DeviceBans[3] != 300 {
 		t.Fatalf("incorrect coalesced device state: %+v", state)
 	}
-	if next := mb.DrainIfReady(); next.DeviceBans != nil {
+	if next := mb.DrainIfReady(nil); next.DeviceBans != nil {
 		t.Fatal("drained bans were retained")
 	}
 }
@@ -186,7 +185,7 @@ func TestNodeMailboxInvalidConfigWithdrawsBufferedCandidate(t *testing.T) {
 	mb.Apply(Event{Type: EventSyncConfig, ConfigErr: errors.New("translate node config: unsupported")})
 
 	mb.MarkReady()
-	state := mb.DrainIfReady()
+	state := mb.DrainIfReady(nil)
 	if state.HasConfig || state.Config != nil {
 		t.Fatalf("withdrawn candidate was still delivered: %+v", state.Config)
 	}
@@ -197,8 +196,25 @@ func TestNodeMailboxInvalidConfigWithdrawsBufferedCandidate(t *testing.T) {
 	// A later valid config clears the error.
 	replacement := &model.NodeSpec{Protocol: "vless", ServerPort: 10030}
 	mb.Apply(Event{Type: EventSyncConfig, Config: replacement})
-	state = mb.DrainIfReady()
+	state = mb.DrainIfReady(nil)
 	if state.ConfigErr != nil || !state.HasConfig || state.Config.ServerPort != 10030 {
 		t.Fatalf("valid config after an invalid one was not delivered cleanly: %+v err=%v", state.Config, state.ConfigErr)
+	}
+}
+
+func TestNodeMailboxDeltaKeepsRESTRevocation(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.MarkReady()
+	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 1}, {ID: 2}}})
+	if state := mb.DrainIfReady(nil); len(state.Users) != 2 {
+		t.Fatal("did not receive initial WebSocket users")
+	}
+
+	// REST has removed user 2. An unrelated WS removal must use that list,
+	// and removing its last user must deliver a nonnil empty snapshot.
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}})
+	state := mb.DrainIfReady([]model.UserSpec{{ID: 1}})
+	if state.NeedsReconcile || !state.HasUsers || state.Users == nil || len(state.Users) != 0 {
+		t.Fatalf("delta did not preserve the REST revocation: %+v", state)
 	}
 }

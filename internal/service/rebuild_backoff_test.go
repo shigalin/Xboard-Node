@@ -42,7 +42,7 @@ func TestRebuildBackoffSurvivesUserChurn(t *testing.T) {
 		users := append(append([]model.UserSpec(nil), s.lastUsers...), model.UserSpec{ID: 10 + i, UUID: fmt.Sprintf("11111111-1111-4111-8111-1111111111%02d", i)})
 		s.applyUserUpdate(ctx, users, computeUserHash(users))
 	}
-	t.Logf("listener interruptions over 5 polls within the 1m backoff: %d, failures counter=%d", stops, s.rebuildRetryFailures)
+	t.Logf("listener interruptions over 5 polls within the 1m backoff: %d, failures counter=%d", stops, s.rebuildRetry.failures)
 	if stops > 1 {
 		t.Fatalf("backoff bypassed: %d stop/start cycles of the serving kernel in 5 polls", stops)
 	}
@@ -118,13 +118,13 @@ func TestNoOpReapplyKeepsRebuildBackoff(t *testing.T) {
 	s.lastConfig, s.appliedState.Config, s.lastConfigHash = spec, spec, computeConfigHash(spec)
 	s.appliedState.CustomConfig = map[string]any{}
 	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}})
-	s.rebuildRetryKey, s.rebuildRetryFailures, s.rebuildRetryAt = "failing", 2, time.Now().Add(time.Hour)
+	s.rebuildRetry.key, s.rebuildRetry.failures, s.rebuildRetry.retryAt = "failing", 2, time.Now().Add(time.Hour)
 
 	// Re-applying the active config changes nothing and proves nothing.
 	if err := s.applyNodeConfig(ctx, spec); err != nil {
 		t.Fatal(err)
 	}
-	if s.rebuildRetryKey != "failing" || s.rebuildRetryFailures != 2 {
+	if s.rebuildRetry.key != "failing" || s.rebuildRetry.failures != 2 {
 		t.Fatal("a no-op re-apply cleared the rebuild backoff")
 	}
 }

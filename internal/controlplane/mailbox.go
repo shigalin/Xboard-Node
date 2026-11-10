@@ -1,6 +1,8 @@
 package controlplane
 
 import (
+	"maps"
+	"slices"
 	"sync"
 
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -25,19 +27,23 @@ type MailboxState struct {
 // yet ready to process them. Events are coalesced (latest-wins) and drained
 // as a single snapshot once the service marks the mailbox as ready.
 type NodeMailbox struct {
-	mu               sync.Mutex
-	ready            bool
-	config           *model.NodeSpec
-	configErr        error
-	users            []model.UserSpec
-	deviceUsers      map[int][]string
-	deviceBans       map[int]int64
-	dirtyConfig      bool
-	dirtyUsers       bool
-	dirtyDevices     bool
-	needsReconcile   bool
-	hasFullUserState bool
-	notifyCh         chan struct{}
+	mu             sync.Mutex
+	ready          bool
+	config         *model.NodeSpec
+	configErr      error
+	users          []model.UserSpec // pending full snapshot, including an empty list
+	userDeltas     map[int]mailboxUserDelta
+	deviceUsers    map[int][]string
+	deviceBans     map[int]int64
+	dirtyConfig    bool
+	dirtyDevices   bool
+	needsReconcile bool
+	notifyCh       chan struct{}
+}
+
+type mailboxUserDelta struct {
+	user    model.UserSpec
+	removed bool
 }
 
 func NewNodeMailbox() *NodeMailbox {
@@ -49,21 +55,6 @@ func (m *NodeMailbox) MarkReady() {
 	m.ready = true
 	m.mu.Unlock()
 	m.notify()
-}
-
-// SeedBaseline initializes the mailbox with the REST-derived baseline so that
-// subsequent delta events can be applied incrementally instead of triggering
-// a full REST reconciliation.
-func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpec) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if users != nil && !m.hasFullUserState {
-		m.users = cloneUsers(users)
-		m.hasFullUserState = true
-	}
-	if config != nil && m.config == nil {
-		m.config = cloneNodeSpec(config)
-	}
 }
 
 func (m *NodeMailbox) Apply(event Event) {
@@ -88,8 +79,7 @@ func (m *NodeMailbox) Apply(event Event) {
 	case EventSyncUsers:
 		if event.Users != nil {
 			m.users = cloneUsers(event.Users)
-			m.dirtyUsers = true
-			m.hasFullUserState = true
+			m.userDeltas = nil // This snapshot supersedes all earlier deltas.
 			changed = true
 		}
 	case EventSyncDevices:
@@ -109,16 +99,17 @@ func (m *NodeMailbox) Apply(event Event) {
 		}
 	case EventSyncUserDelta:
 		if len(event.DeltaUsers) > 0 {
-			if !m.hasFullUserState {
+			if event.DeltaAction != "add" && event.DeltaAction != "remove" {
 				m.needsReconcile = true
-				changed = true
-			} else if !applyUserDelta(&m.users, event.DeltaAction, event.DeltaUsers) {
-				m.needsReconcile = true
-				changed = true
 			} else {
-				m.dirtyUsers = true
-				changed = true
+				if m.userDeltas == nil {
+					m.userDeltas = make(map[int]mailboxUserDelta)
+				}
+				for _, user := range event.DeltaUsers {
+					m.userDeltas[user.ID] = mailboxUserDelta{user: user, removed: event.DeltaAction == "remove"}
+				}
 			}
+			changed = true
 		}
 	}
 	m.mu.Unlock()
@@ -137,7 +128,10 @@ func (m *NodeMailbox) notify() {
 
 func (m *NodeMailbox) NotifyCh() <-chan struct{} { return m.notifyCh }
 
-func (m *NodeMailbox) DrainIfReady() MailboxState {
+// DrainIfReady applies pending deltas to the latest users known by the service
+// unless the mailbox has a newer full WebSocket snapshot. A nil baseline means
+// the service has not received a full user list yet.
+func (m *NodeMailbox) DrainIfReady(users []model.UserSpec) MailboxState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.ready {
@@ -150,11 +144,19 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 		state.HasConfig = true
 		m.dirtyConfig = false
 	}
-	if m.dirtyUsers {
-		state.Users = cloneUsers(m.users)
+	if m.users != nil {
+		users = m.users
 		state.HasUsers = true
-		m.dirtyUsers = false
 	}
+	if len(m.userDeltas) > 0 && users == nil {
+		state.NeedsReconcile = true
+	} else if len(m.userDeltas) > 0 {
+		state.Users = applyUserDeltas(users, m.userDeltas)
+		state.HasUsers = true
+	} else if state.HasUsers {
+		state.Users = users
+	}
+	m.users, m.userDeltas = nil, nil
 	if m.dirtyDevices && m.deviceUsers != nil {
 		state.DeviceUsers = cloneDeviceUsers(m.deviceUsers)
 		state.HasDevices = true
@@ -247,40 +249,22 @@ func cloneDeviceUsers(devices map[int][]string) map[int][]string {
 	return cloned
 }
 
-func applyUserDelta(users *[]model.UserSpec, action string, delta []model.UserSpec) bool {
-	current := cloneUsers(*users)
-	index := make(map[int]int, len(current))
-	for i, user := range current {
-		index[user.ID] = i
-	}
-
-	switch action {
-	case "add":
-		for _, user := range delta {
-			if idx, ok := index[user.ID]; ok {
-				current[idx] = user
+func applyUserDeltas(users []model.UserSpec, deltas map[int]mailboxUserDelta) []model.UserSpec {
+	updated := make([]model.UserSpec, 0, len(users))
+	for _, user := range users {
+		if delta, ok := deltas[user.ID]; ok {
+			delete(deltas, user.ID)
+			if delta.removed {
 				continue
 			}
-			index[user.ID] = len(current)
-			current = append(current, user)
+			user = delta.user
 		}
-	case "remove":
-		removeIDs := make(map[int]struct{}, len(delta))
-		for _, user := range delta {
-			removeIDs[user.ID] = struct{}{}
-		}
-		filtered := current[:0]
-		for _, user := range current {
-			if _, ok := removeIDs[user.ID]; ok {
-				continue
-			}
-			filtered = append(filtered, user)
-		}
-		current = append([]model.UserSpec(nil), filtered...)
-	default:
-		return false
+		updated = append(updated, user)
 	}
-
-	*users = current
-	return true
+	for _, id := range slices.Sorted(maps.Keys(deltas)) {
+		if delta := deltas[id]; !delta.removed {
+			updated = append(updated, delta.user)
+		}
+	}
+	return updated
 }

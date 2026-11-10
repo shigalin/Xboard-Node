@@ -54,11 +54,11 @@ type Snapshot struct {
 	Users       []model.UserSpec
 	DeviceUsers map[int][]string
 	// CurrentConfig is the config the panel serves when Config is nil: the
-	// body behind an HTTP 304, or a body that failed validation. Nil when
-	// the source cannot tell.
+	// body behind an HTTP 304, a config from a partial poll, or a body that
+	// failed validation. Nil when the source cannot tell.
 	CurrentConfig *model.NodeSpec
-	// CurrentConfigErr is set when CurrentConfig does not validate for the
-	// selected kernel: the panel's config is known but cannot be applied.
+	// CurrentConfigErr means the panel returned an unusable config. It can
+	// be set without CurrentConfig when the body could not be decoded.
 	CurrentConfigErr error
 }
 
@@ -83,6 +83,7 @@ type PushClient interface {
 
 type Source interface {
 	Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (Bootstrap, error)
+	// Poll may return a partial snapshot with an error from one request.
 	Poll(ctx context.Context) (Snapshot, error)
 	Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error)
 	Metrics() APIMetrics

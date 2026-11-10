@@ -307,18 +307,21 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 		return
 	}
 
-	translated, err := controlplane.TranslateWSEvent(event, o.cfg.Kernel)
-	if err != nil {
-		nlog.Core().Warn("machine ws event translation failed",
-			"type", event.Type, "node_id", nodeID, "error", err)
-		return
-	}
-
 	o.eventsMu.RLock()
 	mailbox, ok := o.mailboxes[nodeID]
 	o.eventsMu.RUnlock()
 	if !ok {
 		nlog.Core().Debug("machine ws event for unknown node", "node_id", nodeID, "type", event.Type)
+		return
+	}
+	kcfg := o.cfg.Kernel
+	if event.Config != nil {
+		kcfg = o.cfg.ExpandMachineNode(nodeID, "").Kernel
+	}
+	translated, err := controlplane.TranslateWSEvent(event, kcfg)
+	if err != nil {
+		nlog.Core().Warn("machine ws event translation failed",
+			"type", event.Type, "node_id", nodeID, "error", err)
 		return
 	}
 	mailbox.Apply(translated)

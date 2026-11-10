@@ -103,26 +103,7 @@ func (p *MachinePanelControlPlane) Initial(
 }
 
 func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)
-	}
-	users, err := p.client.GetUsers()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll users: %w", err)
-	}
-	select {
-	case <-ctx.Done():
-		return Snapshot{}, ctx.Err()
-	default:
-	}
-	snapshot := Snapshot{Users: model.UserSpecsFromPanel(users)}
-	if configSnapshot == nil {
-		snapshot.CurrentConfig, snapshot.CurrentConfigErr = cachedConfig(p.client, p.kcfg)
-	} else {
-		snapshot.Config, snapshot.CurrentConfig, snapshot.CurrentConfigErr = resolveConfig(configSnapshot, p.kcfg)
-	}
-	return snapshot, nil
+	return pollPanel(ctx, p.client, p.kcfg)
 }
 
 func (p *MachinePanelControlPlane) FetchDevices(ctx context.Context) (map[int][]string, error) {

@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -55,11 +54,10 @@ type Service struct {
 	kernelRetryAt       time.Time
 	kernelRetryFailures int
 
-	// rebuildRetry* back off failed same-kernel rebuilds, separately from
-	// kernel switches so that two different failures do not reset each other.
-	rebuildRetryKey      string
-	rebuildRetryAt       time.Time
-	rebuildRetryFailures int
+	// Config, certificate and user rebuilds retry independently.
+	rebuildRetry     rebuildBackoff
+	certRenewRetry   rebuildBackoff
+	userRebuildRetry rebuildBackoff
 
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
@@ -160,10 +158,11 @@ type pullResult struct {
 	wsDeviceRevision    uint64
 	deviceFetchRevision uint64
 	deviceUsers         map[int][]string
-	// currentConfig is what the panel still serves when it answered 304.
+	// currentConfig is what the panel serves, even when this poll cannot apply it.
 	currentConfig    *model.NodeSpec
 	currentConfigErr error
 	wsConfigRevision uint64
+	partialPoll      bool
 }
 
 type deviceSnapshotResult struct {
@@ -503,13 +502,6 @@ func (s *Service) markMailboxReadyAndDrain(ctx context.Context) {
 	if s.machineMailbox == nil {
 		return
 	}
-	// Seed mailbox with bootstrap state so delta events can be applied
-	// incrementally instead of always triggering REST reconciliation.
-	s.metricsMu.RLock()
-	users := s.lastUsers
-	config := s.lastConfig
-	s.metricsMu.RUnlock()
-	s.machineMailbox.SeedBaseline(users, config)
 	s.machineMailbox.MarkReady()
 	s.drainMachineMailbox(ctx)
 }
@@ -518,7 +510,19 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 	if s.machineMailbox == nil {
 		return
 	}
-	state := s.machineMailbox.DrainIfReady()
+	users := s.lastUsers
+	if users == nil && s.lastUserHash != "" {
+		users = []model.UserSpec{}
+	}
+	state := s.machineMailbox.DrainIfReady(users)
+	stagedUsers := state.HasConfig && state.HasUsers && !s.kernel.IsRunning()
+	if stagedUsers {
+		// Apply the coalesced users before a config can start a stopped
+		// listener. Otherwise that start could reuse revoked credentials.
+		s.wsUserRevision++
+		s.updateUserState(state.Users)
+		state.HasUsers = false
+	}
 	if state.ConfigErr != nil {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncConfig, ConfigErr: state.ConfigErr})
 	} else if state.HasConfig {
@@ -526,6 +530,10 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 	}
 	if state.HasUsers {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncUsers, Users: state.Users})
+	} else if stagedUsers {
+		// A failed candidate or an unchanged config can leave the listener
+		// stopped. Try the active config with the newly staged list.
+		s.ensureRunning()
 	}
 	if state.HasDevices || len(state.DeviceBans) > 0 {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncDevices, DeviceUsers: state.DeviceUsers, DeviceBans: state.DeviceBans})
@@ -769,10 +777,15 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		snapshot, err := s.source.Poll(ctx)
 		if err != nil {
 			nlog.Core().Error("poll control plane failed", "error", err)
-			s.pullBackoff.onFailure()
-			return
+			if snapshot.Users == nil {
+				s.pullBackoff.onFailure()
+			}
+			if snapshot.Users == nil && snapshot.CurrentConfig == nil && snapshot.CurrentConfigErr == nil {
+				return
+			}
+		} else {
+			s.pullBackoff.onSuccess()
 		}
-		s.pullBackoff.onSuccess()
 
 		result := pullResult{
 			wsUserRevision:      currentWSUserRevision,
@@ -782,6 +795,7 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 			wsConfigRevision:    currentWSConfigRevision,
 			currentConfig:       snapshot.CurrentConfig,
 			currentConfigErr:    snapshot.CurrentConfigErr,
+			partialPoll:         err != nil,
 		}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
@@ -819,29 +833,27 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	if result.wsConfigRevision != s.wsConfigRevision {
 		// A WS config arrived while this poll was in flight; it is newer.
 		result.config = nil
+	} else if result.currentConfigErr != nil {
+		// The panel returned a config this node cannot run. Withdraw the
+		// earlier candidate even if the current body could not be decoded.
+		s.discardPendingConfig(result.currentConfigErr)
 	} else if result.config != nil {
-		s.pendingConfig = result.config
+		s.setPolledCandidate(result.config)
 	} else if result.currentConfig != nil {
-		// HTTP 304 names the config the panel still serves. It supersedes a
-		// pending config after a rollback whose WS event was lost, and recovers
-		// a config whose earlier 200 was discarded because the poll failed.
+		// A 304 or partial poll still identifies the config the panel serves.
 		current := computeConfigHash(result.currentConfig)
 		switch {
-		case result.currentConfigErr != nil:
-			// The panel serves a config this node cannot run, or the candidate
-			// stopped validating. Keep serving the active config instead of
-			// retrying a stale candidate.
-			s.discardPendingConfig(result.currentConfigErr)
 		case s.pendingConfig != nil && current == computeConfigHash(s.pendingConfig):
 		case current == s.lastConfigHash:
 			s.clearWithdrawnCandidate()
 		default:
-			s.pendingConfig = result.currentConfig
+			s.setPolledCandidate(result.currentConfig)
 		}
 	}
 	spec := s.pendingConfig
-	retryCert := s.certTarget != nil && !s.certInFlight && !time.Now().Before(s.certRetryAt)
-	if spec == nil && (s.certificateChanged() || retryCert || s.lastConfigHash == "") {
+	if result.partialPoll {
+		spec = nil // Wait for a complete poll before applying a candidate.
+	} else if retryCert := s.certTarget != nil && !s.certInFlight && !time.Now().Before(s.certRetryAt); spec == nil && (retryCert || s.lastConfigHash == "") {
 		spec = s.lastConfig
 	}
 
@@ -879,6 +891,16 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		// been fixed. Retry with what we have.
 		s.ensureRunning()
 	}
+	s.refreshActiveCertificate()
+}
+
+func (s *Service) setPolledCandidate(spec *model.NodeSpec) {
+	if s.pendingConfig == nil || computeConfigHash(s.pendingConfig) != computeConfigHash(spec) {
+		// A result for an earlier ACME target must not apply this candidate
+		// before its config and user snapshots are both available.
+		s.setCertificateTarget(nil)
+	}
+	s.pendingConfig = spec
 }
 
 // handlePullTick polls the panel when the WebSocket is down. With a healthy
@@ -887,12 +909,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 // re-reads the users now, and a kernel left stopped by a failed rebuild is
 // restarted with the state the node already has.
 func (s *Service) handlePullTick(ctx context.Context) {
-	if s.lastConfig != nil && s.certificateChanged() &&
-		(s.pendingConfig == nil || computeConfigHash(s.pendingConfig) == s.lastConfigHash) {
-		// Renewals are local. Apply them even if polling is unavailable or
-		// the panel is temporarily unreachable.
-		s.applyConfigUpdate(ctx, s.lastConfig)
-	}
+	s.refreshActiveCertificate()
 	if !s.kernel.IsRunning() {
 		// Before the re-read below: the panel may be unreachable, and the
 		// stopped kernel must not wait for it.
@@ -906,15 +923,6 @@ func (s *Service) handlePullTick(ctx context.Context) {
 		nlog.Core().Debug("polling from API (ws not connected)")
 		s.pullViaAPIAsync(ctx)
 	}
-}
-
-func (s *Service) certificateChanged() bool {
-	if !s.kernel.IsRunning() {
-		return false
-	}
-	tls := s.cert.TLSCert()
-	return !bytes.Equal(tls.CertPEM, s.appliedState.TLS.CertPEM) ||
-		!bytes.Equal(tls.KeyPEM, s.appliedState.TLS.KeyPEM)
 }
 
 // clearWithdrawnCandidate drops a pending config that differs from the
@@ -1074,12 +1082,11 @@ func (s *Service) ensureRunning() bool {
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
 	if !s.kernel.IsRunning() {
-		prevUsers, prevHash := s.prepareUserState(users)
-		if len(users) == 0 || s.lastConfig == nil {
-			return
-		}
-		if !s.startKernel(s.lastConfig, users) {
-			s.userUpdateFailed(prevUsers, prevHash)
+		// With no serving listener, this is the list to use on every start
+		// attempt. Restoring the old list would undo accepted revocations.
+		s.updateUserState(users)
+		if len(users) > 0 && s.lastConfig != nil && !s.ensureRunning() {
+			s.userRefetch = true
 		}
 		return
 	}
@@ -1093,9 +1100,13 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 			s.kernel.Stop()
 			return
 		}
-		if err := s.rebuildKernel(s.lastConfig, users, prevUsers, s.appliedState.TLS, s.appliedState.CustomConfig); err != nil {
+		if err := s.rebuildKernel(s.lastConfig, users, prevUsers, s.appliedState.TLS, s.appliedState.CustomConfig, &s.userRebuildRetry); err != nil {
 			nlog.Core().Error("kernel rebuild for user update failed", "error", err)
-			s.userUpdateFailed(prevUsers, prevHash)
+			if s.kernel.IsRunning() {
+				s.userUpdateFailed(prevUsers, prevHash)
+			} else {
+				s.userRefetch = true
+			}
 			return
 		}
 		s.recordKernelStarted(s.lastConfig, users, s.appliedState.TLS)
@@ -1140,12 +1151,10 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		prevUsers, prevHash := s.prepareUserState(merged)
 		added, err := s.kernel.AddUsers(deltaUsers)
 		if err != nil {
-			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
-			if _, _, err := s.kernel.UpdateUsers(merged); err != nil {
-				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
-				s.userUpdateFailed(prevUsers, prevHash)
-				return
-			}
+			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to full update", err))
+			s.restoreUserState(prevUsers, prevHash)
+			s.applyUserUpdate(ctx, merged, "")
+			return
 		}
 		if s.nodeLog != nil && added > 0 {
 			s.nodeLog.Info(fmt.Sprintf("users added: +%d", added))

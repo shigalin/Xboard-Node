@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,6 +23,28 @@ type certificateResult struct {
 	config  config.CertConfig
 	manager *cert.Manager
 	err     error
+}
+
+// refreshActiveCertificate uses the already applied config and the active
+// manager's renewed PEM. It leaves any candidate config and ACME job alone.
+func (s *Service) refreshActiveCertificate() {
+	spec := s.appliedState.Config
+	if spec == nil || !requiresTLSCertificate(spec) || !s.kernel.IsRunning() {
+		return
+	}
+	tls := s.cert.TLSCert()
+	if !tls.HasCert() || (bytes.Equal(tls.CertPEM, s.appliedState.TLS.CertPEM) &&
+		bytes.Equal(tls.KeyPEM, s.appliedState.TLS.KeyPEM)) {
+		return
+	}
+	if err := s.reloadRunningKernel(spec, tls, s.appliedState.CustomConfig, &s.certRenewRetry); err != nil {
+		if !errors.Is(err, errKernelSwitchDeferred) {
+			nlog.Core().Warn("failed to apply renewed certificate", "error", err)
+		}
+		return
+	}
+	s.appliedState.TLS = tls
+	s.certRenewRetry = rebuildBackoff{}
 }
 
 func (s *Service) setCertificateTarget(target *config.CertConfig) {

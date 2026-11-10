@@ -20,6 +20,34 @@ import (
 	"github.com/cedar2025/xboard-node/internal/model"
 )
 
+func TestHysteriaV1UserDeltaRebuildsExplicitly(t *testing.T) {
+	ctx := context.Background()
+	listener, err := net.ListenPacket("udp", "[::]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.LocalAddr().(*net.UDPAddr).Port
+	listener.Close()
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox", ConfigDir: t.TempDir(), LogLevel: "error"},
+		Cert: config.CertConfig{CertMode: "self"}}
+	s := NewWithControlPlane(cfg, &kernelTestControlPlane{})
+	defer s.kernel.Stop()
+	defer s.cert.Stop()
+	if err := s.cert.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}})
+	spec := &model.NodeSpec{Protocol: "hysteria", Version: 1, ServerPort: port, UpMbps: 100, DownMbps: 100}
+	if err := s.applyNodeConfig(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "add",
+		DeltaUsers: []model.UserSpec{{ID: 2, UUID: "22222222-2222-4222-8222-222222222222"}}})
+	if !s.kernel.IsRunning() || len(s.appliedState.Users) != 2 || !hasUser(s.appliedState.Users, 2) || s.userRefetch {
+		t.Fatal("service did not rebuild the Hysteria v1 listener with the new user")
+	}
+}
+
 func TestKernelSwitchWaitsForCertificateAndRetriesREST304(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

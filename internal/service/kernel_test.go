@@ -229,7 +229,7 @@ func TestKernelSwitchRollbackKeepsOldKernelCustomConfigSnapshot(t *testing.T) {
 	}
 }
 
-func TestUserUpdateRefusedByCustomConfigRefetchesUsers(t *testing.T) {
+func TestStoppedUserUpdateSurvivesRefusedStart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "custom.json")
 	if err := os.WriteFile(path, []byte(`{"route":{"rules":[]}}`), 0o644); err != nil {
@@ -254,8 +254,8 @@ func TestUserUpdateRefusedByCustomConfigRefetchesUsers(t *testing.T) {
 	if stopped.startCalls != 0 {
 		t.Fatal("kernel started with a foreign custom_config")
 	}
-	if len(s.lastUsers) != 0 || !s.userRefetch {
-		t.Fatalf("refused start must keep the kernel's state and re-read users: last=%d refetch=%v", len(s.lastUsers), s.userRefetch)
+	if len(s.lastUsers) != 1 || !s.userRefetch {
+		t.Fatalf("refused start must preserve the received users and re-read: last=%d refetch=%v", len(s.lastUsers), s.userRefetch)
 	}
 	// The file is fixed and the re-read list arrives.
 	if err := os.WriteFile(path, []byte(`{"route":{"rules":[]}}`), 0o644); err != nil {
@@ -982,8 +982,8 @@ func TestREST304ResolvesPendingConfigAgainstPanelConfig(t *testing.T) {
 		s, panelServer, poll := setup(t, singbox)
 		pending := pushB(t, s)
 		panelServer.set(configB, true)
-		if poll() {
-			t.Fatal("poll with a failing user endpoint produced a result")
+		if !poll() || s.lastConfig.ServerPort != 20001 || s.pendingConfig == nil {
+			t.Fatal("partial poll disturbed the active or pending config")
 		}
 		panelServer.set(configB, false)
 		if !poll() {
@@ -996,9 +996,17 @@ func TestREST304ResolvesPendingConfigAgainstPanelConfig(t *testing.T) {
 
 	t.Run("config from a failed poll is applied after 304", func(t *testing.T) {
 		s, panelServer, poll := setup(t, singbox)
+		pushB(t, s)
+		oldTarget := config.CertConfig{CertMode: "http", Domain: "old.example"}
+		s.setCertificateTarget(&oldTarget)
+		s.certInFlight = true
 		panelServer.set(configC, true)
-		if poll() {
-			t.Fatal("poll with a failing user endpoint produced a result")
+		if !poll() || s.lastConfig.ServerPort != 20001 || s.pendingConfig == nil || s.pendingConfig.ServerPort != 20003 {
+			t.Fatal("partial poll must replace the candidate without applying it")
+		}
+		s.handleCertificateResult(context.Background(), certificateResult{config: oldTarget, manager: cert.NewCandidate(oldTarget)})
+		if s.lastConfig.ServerPort != 20001 || s.certTarget != nil {
+			t.Fatal("an obsolete certificate result applied a config before the user fetch recovered")
 		}
 		panelServer.set(configC, false)
 		if !poll() {
@@ -1109,51 +1117,6 @@ func TestREST304ResolvesPendingConfigAgainstPanelConfig(t *testing.T) {
 		}
 		if s.lastConfigHash != active || !s.kernel.IsRunning() {
 			t.Fatal("active config was disturbed")
-		}
-	})
-
-	t.Run("pending certificate reload survives an invalid 304", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "custom.json")
-		if err := os.WriteFile(path, []byte(`{"route":{"rules":[]}}`), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		s, _, poll := setup(t, config.KernelConfig{Type: "singbox", CustomConfig: path})
-		active := computeConfigHash(s.lastConfig)
-		// The certificate renews while custom_config is temporarily in Xray's format.
-		if err := os.WriteFile(path, []byte(`{"routing":{"rules":[]}}`), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		s.cert = cert.NewManager(config.CertConfig{CertMode: "self"})
-		if err := s.cert.Start(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		defer s.cert.Stop()
-		s.applyPullResult(context.Background(), pullResult{wsConfigRevision: s.wsConfigRevision})
-		if s.pendingConfig == nil || computeConfigHash(s.pendingConfig) != active {
-			t.Fatal("failed certificate reload did not queue the active config for retry")
-		}
-		// The panel resends the active config over WebSocket.
-		resent := *s.lastConfig
-		s.handleWSEvent(context.Background(), controlplane.Event{Type: controlplane.EventSyncConfig, Config: &resent})
-		if s.pendingConfig == nil {
-			t.Fatal("WS resend of the active config discarded the pending certificate reload")
-		}
-		// The panel still serves the active config, which does not validate right now.
-		if !poll() {
-			t.Fatal("poll failed")
-		}
-		if s.pendingConfig == nil {
-			t.Fatal("invalid 304 discarded the pending certificate reload")
-		}
-		// Once the file is native again the reload goes through.
-		if err := os.WriteFile(path, []byte(`{"route":{"rules":[]}}`), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if !poll() {
-			t.Fatal("poll failed")
-		}
-		if s.pendingConfig != nil || s.lastConfigHash != active || !s.kernel.IsRunning() {
-			t.Fatal("certificate reload was not applied after custom_config was fixed")
 		}
 	})
 
@@ -1365,9 +1328,7 @@ func TestFailedReReadKeepsRefetchPending(t *testing.T) {
 	panelServer.mu.Lock()
 	panelServer.usersDown = true
 	panelServer.mu.Unlock()
-	if pollAndApply(t, s, nil) {
-		t.Fatal("a poll with a failing user endpoint produced a result")
-	}
+	pollAndApply(t, s, nil)
 	if !s.userRefetch {
 		t.Fatal("a failed re-read cleared the pending re-read")
 	}
