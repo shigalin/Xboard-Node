@@ -134,8 +134,9 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 }
 
 // loadPersistedPEM loads previously persisted cert material from cert_dir.
+// When domain is non-empty, the certificate must cover it before reuse.
 // Returns true if valid material was loaded.
-func (m *Manager) loadPersistedPEM() bool {
+func (m *Manager) loadPersistedPEM(domain string) bool {
 	dir := m.cfg.CertDir
 	if dir == "" {
 		return false
@@ -148,9 +149,21 @@ func (m *Manager) loadPersistedPEM() bool {
 	if err != nil {
 		return false
 	}
-	if err := validateKeyPair(certPEM, keyPEM); err != nil {
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
 		nlog.Core().Warn("cert: persisted cert invalid, will regenerate", "error", err)
 		return false
+	}
+	if domain != "" {
+		leaf, err := x509.ParseCertificate(pair.Certificate[0])
+		if err != nil {
+			nlog.Core().Warn("cert: persisted cert invalid, will regenerate", "error", err)
+			return false
+		}
+		if err := leaf.VerifyHostname(domain); err != nil {
+			nlog.Core().Warn("cert: persisted cert does not match domain, will regenerate", "domain", domain, "error", err)
+			return false
+		}
 	}
 	// Store in memory only (don't re-persist what we just read).
 	m.mat.Store(&certMaterial{certPEM: certPEM, keyPEM: keyPEM})
@@ -338,14 +351,13 @@ func (m *Manager) startFile() error {
 // ─── Mode: self ────────────────────────────────────────────────────────────
 
 func (m *Manager) startSelfSigned() error {
-	// Reuse persisted self-signed cert if available and valid.
-	if m.loadPersistedPEM() {
-		return nil
-	}
-
 	domain := m.cfg.Domain
 	if domain == "" {
 		domain = "localhost"
+	}
+	// Reuse persisted self-signed cert only if it covers the configured domain.
+	if m.loadPersistedPEM(domain) {
+		return nil
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -397,7 +409,7 @@ func (m *Manager) startSelfSigned() error {
 func (m *Manager) startContent() error {
 	if m.cfg.CertContent == "" || m.cfg.KeyContent == "" {
 		// No fresh content from panel — try previously persisted material.
-		if m.loadPersistedPEM() {
+		if m.loadPersistedPEM("") {
 			return nil
 		}
 		return fmt.Errorf("cert_mode 'content' requires both cert_content and key_content")

@@ -1,17 +1,154 @@
 package panel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/gorilla/websocket"
 )
+
+type lockedLogBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
+func TestWSDialErrorDoesNotExposeToken(t *testing.T) {
+	const token = "sensitive test+value"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// A malformed handshake can echo the request token into a dial error.
+		fmt.Fprintf(conn, "HTTP/1.1 %s Bad Handshake\r\n\r\n", r.URL.Query().Get("token"))
+	}))
+	defer server.Close()
+
+	ws := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), token, 1, WSClientConfig{}, nil, nil, nil)
+	err := ws.connect(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "malformed HTTP status code") {
+		t.Error("dial error cause was lost")
+	}
+	if err != nil && (strings.Contains(err.Error(), token) || strings.Contains(err.Error(), url.QueryEscape(token))) {
+		t.Error("dial error exposed token")
+	}
+}
+
+func TestWSAuthFailureDoesNotExposeToken(t *testing.T) {
+	const token = "sensitive test+value"
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wsMessage{Event: "error", Data: json.RawMessage(`{"message":"invalid ` + token + `"}`)})
+	}))
+	defer server.Close()
+
+	ws := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), token, 1, WSClientConfig{}, nil, nil, nil)
+	if err := ws.connect(context.Background()); err == nil || !strings.Contains(err.Error(), "auth failed") {
+		t.Error("authentication error cause was lost")
+	} else if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), url.QueryEscape(token)) {
+		t.Error("authentication error exposed token")
+	}
+
+	var logs lockedLogBuffer
+	nlog.Init(&logs, slog.LevelDebug, false)
+	t.Cleanup(func() { nlog.Init(os.Stdout, slog.LevelInfo, true) })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	// Stop after the first failure so the test covers the production logging path.
+	ws.onStatus = func(WSStatusChange) { cancel() }
+	ws.Run(ctx)
+	if strings.Contains(logs.String(), token) || strings.Contains(logs.String(), url.QueryEscape(token)) {
+		t.Error("WS error log exposed token")
+	}
+}
+
+func TestWSDebugLogsNeverIncludeRawMessagesOrToken(t *testing.T) {
+	const token = "sensitive test+value"
+	upgrader := websocket.Upgrader{}
+	received := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wsMessage{Event: "auth.success", Data: json.RawMessage(`{"credential":"` + token + `"}`)})
+		conn.WriteJSON(wsMessage{Event: "ping", Data: json.RawMessage(`{"credential":"` + token + `"}`)})
+		var msg wsMessage
+		for conn.ReadJSON(&msg) == nil {
+			if msg.Event == token {
+				received <- struct{}{}
+			}
+		}
+	}))
+	defer server.Close()
+
+	var logs lockedLogBuffer
+	nlog.Init(&logs, slog.LevelDebug, false)
+	t.Cleanup(func() { nlog.Init(os.Stdout, slog.LevelInfo, true) })
+	ws := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), token, 1, WSClientConfig{}, nil, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	connected := make(chan struct{}, 1)
+	ws.onStatus = func(status WSStatusChange) {
+		if status.Connected {
+			connected <- struct{}{}
+		}
+	}
+	done := make(chan struct{})
+	go func() { ws.Run(ctx); close(done) }()
+	select {
+	case <-connected:
+	case <-ctx.Done():
+		t.Fatal("WS did not connect")
+	}
+	if !ws.SendRaw(token, json.RawMessage(`{"credential":"`+token+`"}`)) {
+		t.Error("failed to queue outgoing message")
+	}
+	select {
+	case <-received:
+	case <-ctx.Done():
+		t.Error("WS did not send outgoing message")
+	}
+	cancel()
+	<-done
+	if strings.Contains(logs.String(), token) || strings.Contains(logs.String(), url.QueryEscape(token)) || strings.Contains(logs.String(), "credential") {
+		t.Error("WS debug log exposed authentication or message data")
+	}
+	if !strings.Contains(logs.String(), "ws connecting") || strings.Count(logs.String(), "ws recv") < 2 || !strings.Contains(logs.String(), "ws send") {
+		t.Error("WS debug paths were not exercised")
+	}
+}
 
 // fakeWSServer simulates a minimal Workerman-style WS server for testing.
 // It authenticates via token/node_id query params, sends auth.success, then
@@ -147,6 +284,40 @@ func TestWSClient_ConnectAndReceiveDataEvents(t *testing.T) {
 
 	if !ws.IsConnected() {
 		t.Error("expected IsConnected() = true while server is running")
+	}
+}
+
+func TestWSClient_EmptyUsersSnapshot(t *testing.T) {
+	server := fakeWSServer(t, []wsMessage{
+		{Event: WSEventSyncUsers, Data: json.RawMessage(`{"node_id":2,"users":[{"id":1,"uuid":"abc"}]}`)},
+		{Event: WSEventSyncUsers, Data: json.RawMessage(`{"node_id":2,"users":[]}`)},
+	})
+	defer server.Close()
+
+	events := make(chan WSEvent, 2)
+	ws := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), "test-token", 2, WSClientConfig{}, func(event WSEvent) {
+		events <- event
+	}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go ws.Run(ctx)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case event := <-events:
+			if event.Type != WSEventSyncUsers || event.NodeID != 2 {
+				t.Fatalf("event[%d] = %+v, want sync.users for node 2", i, event)
+			}
+			if i == 0 && len(event.Users) != 1 {
+				t.Fatalf("initial snapshot = %+v, want one user", event.Users)
+			}
+			if i == 1 && (event.Users == nil || len(event.Users) != 0) {
+				t.Fatalf("revocation snapshot = %+v, want non-nil empty users", event.Users)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for users snapshot %d", i)
+		}
 	}
 }
 

@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,12 +74,14 @@ type Xray struct {
 	protocol        string
 	inboundTag      string
 	lastKernelHash  string
+	metricsListen   string
 	cumTraffic      map[int][2]int64
 	// draining keeps replaced instances reachable until their connections
 	// close and their final counters have been collected.
 	draining        map[*xrayCore.Instance]*drainingInstance
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
+	userManagerFunc func() (xrayProxy.UserManager, error) // test seam for core removal failures
 
 	// devices is the admission state shared by every dispatcher this kernel
 	// creates. Global snapshots and bans live here, so they need no replay
@@ -221,6 +226,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
+	x.metricsListen = metricsListen(x.cfg.CustomConfigData)
 	x.running.Store(true)
 	x.mu.Unlock()
 
@@ -258,6 +264,54 @@ func (x *Xray) SetCustomConfig(data map[string]any) {
 	x.mu.Lock()
 	x.cfg.CustomConfigData = data
 	x.mu.Unlock()
+}
+
+// CanReplaceInPlace reports whether the old and new instances can coexist.
+// Xray's proxy listeners support overlapping starts, but its metrics listener
+// binds a normal TCP socket and cannot be opened twice.
+func (x *Xray) CanReplaceInPlace(spec *model.NodeSpec) bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.instance == nil {
+		return true
+	}
+	port := func(address string) string {
+		if address == "" {
+			return ""
+		}
+		_, number, err := net.SplitHostPort(address)
+		if err != nil {
+			return address // Invalid addresses will fail CheckConfig; do not assume sharing is safe.
+		}
+		return number
+	}
+	oldMetrics, newMetrics := port(x.metricsListen), port(metricsListen(x.cfg.CustomConfigData))
+	if oldMetrics != "" && (oldMetrics == newMetrics || oldMetrics == strconv.Itoa(spec.ServerPort)) {
+		return false
+	}
+	if newMetrics != "" && x.nodeConfig != nil && newMetrics == strconv.Itoa(x.nodeConfig.ServerPort) {
+		return false
+	}
+	return true
+}
+
+func metricsListen(custom map[string]any) string {
+	for key, value := range custom {
+		if !strings.EqualFold(key, "metrics") {
+			continue
+		}
+		fields, ok := value.(map[string]any)
+		if !ok {
+			return ""
+		}
+		for field, address := range fields {
+			if strings.EqualFold(field, "listen") {
+				listen, _ := address.(string)
+				return listen
+			}
+		}
+	}
+	return ""
 }
 
 // CheckConfig checks generated configuration without binding the proxy listener.
@@ -485,19 +539,11 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	nc := x.nodeConfig
 	x.mu.Unlock()
 
-	ctx := context.Background()
-	added := 0
-	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
-		if err != nil {
-			nlog.Core().Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
-			continue
-		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
-			continue
-		}
-		added++
+	// Build all accounts before changing the authenticator, and undo earlier
+	// additions if the core rejects a later user. Keep admission/bookkeeping
+	// unchanged on failure so the service can reconcile with UpdateUsers.
+	if err := applyUserChanges(um, proto, nc, toAdd, nil); err != nil {
+		return 0, fmt.Errorf("add users: %w", err)
 	}
 
 	// Update bookkeeping with full merged list (new users + updated properties).
@@ -508,8 +554,8 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	x.updateBandwidthLimits(merged)
 	x.devices.UpdateUsers(merged)
 
-	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(merged))
-	return added, nil
+	nlog.Core().Info("xray: users added via UserManager", "added", len(toAdd), "total", len(merged))
+	return len(toAdd), nil
 }
 
 // RemoveUsers removes users from the running kernel via xray's UserManager API.
@@ -524,15 +570,15 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	for _, u := range users {
 		removeSet[u.ID] = struct{}{}
 	}
-	var kept []model.UserSpec
-	removed := 0
+	var kept, toRemove []model.UserSpec
 	for _, u := range x.users {
 		if _, rm := removeSet[u.ID]; rm {
-			removed++
+			toRemove = append(toRemove, u)
 		} else {
 			kept = append(kept, u)
 		}
 	}
+	removed := len(toRemove)
 	if removed == 0 {
 		x.mu.Unlock()
 		return 0, nil
@@ -561,15 +607,16 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	}
 	x.mu.Unlock()
 
-	ctx := context.Background()
 	actualRemoved := 0
-	for _, u := range users {
-		email := userEmail(u.ID)
-		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
-			continue
+	for _, u := range toRemove {
+		if um.GetUser(context.Background(), userEmail(u.ID)) != nil {
+			actualRemoved++
 		}
-		actualRemoved++
+	}
+	// Roll back any earlier removals on failure so the full-update fallback
+	// can diff against the unchanged authenticator and bookkeeping.
+	if err := applyUserChanges(um, x.protocol, x.nodeConfig, nil, toRemove); err != nil {
+		return 0, fmt.Errorf("remove users: %w", err)
 	}
 
 	x.mu.Lock()
@@ -577,7 +624,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
 	x.updateBandwidthLimits(kept)
-	x.dropBandwidthLimits(users, kept)
+	x.dropBandwidthLimits(toRemove, kept)
 	x.devices.UpdateUsers(kept)
 
 	nlog.Core().Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
@@ -656,6 +703,9 @@ var _ kernel.Kernel = (*Xray)(nil)
 // inbound handler. Must be called with x.mu held.
 // Returns error for protocols that don't support UserManager (socks, http).
 func (x *Xray) getUserManager() (xrayProxy.UserManager, error) {
+	if x.userManagerFunc != nil {
+		return x.userManagerFunc()
+	}
 	if x.instance == nil {
 		return nil, fmt.Errorf("instance is nil")
 	}

@@ -1,9 +1,15 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -17,6 +23,204 @@ func newTestServer(handler http.HandlerFunc) (*httptest.Server, *Client) {
 		NodeID: 1,
 	})
 	return ts, client
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestAuthenticatedGETTransportErrorsDoNotExposeToken(t *testing.T) {
+	const token = "sensitive test+value"
+	for name, call := range map[string]func(*Client) error{
+		"config":      func(c *Client) error { _, err := c.GetConfig(); return err },
+		"users":       func(c *Client) error { _, err := c.GetUsers(); return err },
+		"devices":     func(c *Client) error { _, err := c.GetDevices(); return err },
+		"device bans": func(c *Client) error { _, err := c.SyncDeviceBans(context.Background(), nil); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cause := errors.New("transport unavailable")
+			client := NewClient(config.PanelConfig{URL: "http://panel.invalid", Token: token, NodeID: 1})
+			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Query().Get("token") != token {
+					t.Error("GET request did not authenticate")
+				}
+				return nil, cause
+			})
+			err := call(client)
+			if err == nil || !errors.Is(err, cause) {
+				t.Error("transport cause was lost")
+			}
+			if err != nil && (strings.Contains(err.Error(), token) || strings.Contains(err.Error(), url.QueryEscape(token))) {
+				t.Error("transport error exposed token")
+			}
+		})
+	}
+}
+
+func TestAuthenticatedGETTransportErrorWithURLDoesNotExposeToken(t *testing.T) {
+	const token = "sensitive test+value"
+	client := NewClient(config.PanelConfig{URL: "http://panel.invalid", Token: token, NodeID: 1})
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("transport unavailable: %s", r.URL.String())
+	})
+	_, err := client.GetConfig()
+	if err == nil || !strings.Contains(err.Error(), "transport unavailable") {
+		t.Error("transport cause was lost")
+	}
+	if err != nil && (strings.Contains(err.Error(), token) || strings.Contains(err.Error(), url.QueryEscape(token))) {
+		t.Error("transport error exposed token")
+	}
+}
+
+func TestAuthenticatedGETErrorResponseDoesNotExposeToken(t *testing.T) {
+	const token = "sensitive test+value"
+	for name, call := range map[string]func(*Client) error{
+		"config":      func(c *Client) error { _, err := c.GetConfig(); return err },
+		"users":       func(c *Client) error { _, err := c.GetUsers(); return err },
+		"devices":     func(c *Client) error { _, err := c.GetDevices(); return err },
+		"device bans": func(c *Client) error { _, err := c.SyncDeviceBans(context.Background(), nil); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("token") != token {
+					t.Error("GET request did not authenticate")
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(w, "upstream unavailable: ", r.URL.String(), " ", token)
+			}))
+			defer ts.Close()
+
+			client := NewClient(config.PanelConfig{URL: ts.URL, Token: token, NodeID: 1})
+			err := call(client)
+			if err == nil {
+				t.Fatal("expected error for 500 response")
+			}
+			if !strings.Contains(err.Error(), "status 500") || strings.Contains(err.Error(), "upstream unavailable") {
+				t.Error("status was lost or remote response body was returned")
+			}
+			if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), url.QueryEscape(token)) {
+				t.Error("response error exposed token")
+			}
+		})
+	}
+}
+
+func TestAuthenticatedPOSTErrorResponsesDoNotExposeToken(t *testing.T) {
+	const token = "sensitive <test+value>&"
+	jsonToken, _ := json.Marshal(token)
+	escapedToken := string(jsonToken[1 : len(jsonToken)-1])
+
+	for _, tc := range []struct {
+		name      string
+		path      string
+		machineID int
+		call      func(*Client) error
+	}{
+		{"traffic", "/api/v1/server/UniProxy/push", 0, func(c *Client) error {
+			return c.PushTraffic(map[int][2]int64{1: {100, 200}})
+		}},
+		{"handshake", "/api/v2/server/handshake", 0, func(c *Client) error {
+			_, err := c.Handshake()
+			return err
+		}},
+		{"machine nodes", "/api/v2/server/machine/nodes", 3, func(c *Client) error {
+			_, err := c.GetMachineNodes()
+			return err
+		}},
+		{"machine status", "/api/v2/server/machine/status", 3, func(c *Client) error {
+			return c.ReportMachineStatus(1, [2]uint64{}, [2]uint64{}, [2]uint64{}, -1, -1)
+		}},
+		{"device bans", "/api/v2/server/device-bans", 3, func(c *Client) error {
+			_, err := c.SyncDeviceBans(context.Background(), map[int]int64{1: 1})
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != tc.path {
+					t.Error("unexpected request method or path")
+				}
+				requestBody, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error("failed to read request body")
+					return
+				}
+				var payload map[string]interface{}
+				if json.Unmarshal(requestBody, &payload) != nil || payload["token"] != token {
+					t.Error("POST request did not authenticate")
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(w, "upstream unavailable: ", string(requestBody), " token=", url.QueryEscape(token), " ", token)
+			}))
+			defer ts.Close()
+
+			client := NewClient(config.PanelConfig{URL: ts.URL, Token: token, NodeID: 1, MachineID: tc.machineID})
+			err := tc.call(client)
+			if err == nil {
+				t.Fatal("expected error for 500 response")
+			}
+			message := err.Error()
+			if !strings.Contains(message, "status 500") || strings.Contains(message, "upstream unavailable") || strings.Contains(message, "[REDACTED]") {
+				t.Error("status was lost or remote response body was returned")
+			}
+			for _, exposed := range []string{token, url.QueryEscape(token), escapedToken} {
+				if strings.Contains(message, exposed) {
+					t.Error("response error exposed token")
+				}
+			}
+		})
+	}
+}
+
+func TestAuthenticatedErrorResponseEscapedTokenDoesNotLeak(t *testing.T) {
+	const token = "sek/ret"
+	const escapedToken = `sek\\/ret`
+	const htmlToken = "sek&#47;ret"
+	const diagnostic = "upstream unavailable"
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		call   func(*Client) error
+	}{
+		{"GET", http.MethodGet, func(c *Client) error { _, err := c.GetConfig(); return err }},
+		{"POST", http.MethodPost, func(c *Client) error { return c.PushTraffic(map[int][2]int64{1: {1, 2}}) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != tc.method {
+					t.Error("unexpected request method")
+				}
+				if r.Method == http.MethodGet {
+					if r.URL.Query().Get("token") != token {
+						t.Error("GET request did not authenticate")
+					}
+				} else {
+					var payload map[string]interface{}
+					if json.NewDecoder(r.Body).Decode(&payload) != nil || payload["token"] != token {
+						t.Error("POST request did not authenticate")
+					}
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(w, diagnostic, ": ", escapedToken, " ", htmlToken)
+			}))
+			defer ts.Close()
+
+			client := NewClient(config.PanelConfig{URL: ts.URL, Token: token, NodeID: 1})
+			err := tc.call(client)
+			if err == nil {
+				t.Fatal("expected error for 500 response")
+			}
+			if !strings.Contains(err.Error(), "status 500") {
+				t.Error("response status was lost")
+			}
+			for _, exposed := range []string{diagnostic, token, url.QueryEscape(token), escapedToken, htmlToken} {
+				if strings.Contains(err.Error(), exposed) {
+					t.Error("remote response body or token encoding was returned")
+				}
+			}
+		})
+	}
 }
 
 func TestGetConfig_Success(t *testing.T) {

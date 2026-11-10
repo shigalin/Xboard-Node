@@ -22,6 +22,7 @@ type nodeHandle struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 	mailbox *controlplane.NodeMailbox
+	certDir string // canonical directory reserved until the service exits
 }
 
 // Orchestrator manages all nodes bound to a panel machine. It:
@@ -33,8 +34,10 @@ type Orchestrator struct {
 	cfg    *config.Config
 	client *panel.Client // machine-level client (no node_id)
 
-	mu    sync.Mutex
-	nodes map[int]*nodeHandle // node_id → handle
+	mu          sync.Mutex
+	discoveryMu sync.Mutex          // serialize periodic and WS-triggered reconciliation
+	nodes       map[int]*nodeHandle // node_id → handle
+	stopping    bool
 
 	// Per-node mailbox keyed by node_id. Shared WS events are aggregated here
 	// and each node service drains the latest state when ready.
@@ -82,14 +85,15 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	nlog.Core().Info(fmt.Sprintf("machine %d: discovered %d nodes",
 		o.cfg.Machine.MachineID, len(nodesResp.Nodes)))
 
-	// Start machine-level WS as early as possible so sync.nodes can reach an
-	// empty machine before the first node is attached.
+	// Treat initial discovery and node startup as one reconciliation. WS
+	// callbacks may arrive immediately, but must wait until this list is applied.
+	o.discoveryMu.Lock()
+	// Start WS even when the initial list is empty: sync.nodes may add nodes.
 	o.tryStartWS(ctx)
-
-	// Start initial nodes.
 	for _, n := range nodesResp.Nodes {
 		o.startNode(ctx, n)
 	}
+	o.discoveryMu.Unlock()
 
 	discoveryTicker := time.NewTicker(o.pullInterval)
 	statusTicker := time.NewTicker(o.pushInterval)
@@ -114,23 +118,34 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 // ─── Node lifecycle ──────────────────────────────────────────────────────
 
 func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
+	nodeCfg := o.cfg.ExpandMachineNode(mn.ID, mn.Type)
+	certDir, err := config.CanonicalCertDir(nodeCfg.Cert.CertDir)
+	if err != nil {
+		nlog.Core().Warn("machine: cannot resolve node cert_dir; refusing to start node", "node_id", mn.ID, "cert_dir", nodeCfg.Cert.CertDir, "error", err)
+		return
+	}
 	o.mu.Lock()
-	if _, exists := o.nodes[mn.ID]; exists {
+	if _, exists := o.nodes[mn.ID]; exists || o.stopping {
 		o.mu.Unlock()
 		return
+	}
+	for id, h := range o.nodes {
+		if h.certDir == certDir {
+			o.mu.Unlock()
+			nlog.Core().Warn("machine: shared cert_dir; refusing to start node", "node_id", mn.ID, "other_node_id", id, "cert_dir", nodeCfg.Cert.CertDir)
+			return
+		}
 	}
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	mb := controlplane.NewNodeMailbox()
-	o.nodes[mn.ID] = &nodeHandle{cancel: cancel, done: done, mailbox: mb}
-	o.mu.Unlock()
-
+	h := &nodeHandle{cancel: cancel, done: done, mailbox: mb, certDir: certDir}
+	o.nodes[mn.ID] = h
 	o.eventsMu.Lock()
 	o.mailboxes[mn.ID] = mb
 	o.eventsMu.Unlock()
-
-	nodeCfg := o.cfg.ExpandMachineNode(mn.ID, mn.Type)
+	o.mu.Unlock()
 
 	perNodeClient := o.client.ForNode(mn.ID)
 
@@ -146,7 +161,7 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	// the node mailbox + status channel to the Service.
 	nodeID := mn.ID
 	registerFn := func(st chan<- controlplane.StatusChange) *controlplane.NodeMailbox {
-		o.registerNode(nodeID, st)
+		o.registerNode(nodeID, h, st)
 		return mb
 	}
 
@@ -157,8 +172,10 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 		mn.ID, mn.Type, mn.Name))
 
 	go func() {
-		defer close(done)
-		defer o.unregisterNode(mn.ID)
+		defer func() {
+			o.unregisterNode(mn.ID, h)
+			close(done)
+		}()
 		if err := svc.Run(nodeCtx); err != nil {
 			nlog.Core().Error("machine node exited with error",
 				"node_id", mn.ID, "error", err)
@@ -166,27 +183,22 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	}()
 }
 
-func (o *Orchestrator) stopNode(nodeID int) {
+func (o *Orchestrator) stopNode(nodeID int, h *nodeHandle) {
 	o.mu.Lock()
-	h, ok := o.nodes[nodeID]
-	if !ok {
+	if o.nodes[nodeID] != h {
 		o.mu.Unlock()
 		return
 	}
-	delete(o.nodes, nodeID)
+	h.cancel()
 	o.mu.Unlock()
 
-	o.eventsMu.Lock()
-	delete(o.mailboxes, nodeID)
-	o.eventsMu.Unlock()
-
 	nlog.Core().Info(fmt.Sprintf("machine: stopping node %d", nodeID))
-	h.cancel()
 	<-h.done
 }
 
 func (o *Orchestrator) stopAll() {
 	o.mu.Lock()
+	o.stopping = true
 	handles := make(map[int]*nodeHandle, len(o.nodes))
 	for id, h := range o.nodes {
 		handles[id] = h
@@ -209,6 +221,8 @@ func (o *Orchestrator) stopAll() {
 // ─── Node discovery ──────────────────────────────────────────────────────
 
 func (o *Orchestrator) rediscover(ctx context.Context) {
+	o.discoveryMu.Lock()
+	defer o.discoveryMu.Unlock()
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		nlog.Core().Warn("machine node discovery failed", "error", err)
@@ -221,16 +235,16 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	}
 
 	o.mu.Lock()
-	var toRemove []int
-	for id := range o.nodes {
+	toRemove := make(map[int]*nodeHandle)
+	for id, h := range o.nodes {
 		if _, ok := wanted[id]; !ok {
-			toRemove = append(toRemove, id)
+			toRemove[id] = h
 		}
 	}
 	o.mu.Unlock()
 
-	for _, id := range toRemove {
-		o.stopNode(id)
+	for id, h := range toRemove {
+		o.stopNode(id, h)
 	}
 
 	for _, n := range nodesResp.Nodes {
@@ -340,17 +354,26 @@ func (o *Orchestrator) onWSStatus(status panel.WSStatusChange) {
 	}
 }
 
-func (o *Orchestrator) registerNode(nodeID int, st chan<- controlplane.StatusChange) {
-	o.eventsMu.Lock()
-	o.statuses[nodeID] = st
-	o.eventsMu.Unlock()
+func (o *Orchestrator) registerNode(nodeID int, h *nodeHandle, st chan<- controlplane.StatusChange) {
+	o.mu.Lock()
+	if o.nodes[nodeID] == h {
+		o.eventsMu.Lock()
+		o.statuses[nodeID] = st
+		o.eventsMu.Unlock()
+	}
+	o.mu.Unlock()
 }
 
-func (o *Orchestrator) unregisterNode(nodeID int) {
-	o.eventsMu.Lock()
-	delete(o.mailboxes, nodeID)
-	delete(o.statuses, nodeID)
-	o.eventsMu.Unlock()
+func (o *Orchestrator) unregisterNode(nodeID int, h *nodeHandle) {
+	o.mu.Lock()
+	if o.nodes[nodeID] == h {
+		delete(o.nodes, nodeID)
+		o.eventsMu.Lock()
+		delete(o.mailboxes, nodeID)
+		delete(o.statuses, nodeID)
+		o.eventsMu.Unlock()
+	}
+	o.mu.Unlock()
 }
 
 func (o *Orchestrator) applyIntervals(bc panel.MachineBaseConfig) {

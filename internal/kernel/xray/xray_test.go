@@ -18,6 +18,32 @@ import (
 	"golang.org/x/time/rate"
 )
 
+func TestXrayMetricsReplacementChecksPortConflicts(t *testing.T) {
+	x := New(config.KernelConfig{Type: "xray"})
+	x.instance = new(xrayCore.Instance)
+	x.nodeConfig = &model.NodeSpec{ServerPort: 10001}
+	x.metricsListen = "127.0.0.1:19090"
+	candidate := &model.NodeSpec{ServerPort: 10002}
+	x.cfg.CustomConfigData = map[string]any{"metrics": map[string]any{"listen": "127.0.0.1:19091"}}
+	if !x.CanReplaceInPlace(candidate) {
+		t.Fatal("moving metrics to a free port should not stop the old listener")
+	}
+	x.cfg.CustomConfigData = map[string]any{"metrics": map[string]any{"listen": "127.0.0.1:19090"}}
+	if x.CanReplaceInPlace(candidate) {
+		t.Fatal("same metrics port cannot bind twice")
+	}
+	x.cfg.CustomConfigData = map[string]any{"metrics": map[string]any{"listen": "127.0.0.1:19091"}}
+	candidate.ServerPort = 19090
+	if x.CanReplaceInPlace(candidate) {
+		t.Fatal("new proxy cannot bind old metrics port")
+	}
+	candidate.ServerPort = 10002
+	x.cfg.CustomConfigData = map[string]any{"metrics": map[string]any{"listen": "127.0.0.1:10001"}}
+	if x.CanReplaceInPlace(candidate) {
+		t.Fatal("new metrics cannot bind old proxy port")
+	}
+}
+
 func TestToMemoryUserSS2022MatchesInitialConfig(t *testing.T) {
 	user := model.UserSpec{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}
 	for _, cipher := range []string{"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"} {

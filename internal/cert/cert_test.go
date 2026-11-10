@@ -1,10 +1,12 @@
 package cert
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -284,6 +286,76 @@ func TestPrepareCertificatePreservesActiveManager(t *testing.T) {
 	}
 	if renewalCtx.Err() == nil || !next.HasCert() {
 		t.Fatal("retiring the old manager did not preserve the prepared replacement")
+	}
+}
+
+func TestSelfSignedPersistedCertificateMatchesDomain(t *testing.T) {
+	for _, tc := range []struct {
+		name, firstDomain, nextDomain, firstIdentity string
+	}{
+		{"dns", "old.example.test", "new.example.test", "old.example.test"},
+		{"ip", "127.0.0.1", "127.0.0.2", "127.0.0.1"},
+		{"default", "", "new.example.test", "localhost"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.CertConfig{CertMode: "self", Domain: tc.firstDomain, CertDir: t.TempDir()}
+			first := NewManager(cfg)
+			if err := first.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			original := first.TLSCert()
+
+			restarted := NewManager(cfg)
+			if err := restarted.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := restarted.TLSCert(); !bytes.Equal(got.CertPEM, original.CertPEM) || !bytes.Equal(got.KeyPEM, original.KeyPEM) {
+				t.Fatal("same-domain restart should reuse persisted certificate")
+			}
+
+			cfg.Domain = tc.nextDomain
+			changed := NewManager(cfg)
+			if err := changed.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			got := changed.TLSCert()
+			pair, err := tls.X509KeyPair(got.CertPEM, got.KeyPEM)
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaf, err := x509.ParseCertificate(pair.Certificate[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := leaf.VerifyHostname(tc.nextDomain); err != nil {
+				t.Fatalf("certificate does not cover changed domain %q: %v", tc.nextDomain, err)
+			}
+			if err := leaf.VerifyHostname(tc.firstIdentity); err == nil {
+				t.Fatalf("certificate still covers previous domain %q", tc.firstIdentity)
+			}
+			if bytes.Equal(got.CertPEM, original.CertPEM) {
+				t.Fatal("changed domain should generate a new certificate")
+			}
+			if disk, err := os.ReadFile(filepath.Join(cfg.CertDir, "cert.pem")); err != nil || !bytes.Equal(disk, got.CertPEM) {
+				t.Fatalf("new certificate was not persisted: %v", err)
+			}
+		})
+	}
+}
+
+func TestContentPersistedCertificateIgnoresConfigDomain(t *testing.T) {
+	certPEM, keyPEM := generateSelfSignedPair(t, "cert.example.test")
+	cfg := config.CertConfig{CertMode: "content", Domain: "other.example.test", CertDir: t.TempDir(), CertContent: string(certPEM), KeyContent: string(keyPEM)}
+	if err := NewManager(cfg).Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cfg.CertContent, cfg.KeyContent = "", ""
+	restarted := NewManager(cfg)
+	if err := restarted.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.TLSCert(); !bytes.Equal(got.CertPEM, certPEM) || !bytes.Equal(got.KeyPEM, keyPEM) {
+		t.Fatal("content mode should reuse persisted PEM regardless of config domain")
 	}
 }
 

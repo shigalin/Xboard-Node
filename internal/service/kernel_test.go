@@ -229,6 +229,57 @@ func TestKernelSwitchRollbackKeepsOldKernelCustomConfigSnapshot(t *testing.T) {
 	}
 }
 
+func TestSamePortKernelSwitchRetriesAfterCustomConfigCorrection(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "custom.json")
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	reserve, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reserve.Addr().(*net.TCPAddr).Port
+	reserve.Close()
+	// The Xray config validates, but its metrics listener cannot bind.
+	if err := os.WriteFile(path, []byte(fmt.Sprintf(`{"metrics":{"listen":%q}}`, busy.Addr().String())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox", CustomConfig: path, ConfigDir: t.TempDir(), LogLevel: "error"}}
+	s := NewWithControlPlane(cfg, &kernelTestControlPlane{})
+	defer s.kernel.Stop()
+	old := &fakeKernel{running: true}
+	s.kernel = old
+	previous := &model.NodeSpec{Protocol: "vless", Network: "tcp", ServerPort: port}
+	s.lastConfig = previous
+	s.appliedState.Config = previous
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}})
+	next := &model.NodeSpec{Protocol: "vless", Network: "xhttp", ListenIP: "127.0.0.1", ServerPort: previous.ServerPort}
+
+	if err := s.applyNodeConfig(ctx, next); err == nil || errors.Is(err, errKernelSwitchDeferred) {
+		t.Fatalf("expected the first switch to fail starting Xray: %v", err)
+	}
+	if !old.IsRunning() || s.kernel != old || old.startCalls != 1 {
+		t.Fatal("failed switch did not restore the old listener")
+	}
+	if err := s.applyNodeConfig(ctx, next); !errors.Is(err, errKernelSwitchDeferred) || old.startCalls != 1 {
+		t.Fatalf("unchanged candidate interrupted the restored listener: error=%v restores=%d", err, old.startCalls)
+	}
+
+	// Only the validated local file changes; the panel's node spec stays the same.
+	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.applyNodeConfig(ctx, next); err != nil {
+		t.Fatalf("corrected custom_config remained behind the old backoff: %v", err)
+	}
+	if s.kernelType != "xray" || !s.kernel.IsRunning() || s.lastConfig != next || old.IsRunning() {
+		t.Fatal("corrected config did not switch to the new kernel")
+	}
+}
+
 func TestStoppedUserUpdateSurvivesRefusedStart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "custom.json")
@@ -322,8 +373,8 @@ func TestFailedRevocationIsReReadFromPanelAfterETag(t *testing.T) {
 	k.updateErr = errors.New("hot update failed")
 	k.startErr = errors.New("rebuild failed")
 	poll()
-	if !hasUser(s.lastUsers, 2) || !s.userRefetch {
-		t.Fatalf("failed revocation must keep the running state and re-read users: users=%v refetch=%v", s.lastUsers, s.userRefetch)
+	if hasUser(s.lastUsers, 2) || k.IsRunning() || !s.userRefetch {
+		t.Fatalf("failed revocation must fail closed and re-read users: users=%v running=%v refetch=%v", s.lastUsers, k.IsRunning(), s.userRefetch)
 	}
 	// The kernel recovers. The panel's list is unchanged, so without a forced
 	// re-read the user endpoint would answer 304 forever.
@@ -454,13 +505,13 @@ func TestKernelSwitchRestoresPreviousListenerAfterSamePortStartFailure(t *testin
 	next := &model.NodeSpec{Protocol: "vless", Network: "xhttp", ServerPort: previous.ServerPort}
 	startErr := errors.New("bind failed after successful preflight")
 	candidate := &fakeKernel{startErr: startErr}
-	if err := s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{}); !errors.Is(err, startErr) {
+	if err := s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{}, nil); !errors.Is(err, startErr) {
 		t.Fatalf("unexpected switch result: %v", err)
 	}
 	if s.kernel != old || !old.IsRunning() || old.startCalls != 1 || s.lastConfig != previous {
 		t.Fatal("old listener was not restored after failed handoff")
 	}
-	_ = s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{})
+	_ = s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{}, nil)
 	if candidate.startCalls != 1 || old.startCalls != 1 {
 		t.Fatal("an unchanged failure immediately interrupted the restored listener again")
 	}
@@ -781,7 +832,7 @@ func TestFailedSamePortKernelSwitchBacksOff(t *testing.T) {
 	for i, want := range kernelSwitchRetryDelays {
 		s.kernelRetryAt = time.Time{}
 		before := time.Now()
-		if err := s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{}); err == nil {
+		if err := s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{}, nil); err == nil {
 			t.Fatal("switch unexpectedly succeeded")
 		}
 		if got := s.kernelRetryAt.Sub(before); got < want || got > want+time.Second {
@@ -792,17 +843,17 @@ func TestFailedSamePortKernelSwitchBacksOff(t *testing.T) {
 		}
 	}
 	s.kernelRetryAt = time.Time{}
-	_ = s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{})
+	_ = s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{}, nil)
 	if got := time.Until(s.kernelRetryAt); got < 59*time.Minute {
 		t.Fatalf("retry delay was not capped at one hour: %v", got)
 	}
-	if err := s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{}); !errors.Is(err, errKernelSwitchDeferred) {
+	if err := s.switchKernel(ctx, candidate, "xray", next, kernel.TLSCert{}, nil); !errors.Is(err, errKernelSwitchDeferred) {
 		t.Fatalf("retry was not deferred: %v", err)
 	}
 
 	other := &model.NodeSpec{Protocol: "vless", Network: "xhttp", ServerPort: previous.ServerPort, Host: "other"}
 	before := time.Now()
-	_ = s.switchKernel(ctx, candidate, "xray", other, kernel.TLSCert{})
+	_ = s.switchKernel(ctx, candidate, "xray", other, kernel.TLSCert{}, nil)
 	if got := s.kernelRetryAt.Sub(before); got > time.Minute+time.Second {
 		t.Fatalf("a new config inherited the previous backoff: %v", got)
 	}
@@ -1298,7 +1349,13 @@ func pollAndApply(t *testing.T, s *Service, between func()) bool {
 
 func TestDiscardedReReadIsRetriedInsteadOfTrusting304(t *testing.T) {
 	s, k, panelServer, poll := restUserNode(t)
-	panelServer.setUsers([]map[string]any{{"id": 1, "uuid": "11111111-1111-4111-8111-111111111111"}})
+	// Failed addition retains the old listener; the panel's newer list must
+	// still be fetched again if the first re-read is discarded.
+	panelServer.setUsers([]map[string]any{
+		{"id": 1, "uuid": "11111111-1111-4111-8111-111111111111"},
+		{"id": 2, "uuid": "22222222-2222-4222-8222-222222222222"},
+		{"id": 3, "uuid": "33333333-3333-4333-8333-333333333333"},
+	})
 	k.updateErr, k.startErr = errors.New("hot update failed"), errors.New("rebuild failed")
 	poll()
 	k.updateErr, k.startErr = nil, nil
@@ -1309,12 +1366,12 @@ func TestDiscardedReReadIsRetriedInsteadOfTrusting304(t *testing.T) {
 		s.handleWSEvent(context.Background(), controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "remove",
 			DeltaUsers: []model.UserSpec{{ID: 9, UUID: "99999999-9999-4999-8999-999999999999"}}})
 	})
-	if !hasUser(s.lastUsers, 2) || !s.userRefetch {
+	if hasUser(s.lastUsers, 3) || !s.userRefetch {
 		t.Fatalf("a discarded re-read must keep the re-read pending: users=%v refetch=%v", s.lastUsers, s.userRefetch)
 	}
 	poll()
-	if hasUser(s.lastUsers, 2) || s.userRefetch {
-		t.Fatalf("revocation was lost behind HTTP 304: users=%v refetch=%v", s.lastUsers, s.userRefetch)
+	if !hasUser(s.lastUsers, 3) || s.userRefetch {
+		t.Fatalf("addition was lost behind HTTP 304: users=%v refetch=%v", s.lastUsers, s.userRefetch)
 	}
 }
 
@@ -1355,6 +1412,48 @@ func TestWSRollbackResendSupersedesInFlightPoll(t *testing.T) {
 	})
 	if !hasUser(s.lastUsers, 2) {
 		t.Fatal("an in-flight poll overwrote the panel's rollback")
+	}
+}
+
+func TestXrayMetricsListenerAllowsConfigRebuild(t *testing.T) {
+	ctx := context.Background()
+	reserve, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reserve.Addr().(*net.TCPAddr).Port
+	reserve.Close()
+	metrics, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsAddr := metrics.Addr().String()
+	nextPort, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidatePort := nextPort.Addr().(*net.TCPAddr).Port
+	nextPort.Close()
+	metrics.Close()
+	path := filepath.Join(t.TempDir(), "native.json")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf(`{"metrics":{"listen":%q}}`, metricsAddr)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "xray", ConfigDir: t.TempDir(), LogLevel: "error", CustomConfig: path}}
+	s := NewWithControlPlane(cfg, &kernelTestControlPlane{})
+	defer s.kernel.Stop()
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}})
+	old := &model.NodeSpec{Protocol: "vless", Network: "tcp", ListenIP: "127.0.0.1", ServerPort: port}
+	if err := s.applyNodeConfig(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	next := *old
+	next.ServerPort = candidatePort
+	if err := s.applyNodeConfig(ctx, &next); err != nil {
+		t.Fatalf("rebuild could not reuse metrics address after retiring old instance: %v", err)
+	}
+	if s.lastConfig != &next || !s.kernel.IsRunning() {
+		t.Fatal("new configuration was not applied")
 	}
 }
 

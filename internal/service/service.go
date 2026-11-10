@@ -477,6 +477,18 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		return fmt.Errorf("initial config is nil")
 	}
 	s.updateUserState(bootstrap.Users)
+	restBaseline := append([]model.UserSpec{}, s.lastUsers...) // A known empty REST list is not nil.
+	var queued controlplane.MailboxState
+	if s.machineMailbox != nil {
+		s.machineMailbox.MarkReady()
+		queued = s.machineMailbox.DrainIfReady(restBaseline)
+		filterBootstrapUsers(&queued, restBaseline)
+		if queued.HasUsers {
+			s.wsUserRevision++
+			s.updateUserState(queued.Users)
+			queued.HasUsers = false
+		}
+	}
 	if err := s.applyNodeConfig(ctx, bootstrap.Config); err != nil {
 		if !errors.Is(err, errCertificateUnavailable) {
 			return err
@@ -484,8 +496,51 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		s.pendingConfig = bootstrap.Config
 		nlog.Core().Warn("waiting for a usable certificate before starting the kernel", "error", err)
 	}
-	s.markMailboxReadyAndDrain(ctx)
+	s.applyMachineMailboxState(ctx, queued)
+	if s.machineMailbox != nil {
+		// WS events received during kernel startup must pass the same REST
+		// confirmation gate as events buffered before startup.
+		late := s.machineMailbox.DrainIfReady(s.lastUsers)
+		filterBootstrapUsers(&late, restBaseline)
+		s.applyMachineMailboxState(ctx, late)
+	}
 	return nil
+}
+
+// filterBootstrapUsers accepts queued revocations immediately, but does not
+// permit WS additions absent from the REST snapshot to start a node before
+// the panel can confirm which of two crossing snapshots is newer.
+func filterBootstrapUsers(state *controlplane.MailboxState, baseline []model.UserSpec) {
+	if !state.HasUsers {
+		return
+	}
+	confirmed := make([]model.UserSpec, 0, len(state.Users))
+	stricterLimit := func(a, b int) int {
+		if a <= 0 {
+			return b
+		}
+		if b <= 0 {
+			return a
+		}
+		return min(a, b)
+	}
+	for _, user := range state.Users {
+		for _, rest := range baseline {
+			if user.ID == rest.ID && user.UUID == rest.UUID {
+				if user.SpeedLimit != rest.SpeedLimit || user.DeviceLimit != rest.DeviceLimit {
+					state.NeedsReconcile = true
+				}
+				user.SpeedLimit = stricterLimit(user.SpeedLimit, rest.SpeedLimit)
+				user.DeviceLimit = stricterLimit(user.DeviceLimit, rest.DeviceLimit)
+				confirmed = append(confirmed, user)
+				break
+			}
+		}
+	}
+	if len(confirmed) != len(state.Users) {
+		state.NeedsReconcile = true
+	}
+	state.Users = confirmed
 }
 
 // startWSClient starts the push client goroutine if a client is configured.
@@ -498,14 +553,6 @@ func (s *Service) startWSClient(ctx context.Context) {
 	go s.wsClient.Run(wsCtx)
 }
 
-func (s *Service) markMailboxReadyAndDrain(ctx context.Context) {
-	if s.machineMailbox == nil {
-		return
-	}
-	s.machineMailbox.MarkReady()
-	s.drainMachineMailbox(ctx)
-}
-
 func (s *Service) drainMachineMailbox(ctx context.Context) {
 	if s.machineMailbox == nil {
 		return
@@ -514,7 +561,10 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 	if users == nil && s.lastUserHash != "" {
 		users = []model.UserSpec{}
 	}
-	state := s.machineMailbox.DrainIfReady(users)
+	s.applyMachineMailboxState(ctx, s.machineMailbox.DrainIfReady(users))
+}
+
+func (s *Service) applyMachineMailboxState(ctx context.Context, state controlplane.MailboxState) {
 	stagedUsers := state.HasConfig && state.HasUsers && !s.kernel.IsRunning()
 	if stagedUsers {
 		// Apply the coalesced users before a config can start a stopped
@@ -1091,6 +1141,20 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 		return
 	}
 
+	revokesCredentials := false
+	for _, old := range s.lastUsers {
+		stillAuthorized := false
+		for _, user := range users {
+			if user.ID == old.ID && user.UUID == old.UUID {
+				stillAuthorized = true
+				break
+			}
+		}
+		if !stillAuthorized {
+			revokesCredentials = true
+			break
+		}
+	}
 	prevUsers, prevHash := s.prepareUserState(users)
 	added, removed, err := s.kernel.UpdateUsers(users)
 	if err != nil {
@@ -1102,7 +1166,13 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 		}
 		if err := s.rebuildKernel(s.lastConfig, users, prevUsers, s.appliedState.TLS, s.appliedState.CustomConfig, &s.userRebuildRetry); err != nil {
 			nlog.Core().Error("kernel rebuild for user update failed", "error", err)
-			if s.kernel.IsRunning() {
+			if revokesCredentials {
+				// A failed rebuild (including a deferred retry) may have restored
+				// the old credentials. Fail closed instead of serving revoked users.
+				s.kernel.Stop()
+				s.userRefetch = true
+				s.ensureRunning() // Only the accepted list may be used for recovery.
+			} else if s.kernel.IsRunning() {
 				s.userUpdateFailed(prevUsers, prevHash)
 			} else {
 				s.userRefetch = true
@@ -1445,6 +1515,19 @@ func (s *Service) shutdownAliveIPsForHTTP() map[int][]string {
 
 // pushReportSync is used only during shutdown to ensure final data is sent.
 func (s *Service) pushReportSync() {
+	// First stop accepting connections and wait for the drain to finish. Both
+	// kernels publish final cumulative counters after Stop; otherwise the
+	// last tracking interval is never included in the final report.
+	s.stopAndCollect(context.Background(), s.kernel)
+	// A report already in flight may fail and restore its traffic. Do not
+	// flush the final report until that restoration has completed.
+	deadline := time.Now().Add(35 * time.Second) // Panel HTTP requests time out at 30s.
+	for s.pushActive.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.pushActive.Load() {
+		nlog.Core().Warn("previous report is still in flight; final traffic may need reconciliation")
+	}
 	if !s.sink.SupportsReporting() {
 		return
 	}
@@ -1613,8 +1696,13 @@ func (s *Service) reportDevices(ctx context.Context) {
 	}
 
 	if s.restDevicesSeeded.CompareAndSwap(false, true) {
-		if !s.pushAliveReportAsync(true) && !s.devicePushActive.Load() {
-			s.refreshGlobalDevicesAsync(ctx, s.wsDeviceRevision, false, false)
+		if !s.pushAliveReportAsync(true) {
+			// An in-flight report or backoff did not queue this full snapshot.
+			// Keep it pending for the next tick instead of sending only deltas.
+			s.restDevicesSeeded.Store(false)
+			if !s.devicePushActive.Load() {
+				s.refreshGlobalDevicesAsync(ctx, s.wsDeviceRevision, false, false)
+			}
 		}
 		return
 	}

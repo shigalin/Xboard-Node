@@ -1,6 +1,7 @@
 package singbox
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,6 +13,9 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/option"
+	singJSON "github.com/sagernet/sing/common/json"
 )
 
 var testUsersPanel = []panel.User{
@@ -928,6 +932,36 @@ func TestExtractECHInbound(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildConfig_CustomNativeTopLevelLists(t *testing.T) {
+	// Parse the fixture with the embedded sing-box version before testing the merge.
+	customJSON := []byte(`{"services":[{"type":"oom-killer","tag":"memory-guard","memory_limit":"512MB"}],"certificate_providers":[{"type":"cloudflare-origin-ca","tag":"origin-cert","domain":"example.com","api_token":"not-a-real-token"}]}`)
+	ctx := include.Context(context.Background())
+	if _, err := singJSON.UnmarshalExtendedContext[option.Options](ctx, customJSON); err != nil {
+		t.Fatalf("native custom config unsupported by sing-box parser: %v", err)
+	}
+
+	var custom map[string]any
+	if err := json.Unmarshal(customJSON, &custom); err != nil {
+		t.Fatal(err)
+	}
+	cfg := buildConfig(config.KernelConfig{Type: "singbox", CustomConfigData: custom},
+		testNodeSpec(&panel.NodeConfig{Protocol: "vless", ServerPort: 443}), testUsers, kernel.TLSCert{})
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := singJSON.UnmarshalExtendedContext[option.Options](ctx, data)
+	if err != nil {
+		t.Fatalf("generated config rejected by sing-box parser: %v", err)
+	}
+	if len(parsed.Services) != 1 || parsed.Services[0].Type != "oom-killer" || parsed.Services[0].Tag != "memory-guard" {
+		t.Errorf("generated config lost native services: %s", data)
+	}
+	if len(parsed.CertificateProviders) != 1 || parsed.CertificateProviders[0].Type != "cloudflare-origin-ca" || parsed.CertificateProviders[0].Tag != "origin-cert" {
+		t.Errorf("generated config lost native certificate_providers: %s", data)
 	}
 }
 

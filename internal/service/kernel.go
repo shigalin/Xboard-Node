@@ -91,7 +91,7 @@ func (s *Service) applyNodeConfig(ctx context.Context, spec *model.NodeSpec) err
 		bytes.Equal(tls.KeyPEM, s.appliedState.TLS.KeyPEM) &&
 		sameCustomConfig(customConfig, s.appliedState.CustomConfig)
 	if next != s.kernel {
-		if err := s.switchKernel(ctx, next, kcfg.Type, spec, tls); err != nil {
+		if err := s.switchKernel(ctx, next, kcfg.Type, spec, tls, customConfig); err != nil {
 			return err
 		}
 	} else if len(s.lastUsers) == 0 {
@@ -170,12 +170,12 @@ func sameKernelConfig(a, b *model.NodeSpec) bool {
 	return computeConfigHash(&left) == computeConfigHash(&right)
 }
 
-func (s *Service) switchKernel(ctx context.Context, next kernel.Kernel, kind string, spec *model.NodeSpec, tls kernel.TLSCert) error {
+func (s *Service) switchKernel(ctx context.Context, next kernel.Kernel, kind string, spec *model.NodeSpec, tls kernel.TLSCert, customConfig map[string]any) error {
 	old := s.kernel
 	previous := s.appliedState.Config
 	handoff := old.IsRunning() && previous != nil && previous.ServerPort == spec.ServerPort
-	configHash := computeConfigHash(spec)
-	if handoff && configHash == s.kernelRetryHash && time.Now().Before(s.kernelRetryAt) {
+	retryKey := rebuildKey(spec, customConfig)
+	if handoff && retryKey == s.kernelRetryHash && time.Now().Before(s.kernelRetryAt) {
 		return errKernelSwitchDeferred
 	}
 	next.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
@@ -200,12 +200,12 @@ func (s *Service) switchKernel(ctx context.Context, next kernel.Kernel, kind str
 			}
 			if handoff {
 				// Each attempt interrupts the restored listener, so back off.
-				if configHash != s.kernelRetryHash {
+				if retryKey != s.kernelRetryHash {
 					s.kernelRetryFailures = 0
 				}
 				delay := kernelSwitchRetryDelays[min(s.kernelRetryFailures, len(kernelSwitchRetryDelays)-1)]
 				s.kernelRetryFailures++
-				s.kernelRetryHash = configHash
+				s.kernelRetryHash = retryKey
 				s.kernelRetryAt = time.Now().Add(delay)
 				nlog.Core().Warn("kernel switch failed; previous kernel restored",
 					"to", kind, "failures", s.kernelRetryFailures, "retry_after", delay)

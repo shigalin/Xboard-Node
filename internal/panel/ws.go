@@ -207,7 +207,13 @@ func (w *WSClient) Run(ctx context.Context) {
 	}
 }
 
-func (w *WSClient) connect(ctx context.Context) error {
+func (w *WSClient) connect(ctx context.Context) (retErr error) {
+	// All connection errors flow through Run's warning log (or a direct caller).
+	defer func() {
+		if retErr != nil {
+			retErr = sanitizeTransportError(retErr, w.token)
+		}
+	}()
 	u, err := url.Parse(w.wsURL)
 	if err != nil {
 		return fmt.Errorf("parse ws url: %w", err)
@@ -221,7 +227,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 	}
 	u.RawQuery = q.Encode()
 
-	nlog.Core().Debug("ws connecting", "url", u.String())
+	nlog.Core().Debug("ws connecting")
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.cfg.HandshakeTimeout,
@@ -239,7 +245,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 	if err := conn.ReadJSON(&firstMsg); err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
-	nlog.Core().Debug("ws recv", "event", firstMsg.Event, "data", string(firstMsg.Data))
+	nlog.Core().Debug("ws recv")
 
 	if firstMsg.Event == "error" {
 		var errData struct {
@@ -284,7 +290,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 				}
 				return
 			}
-			nlog.Core().Debug("ws recv", "event", msg.Event, "data", string(msg.Data))
+			nlog.Core().Debug("ws recv")
 			w.handleMessage(msg)
 			if msg.Event == "ping" {
 				select {
@@ -326,7 +332,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 		case msg := <-writeCh:
 			// Perform the actual network write asynchronously in this loop.
-			nlog.Core().Debug("ws send", "event", msg.Event, "data", string(msg.Data))
+			nlog.Core().Debug("ws send")
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteJSON(msg); err != nil {
 				return fmt.Errorf("write: %w", err)
@@ -360,7 +366,7 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 		w.handleDataEvent(msg)
 
 	default:
-		nlog.Core().Debug("ws unknown event", "event", msg.Event)
+		nlog.Core().Debug("ws unknown event")
 	}
 }
 
@@ -403,8 +409,8 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
-		if len(p.Users) == 0 {
-			nlog.Core().Warn("ws: users payload empty")
+		if p.Users == nil {
+			nlog.Core().Warn("ws: users payload missing")
 			return
 		}
 		event.Users = p.Users
@@ -544,7 +550,7 @@ func (w *WSClient) SendRaw(event string, data json.RawMessage) bool {
 	case ch <- msg:
 		return true
 	default:
-		nlog.Core().Warn("ws write channel full, skipping raw message", "event", event)
+		nlog.Core().Warn("ws write channel full, skipping raw message")
 		return false
 	}
 }

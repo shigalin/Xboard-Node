@@ -54,6 +54,67 @@ func (connectedPush) Run(context.Context)                           {}
 func (connectedPush) IsConnected() bool                             { return true }
 func (connectedPush) SendDeviceReport(map[int][]string, int64) bool { return true }
 
+func TestFailedRevocationDoesNotRestartOldCredentials(t *testing.T) {
+	ctx := context.Background()
+	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, &kernelTestControlPlane{})
+	old := []model.UserSpec{{ID: 1, UUID: "old"}, {ID: 2, UUID: "valid"}}
+	next := []model.UserSpec{old[1]}
+	k := &fakeKernel{running: true, updateErr: errors.New("update unavailable")}
+	k.startHook = func(_ *model.NodeSpec, users []model.UserSpec) error {
+		if len(users) == 1 {
+			return errors.New("replacement unavailable")
+		}
+		return nil
+	}
+	s.kernel = k
+	spec := &model.NodeSpec{Protocol: "vless", ServerPort: 12345}
+	s.lastConfig, s.appliedState.Config, s.lastConfigHash = spec, spec, computeConfigHash(spec)
+	s.updateUserState(old)
+	s.applyUserUpdate(ctx, next, computeUserHash(next))
+	if k.IsRunning() || hasUser(s.lastUsers, 1) || !s.userRefetch {
+		t.Fatal("failed revocation kept the revoked credential available")
+	}
+	k.startHook = func(_ *model.NodeSpec, users []model.UserSpec) error {
+		if hasUser(users, 1) {
+			t.Fatal("recovery started the revoked credential")
+		}
+		return nil
+	}
+	s.handlePullTick(ctx) // Panel is unavailable, but recovery must only use the accepted revocation.
+	if !k.IsRunning() || hasUser(s.lastUsers, 1) {
+		t.Fatal("recovery did not start with the revoked credential excluded")
+	}
+}
+
+func TestNewRevocationIsNotBlockedByEarlierUserRebuildBackoff(t *testing.T) {
+	ctx := context.Background()
+	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, &kernelTestControlPlane{})
+	old := []model.UserSpec{{ID: 1, UUID: "old"}}
+	added := []model.UserSpec{old[0], {ID: 2, UUID: "new"}}
+	k := &fakeKernel{running: true, updateErr: errors.New("update unavailable")}
+	k.startHook = func(_ *model.NodeSpec, users []model.UserSpec) error {
+		if len(users) == 2 {
+			return errors.New("first rebuild unavailable")
+		}
+		return nil
+	}
+	s.kernel = k
+	spec := &model.NodeSpec{Protocol: "vless", ServerPort: 12345}
+	s.lastConfig, s.appliedState.Config, s.lastConfigHash = spec, spec, computeConfigHash(spec)
+	s.updateUserState(old)
+	s.applyUserUpdate(ctx, added, computeUserHash(added))
+	if !k.IsRunning() || s.userRebuildRetry.failures == 0 {
+		t.Fatal("fixture did not leave a serving kernel with a rebuild backoff")
+	}
+	// The panel now revokes user 1. Its new snapshot must not inherit the
+	// failure of the older list (which added user 2).
+	revoked := []model.UserSpec{added[1]}
+	s.applyUserUpdate(ctx, revoked, computeUserHash(revoked))
+	if hasUser(s.lastUsers, 1) || !k.IsRunning() {
+		t.Fatal("earlier rebuild backoff delayed a new revocation")
+	}
+}
+
 func TestPullTickRecoversStoppedKernelWhileWebSocketIsConnected(t *testing.T) {
 	ctx := context.Background()
 	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, &kernelTestControlPlane{})

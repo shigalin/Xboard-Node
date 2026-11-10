@@ -43,6 +43,9 @@ type Config struct {
 	// via GET /api/v2/server/machine/nodes. When set, Panel.NodeID and
 	// Panel.Token are ignored; the machine token is used instead.
 	Machine *MachineConfig `yaml:"machine,omitempty"`
+
+	// Distinguish a derived cert_dir from an explicitly configured one when expanding nodes.
+	certDirDefaulted bool
 }
 
 // MachineConfig identifies this process as a panel-managed machine that
@@ -637,6 +640,7 @@ func (c *Config) setDefaultsFrom(baseDir string) {
 	}
 	if c.Cert.CertDir == "" {
 		c.Cert.CertDir = filepath.Join(c.Kernel.ConfigDir, "certs")
+		c.certDirDefaulted = true
 	}
 	if c.Cert.HTTPPort == 0 {
 		c.Cert.HTTPPort = 80
@@ -798,6 +802,21 @@ func (c *Config) validate() error {
 	if c.Node.PullInterval < 0 {
 		return fmt.Errorf("node.pull_interval must not be negative")
 	}
+	if c.Node.TrackInterval < 0 {
+		return fmt.Errorf("node.track_interval must not be negative")
+	}
+	if c.WS.DiscoveryInterval < 0 {
+		return fmt.Errorf("ws.discovery_interval must not be negative")
+	}
+	if c.WS.StatusInterval < 0 {
+		return fmt.Errorf("ws.status_interval must not be negative")
+	}
+	if c.WS.BackoffInitial < 0 {
+		return fmt.Errorf("ws.backoff_initial must not be negative")
+	}
+	if c.WS.BackoffMax < 0 {
+		return fmt.Errorf("ws.backoff_max must not be negative")
+	}
 	if c.Kernel.DeviceLimitCooldown < 0 || c.Kernel.DeviceLimitCooldown > 86400 {
 		return fmt.Errorf("kernel.device_limit_cooldown must be between 0 and 86400 seconds")
 	}
@@ -809,6 +828,104 @@ func (c *Config) validate() error {
 	}
 	if !c.IsStandalone() && c.Node.DeviceReportInterval > 120 {
 		return fmt.Errorf("node.device_report_interval must be between 0 and 120 seconds (panel device state expires after 300)")
+	}
+	if err := c.validateLegacyCertDir(); err != nil {
+		return err
+	}
+	if len(c.Nodes) > 0 {
+		nodes := c.ExpandNodes()
+		if c.IsMachineMode() {
+			nodes = make([]*Config, 0, len(c.Nodes))
+			for _, entry := range c.Nodes {
+				nodes = append(nodes, c.ExpandMachineNode(entry.NodeID, entry.NodeType))
+			}
+		}
+		certDirs := make(map[string]int, len(c.Nodes))
+		for i, node := range nodes {
+			dir, err := CanonicalCertDir(node.Cert.CertDir)
+			if err != nil {
+				return fmt.Errorf("nodes[%d].cert.cert_dir: %w", i, err)
+			}
+			if other, ok := certDirs[dir]; ok {
+				return fmt.Errorf("nodes[%d].cert.cert_dir %q is shared with nodes[%d]", i, node.Cert.CertDir, other)
+			}
+			certDirs[dir] = i
+		}
+	}
+	return nil
+}
+
+// CanonicalCertDir identifies certificate directories that resolve to the same
+// location, even when the final directory has not yet been created. Resolve
+// symlinks on the nearest existing ancestor without creating or moving data.
+func CanonicalCertDir(path string) (string, error) {
+	return canonicalCertDir(path, 0)
+}
+
+func canonicalCertDir(path string, depth int) (string, error) {
+	if depth > 32 {
+		return "", fmt.Errorf("too many cert_dir symlinks at %q", path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	ancestor := abs
+	for {
+		if info, err := os.Lstat(ancestor); err == nil {
+			rest, err := filepath.Rel(ancestor, abs)
+			if err != nil {
+				return "", err
+			}
+			resolved, err := filepath.EvalSymlinks(ancestor)
+			if os.IsNotExist(err) && info.Mode()&os.ModeSymlink != 0 {
+				// Keep a dangling symlink's future target reserved as well.
+				target, err := os.Readlink(ancestor)
+				if err != nil {
+					return "", err
+				}
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(ancestor), target)
+				}
+				return canonicalCertDir(filepath.Join(target, rest), depth+1)
+			}
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(resolved, rest), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return "", fmt.Errorf("no existing ancestor for cert_dir %q", path)
+		}
+		ancestor = parent
+	}
+}
+
+// validateLegacyCertDir prevents a default cert_dir from silently abandoning
+// PEM persisted by earlier multi-node releases. Explicit per-node directories
+// are an operator migration choice and do not need this check.
+func (c *Config) validateLegacyCertDir() error {
+	if len(c.Nodes) < 2 || c.IsMachineMode() || !c.certDirDefaulted {
+		return nil
+	}
+	for _, entry := range c.Nodes {
+		if entry.Cert != nil && entry.Cert.CertDir != "" {
+			continue
+		}
+		// The panel can override every local certificate mode, including
+		// "none" and "file", then need this PEM for content-mode recovery.
+		for _, file := range []string{"cert.pem", "key.pem"} {
+			path := filepath.Join(c.Cert.CertDir, file)
+			if _, err := os.Lstat(path); err == nil {
+				return fmt.Errorf("legacy persisted PEM at default cert_dir %q (%s): multiple static nodes now use per-node directories and would ignore this certificate; migrate each node's certificate and key to its own directory and configure unique nodes[].cert.cert_dir values before restarting", c.Cert.CertDir, file)
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("inspect default cert_dir %q for legacy PEM: %w", c.Cert.CertDir, err)
+			}
+		}
+		break
 	}
 	return nil
 }
@@ -829,9 +946,13 @@ func (c *Config) ExpandNodes() []*Config {
 		nodeCfg.Panel.NodeID = entry.NodeID
 		nodeCfg.Panel.NodeType = entry.NodeType
 
-		if entry.Kernel == nil {
-			// Auto-derive a unique config_dir per node to avoid conflicts.
-			nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, entry.NodeID)
+		// Keep the old parent directory for a single node with a kernel
+		// override that does not specify config_dir.
+		if len(c.Nodes) > 1 || entry.Kernel == nil || entry.Kernel.ConfigDir != "" {
+			nodeCfg.Kernel.ConfigDir = filepath.Join(c.Kernel.ConfigDir, fmt.Sprintf("node-%d", entry.NodeID))
+		}
+		if c.certDirDefaulted && len(c.Nodes) > 1 {
+			nodeCfg.Cert.CertDir = ""
 		}
 		nodeCfg.applyNodeOverrides(entry, c.Kernel.ConfigDir)
 		if nodeCfg.Cert.CertDir == "" {
@@ -935,17 +1056,48 @@ func InitLogger(cfg LogConfig) {
 	slog.SetDefault(slog.New(slog.DiscardHandler))
 }
 
+// machineDefaultNodeID recognizes only the shape of a dynamically derived
+// machine cert_dir; discovered IDs are not enumerable at startup.
+func machineDefaultNodeID(baseDir, certDir string) (int, bool) {
+	rel, err := filepath.Rel(baseDir, certDir)
+	if err != nil || filepath.Base(rel) != "certs" {
+		return 0, false
+	}
+	parent := filepath.Dir(rel)
+	if filepath.Dir(parent) != "." || !strings.HasPrefix(parent, "node-") {
+		return 0, false
+	}
+	id, err := strconv.Atoi(strings.TrimPrefix(parent, "node-"))
+	return id, err == nil && id > 0
+}
+
 // ValidateStartupLayout checks that multiple instances do not conflict on
-// health ports, kernel config directories, or node bindings.
+// health ports, kernel config directories, certificate directories, or node bindings.
 func ValidateStartupLayout(instances []*Config) error {
 	healthPorts := make(map[int]string)
 	configDirs := make(map[string]string)
+	certDirs := make(map[string]string)
 	nodeBindings := make(map[string]string)
+	var machines, staticNodes []*Config
+	recordCertDir := func(owner string, node *Config) error {
+		dir, err := CanonicalCertDir(node.Cert.CertDir)
+		if err != nil {
+			return fmt.Errorf("cert_dir for %s/node-%d: %w", owner, node.Panel.NodeID, err)
+		}
+		if other, ok := certDirs[dir]; ok {
+			return fmt.Errorf("cert_dir %q is shared by %s and %s/node-%d", node.Cert.CertDir, other, owner, node.Panel.NodeID)
+		}
+		certDirs[dir] = fmt.Sprintf("%s/node-%d", owner, node.Panel.NodeID)
+		return nil
+	}
 	for _, instance := range instances {
 		if instance == nil {
 			continue
 		}
 		owner := instance.InstanceID
+		if err := instance.validateLegacyCertDir(); err != nil {
+			return fmt.Errorf("%s: %w", owner, err)
+		}
 		if instance.HealthPort > 0 {
 			if other, ok := healthPorts[instance.HealthPort]; ok {
 				return fmt.Errorf("health_port %d is used by both %s and %s", instance.HealthPort, other, owner)
@@ -953,20 +1105,28 @@ func ValidateStartupLayout(instances []*Config) error {
 			healthPorts[instance.HealthPort] = owner
 		}
 		if dir := strings.TrimSpace(instance.Kernel.ConfigDir); dir != "" {
-			if other, ok := configDirs[dir]; ok && other != owner {
+			canonical, err := CanonicalCertDir(dir)
+			if err != nil {
+				return fmt.Errorf("kernel config_dir %q: %w", dir, err)
+			}
+			if other, ok := configDirs[canonical]; ok && other != owner {
 				return fmt.Errorf("kernel config_dir %q is shared by %s and %s", dir, other, owner)
 			}
-			configDirs[dir] = owner
+			configDirs[canonical] = owner
 		}
-		// Machine mode discovers nodes dynamically — skip static binding check,
-		// but still validate custom_config if set at the instance level.
+		// Machine mode discovers nodes dynamically — check known overrides,
+		// but skip static bindings for nodes not discovered yet.
 		if instance.IsMachineMode() {
+			machines = append(machines, instance)
 			if path := strings.TrimSpace(instance.Kernel.CustomConfig); path != "" {
 				if _, err := os.Stat(path); err != nil {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
 				}
 			}
 			for _, entry := range instance.Nodes {
+				if err := recordCertDir(owner, instance.ExpandMachineNode(entry.NodeID, entry.NodeType)); err != nil {
+					return err
+				}
 				if entry.Kernel != nil && strings.TrimSpace(entry.Kernel.CustomConfig) != "" {
 					if _, err := os.Stat(entry.Kernel.CustomConfig); err != nil {
 						return fmt.Errorf("kernel.custom_config %q for %s/node-%d: %w", entry.Kernel.CustomConfig, owner, entry.NodeID, err)
@@ -976,6 +1136,10 @@ func ValidateStartupLayout(instances []*Config) error {
 			continue
 		}
 		for _, node := range instance.ExpandNodes() {
+			if err := recordCertDir(owner, node); err != nil {
+				return err
+			}
+			staticNodes = append(staticNodes, node)
 			binding := fmt.Sprintf("%s/%d", strings.TrimSpace(node.Panel.URL), node.Panel.NodeID)
 			if other, ok := nodeBindings[binding]; ok {
 				return fmt.Errorf("node binding %s is declared by both %s and %s", binding, other, owner)
@@ -986,6 +1150,79 @@ func ValidateStartupLayout(instances []*Config) error {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
 				}
 			}
+		}
+	}
+	// A static cert_dir can coincide with an as-yet-undiscovered machine node.
+	// Infer just the ID encoded in that path, then check its effective overrides.
+	for _, machine := range machines {
+		base, err := CanonicalCertDir(machine.Kernel.ConfigDir)
+		if err != nil {
+			return fmt.Errorf("kernel config_dir for %s: %w", machine.InstanceID, err)
+		}
+		rawBase, err := filepath.Abs(machine.Kernel.ConfigDir)
+		if err != nil {
+			return fmt.Errorf("kernel config_dir for %s: %w", machine.InstanceID, err)
+		}
+		for _, node := range staticNodes {
+			staticDir, err := CanonicalCertDir(node.Cert.CertDir)
+			if err != nil {
+				return fmt.Errorf("cert_dir for %s/node-%d: %w", node.InstanceID, node.Panel.NodeID, err)
+			}
+			rawDir, err := filepath.Abs(node.Cert.CertDir)
+			if err != nil {
+				return fmt.Errorf("cert_dir for %s/node-%d: %w", node.InstanceID, node.Panel.NodeID, err)
+			}
+			// Check both identities: a symlink in node-<id> can change
+			// which ID the canonical path appears to name.
+			for _, candidate := range [][2]string{{base, staticDir}, {rawBase, rawDir}} {
+				id, ok := machineDefaultNodeID(candidate[0], candidate[1])
+				if !ok {
+					continue
+				}
+				derived := machine.ExpandMachineNode(id, "")
+				dynamicDir, err := CanonicalCertDir(derived.Cert.CertDir)
+				if err != nil {
+					return fmt.Errorf("cert_dir for %s/node-%d: %w", machine.InstanceID, id, err)
+				}
+				if dynamicDir == staticDir {
+					return fmt.Errorf("cert_dir %q is shared by %s/node-%d and %s/node-%d", node.Cert.CertDir, node.InstanceID, node.Panel.NodeID, machine.InstanceID, id)
+				}
+			}
+		}
+	}
+	// Existing node directories may symlink their certs to an unrelated
+	// location. Their IDs cannot be inferred from a static node's path, so
+	// inspect the finite set already present before discovering machine nodes.
+	for _, machine := range machines {
+		entries, err := os.ReadDir(machine.Kernel.ConfigDir)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect machine config_dir %q: %w", machine.Kernel.ConfigDir, err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasPrefix(name, "node-") {
+				continue
+			}
+			id, err := strconv.Atoi(strings.TrimPrefix(name, "node-"))
+			if err != nil || id <= 0 {
+				continue
+			}
+			node := machine.ExpandMachineNode(id, "")
+			dir, err := CanonicalCertDir(node.Cert.CertDir)
+			if err != nil {
+				// An inactive node with a malformed or inaccessible cert
+				// symlink cannot start (startNode checks this path again).
+				// Do not stop unrelated nodes over its stale directory.
+				continue
+			}
+			owner := fmt.Sprintf("%s/node-%d", machine.InstanceID, id)
+			if other, ok := certDirs[dir]; ok && other != owner {
+				return fmt.Errorf("cert_dir %q is shared by %s and %s", node.Cert.CertDir, other, owner)
+			}
+			certDirs[dir] = owner
 		}
 	}
 	return nil

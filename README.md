@@ -17,10 +17,15 @@ Node backend for [Xboard](https://github.com/cedar2025/Xboard). Supports `sing-b
 ### Docker
 
 ```bash
-docker run -d --restart=always --network=host \
+docker run -d --restart=always --network=host --stop-timeout=120 \
   -e apiHost=https://panel.com -e apiKey=TOKEN -e nodeID=1 \
   ghcr.io/shigalin/xboard-node:latest
 ```
+
+Allow at least 120 seconds for graceful shutdown (for example, set Compose
+`stop_grace_period: 120s`); the node waits for pending traffic reports and
+final connection counters before exiting. Existing containers also need their
+stop timeout updated when they are recreated.
 
 ### Docker Compose
 
@@ -41,6 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/shigalin/xboard-node/dev/install.sh
 # Machine mode
 curl -fsSL https://raw.githubusercontent.com/shigalin/xboard-node/dev/install.sh | \
   sudo bash -s -- --mode machine --panel https://panel.example.com --token TOKEN --machine-id 1
+```
 
 ## xbctl
 
@@ -58,6 +64,27 @@ xbctl service restart
 ## Configuration
 
 Legacy single-panel config is fully compatible. Appending bindings auto-migrates to `instances` format. See `config.yml.example`.
+
+**Multi-node certificate upgrade:** If a static multi-node installation has
+`cert.pem` or `key.pem` in its old shared default `cert_dir`, the new binary
+refuses to start until each affected node has a distinct `nodes[].cert.cert_dir`.
+Before upgrading, back up the existing certificate and key, identify which
+node/domain they actually cover, then place a matching pair in that node's
+private directory (or reissue it) and configure unique directories for all
+nodes. `nodes[].cert` replaces the entire inherited certificate configuration,
+so include any other required certificate settings alongside `cert_dir`.
+Do not assign a certificate to a node whose domain it does not cover;
+do not remove the original files until each node's TLS handshake has been
+verified. Even a locally configured `cert_mode: none` cannot bypass this check:
+the panel may still supply content-mode TLS that relies on the persisted pair.
+No certificate is moved automatically.
+
+For a release, verify the candidate against an isolated Linux node and the
+**actual** panel (including user revocation, reconnect and shutdown traffic
+reports) before replacing a live node. Give Docker at least 120 seconds to
+stop; existing containers must be recreated with the stop timeout or Compose
+grace period. Passing local tests or a synthetic-panel smoke test alone is
+not production acceptance.
 
 For panel-backed nodes, Hysteria (v1 and v2) always runs on `singbox` and XHTTP/SplitHTTP
 always runs on `xray`, regardless of `kernel.type`. A switch restarts the

@@ -5,12 +5,16 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/cert"
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -192,6 +196,297 @@ func TestMalformedConfigDoesNotBlockRevocations(t *testing.T) {
 	poll()
 	if len(s.lastUsers) != 0 || s.pendingConfig != nil {
 		t.Fatal("304 for an invalid config blocked the revocation or kept a stale candidate")
+	}
+}
+
+type queuedMailboxBootstrap struct {
+	controlplane.ControlPlane
+	bootstrap controlplane.Bootstrap
+}
+
+func (p *queuedMailboxBootstrap) Initial(context.Context, func() map[string]interface{}, chan<- controlplane.Event, chan<- controlplane.StatusChange) (controlplane.Bootstrap, error) {
+	return p.bootstrap, nil
+}
+
+func (p *queuedMailboxBootstrap) Poll(context.Context) (controlplane.Snapshot, error) {
+	return controlplane.Snapshot{}, errors.New("panel unavailable")
+}
+
+func (p *queuedMailboxBootstrap) SupportsPolling() bool { return true }
+
+type shutdownTrafficKernel struct{ *fakeKernel }
+
+func (k *shutdownTrafficKernel) GetUserTraffic(context.Context) (map[int][2]int64, map[int]map[string]bool, int, error) {
+	if k.IsRunning() {
+		return map[int][2]int64{1: {10, 0}}, nil, 1, nil
+	}
+	return map[int][2]int64{1: {20, 0}}, nil, 0, nil
+}
+
+type shutdownReportSink struct {
+	controlplane.ControlPlane
+	traffic map[int][2]int64
+}
+
+func (s *shutdownReportSink) SupportsReporting() bool { return true }
+func (s *shutdownReportSink) Report(payload controlplane.ReportPayload) error {
+	s.traffic = payload.Traffic
+	return nil
+}
+func (s *shutdownReportSink) ReportAlive(map[int][]string, int64, bool) error { return nil }
+
+func (p *queuedMailboxBootstrap) Metrics() controlplane.APIMetrics { return controlplane.APIMetrics{} }
+
+func TestShutdownReportsTrafficAfterConnectionsDrain(t *testing.T) {
+	cp := &queuedMailboxBootstrap{}
+	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
+	k := &shutdownTrafficKernel{fakeKernel: &fakeKernel{running: true}}
+	s.kernel = k
+	sink := &shutdownReportSink{}
+	s.sink = sink
+	s.trackAndEnforce(context.Background())
+	s.pushReportSync()
+	if got := sink.traffic[1][0]; got != 20 {
+		t.Fatalf("shutdown report = %d bytes; want all 20 bytes after drain", got)
+	}
+}
+
+type shutdownConcurrentSink struct {
+	controlplane.ControlPlane
+	calls        atomic.Int32
+	firstStarted chan struct{}
+	firstRelease chan struct{}
+	traffic      map[int][2]int64
+}
+
+func (s *shutdownConcurrentSink) SupportsReporting() bool { return true }
+func (s *shutdownConcurrentSink) Report(payload controlplane.ReportPayload) error {
+	if s.calls.Add(1) == 1 {
+		close(s.firstStarted)
+		<-s.firstRelease
+		return errors.New("first report failed")
+	}
+	s.traffic = payload.Traffic
+	return nil
+}
+func (s *shutdownConcurrentSink) ReportAlive(map[int][]string, int64, bool) error { return nil }
+
+func TestShutdownWaitsForFailedAsyncReportBeforeFinalFlush(t *testing.T) {
+	cp := &queuedMailboxBootstrap{}
+	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
+	s.kernel = &fakeKernel{}
+	sink := &shutdownConcurrentSink{firstStarted: make(chan struct{}), firstRelease: make(chan struct{})}
+	s.sink = sink
+	s.tracker.Process(map[int][2]int64{1: {10, 0}}, nil, 0)
+	s.pushReportAsync()
+	select {
+	case <-sink.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("async report did not start")
+	}
+	s.tracker.Process(map[int][2]int64{1: {20, 0}}, nil, 0)
+	done := make(chan struct{})
+	go func() { s.pushReportSync(); close(done) }()
+	// With the broken ordering, the final report races ahead of the blocked
+	// failure and flushes before its traffic can be restored.
+	time.Sleep(40 * time.Millisecond)
+	close(sink.firstRelease)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final report did not finish")
+	}
+	if got := sink.traffic[1][0]; got != 20 {
+		t.Fatalf("final report = %d bytes; want the restored async 10 plus subsequent 10", got)
+	}
+}
+
+type deviceReportSeedSink struct {
+	controlplane.ControlPlane
+	full chan bool
+}
+
+func (*deviceReportSeedSink) SupportsReporting() bool     { return true }
+func (*deviceReportSeedSink) SupportsDeviceReports() bool { return false }
+func (s *deviceReportSeedSink) ReportAlive(_ map[int][]string, _ int64, full bool) error {
+	s.full <- full
+	return nil
+}
+
+func TestBusyRESTDeviceReportDoesNotLoseFullSeed(t *testing.T) {
+	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, &queuedMailboxBootstrap{})
+	sink := &deviceReportSeedSink{full: make(chan bool, 1)}
+	s.sink = sink
+	s.devicePushActive.Store(true) // An earlier REST report is still in flight.
+	s.reportDevices(context.Background())
+	if s.restDevicesSeeded.Load() {
+		t.Fatal("full REST snapshot was marked sent while another report held the gate")
+	}
+	s.devicePushActive.Store(false)
+	s.reportDevices(context.Background())
+	select {
+	case full := <-sink.full:
+		if !full {
+			t.Fatal("retry did not send a full device snapshot")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("full device snapshot was not retried")
+	}
+}
+
+func TestMachineBootstrapDoesNotAcceptUnconfirmedQueuedAdd(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		t.Run(fmt.Sprint("full=", full), func(t *testing.T) {
+			user := model.UserSpec{ID: 2, UUID: "22222222-2222-4222-8222-222222222222"}
+			mb := controlplane.NewNodeMailbox()
+			if full {
+				mb.Apply(controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{user}})
+			} else {
+				mb.Apply(controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{user}})
+			}
+			cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
+				Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: []model.UserSpec{}, Mailbox: mb,
+			}}
+			s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
+			k := &fakeKernel{startHook: func(_ *model.NodeSpec, users []model.UserSpec) error {
+				if hasUser(users, 2) {
+					t.Error("queued user was accepted without a fresh REST confirmation")
+				}
+				return nil
+			}}
+			s.kernel = k
+			if err := s.initialSetup(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if k.IsRunning() || hasUser(s.lastUsers, 2) || !s.wsResyncPending.Load() {
+				t.Fatal("unconfirmed queued add was not withheld for REST reconciliation")
+			}
+		})
+	}
+}
+
+func TestMachineBootstrapDoesNotResurrectStaleFullSnapshot(t *testing.T) {
+	valid := model.UserSpec{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}
+	revoked := model.UserSpec{ID: 2, UUID: "22222222-2222-4222-8222-222222222222"}
+	mb := controlplane.NewNodeMailbox()
+	mb.Apply(controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{valid, revoked}})
+	cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
+		Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: []model.UserSpec{valid}, Mailbox: mb,
+	}}
+	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
+	k := &fakeKernel{startHook: func(_ *model.NodeSpec, users []model.UserSpec) error {
+		if hasUser(users, 2) {
+			t.Error("older queued snapshot reauthorized a user absent from REST bootstrap")
+		}
+		return nil
+	}}
+	s.kernel = k
+	if err := s.initialSetup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !k.IsRunning() || hasUser(s.lastUsers, 2) || !s.wsResyncPending.Load() {
+		t.Fatal("stale queued snapshot was not reconciled conservatively")
+	}
+}
+
+func TestMachineBootstrapFiltersWSAddDuringKernelStart(t *testing.T) {
+	mb := controlplane.NewNodeMailbox()
+	cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
+		Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: []model.UserSpec{}, Mailbox: mb,
+	}}
+	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
+	starting, release := make(chan struct{}), make(chan struct{})
+	k := &fakeKernel{startHook: func(_ *model.NodeSpec, users []model.UserSpec) error {
+		if hasUser(users, 2) {
+			t.Error("WS addition unconfirmed by REST started a listener")
+		}
+		close(starting)
+		<-release
+		return nil
+	}}
+	// Start with a known REST user so the initial kernel start blocks. The
+	// queued WS user arrives after the first drain but before startup ends.
+	cp.bootstrap.Users = []model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}}
+	s.kernel = k
+	done := make(chan error, 1)
+	go func() { done <- s.initialSetup(context.Background()) }()
+	select {
+	case <-starting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("kernel did not start")
+	}
+	mb.Apply(controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "add",
+		DeltaUsers: []model.UserSpec{{ID: 2, UUID: "22222222-2222-4222-8222-222222222222"}}})
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("bootstrap did not finish")
+	}
+	if hasUser(s.lastUsers, 2) || !s.wsResyncPending.Load() {
+		t.Fatal("WS user arriving during kernel startup bypassed REST confirmation")
+	}
+}
+
+func TestMachineBootstrapUsesRestrictiveLimitsUntilReconciled(t *testing.T) {
+	for _, tc := range []struct{ rest, ws model.UserSpec }{
+		{model.UserSpec{ID: 1, UUID: "same", SpeedLimit: 8, DeviceLimit: 1}, model.UserSpec{ID: 1, UUID: "same"}},
+		{model.UserSpec{ID: 1, UUID: "same"}, model.UserSpec{ID: 1, UUID: "same", SpeedLimit: 8, DeviceLimit: 1}},
+	} {
+		mb := controlplane.NewNodeMailbox()
+		mb.Apply(controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{tc.ws}})
+		cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
+			Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: []model.UserSpec{tc.rest}, Mailbox: mb,
+		}}
+		s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
+		s.kernel = &fakeKernel{startHook: func(_ *model.NodeSpec, users []model.UserSpec) error {
+			if len(users) != 1 || users[0].SpeedLimit != 8 || users[0].DeviceLimit != 1 {
+				t.Errorf("bootstrap accepted looser queued limit: %+v", users)
+			}
+			return nil
+		}}
+		if err := s.initialSetup(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !s.wsResyncPending.Load() {
+			t.Fatal("conflicting limits did not request reconciliation")
+		}
+	}
+}
+
+func TestMachineBootstrapStagesQueuedRevocationBeforeStart(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		t.Run(fmt.Sprint("full=", full), func(t *testing.T) {
+			ctx := context.Background()
+			users := []model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}, {ID: 2, UUID: "22222222-2222-4222-8222-222222222222"}}
+			mb := controlplane.NewNodeMailbox()
+			if full {
+				mb.Apply(controlplane.Event{Type: controlplane.EventSyncUsers, Users: users[:1]})
+			} else {
+				mb.Apply(controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: users[1:]})
+			}
+			cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
+				Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: users, Mailbox: mb,
+			}}
+			s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
+			startedWithRevoked := false
+			k := &fakeKernel{startHook: func(_ *model.NodeSpec, active []model.UserSpec) error {
+				if hasUser(active, 2) {
+					startedWithRevoked = true
+				}
+				return nil
+			}}
+			s.kernel = k
+			if err := s.initialSetup(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if startedWithRevoked || !k.IsRunning() || hasUser(s.lastUsers, 2) {
+				t.Fatal("bootstrap briefly started the listener with a queued revoked credential")
+			}
+		})
 	}
 }
 

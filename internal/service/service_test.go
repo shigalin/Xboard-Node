@@ -158,7 +158,7 @@ func TestApplyUserUpdatePreparesLimiterBeforeKernelUpdate(t *testing.T) {
 	}
 }
 
-func TestApplyUserUpdateRestoresStateWhenKernelAndRestartFail(t *testing.T) {
+func TestApplyUserUpdateFailsClosedWhenKernelAndRestartFail(t *testing.T) {
 	k := &fakeKernel{
 		running:   true,
 		updateErr: errors.New("update failed"),
@@ -168,30 +168,24 @@ func TestApplyUserUpdateRestoresStateWhenKernelAndRestartFail(t *testing.T) {
 	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
 	oldUsers := []model.UserSpec{{ID: 1, UUID: "uuid-old", SpeedLimit: 4}}
 	s.updateUserState(oldUsers)
-	oldHash := s.lastUserHash
-
 	newUsers := []model.UserSpec{{ID: 2, UUID: "uuid-new", SpeedLimit: 8}}
 	s.applyUserUpdate(context.Background(), newUsers, computeUserHash(newUsers))
 
-	// The rebuild tries to replace the listener in place. When that fails the
-	// running kernel is left alone: stopping it would not help the new config.
-	if got := k.startCalls; got != 1 {
-		t.Fatalf("Start call count = %d, want 1", got)
+	// Rebuild fails, then the fail-closed recovery tries only the new list.
+	if got := k.startCalls; got != 2 {
+		t.Fatalf("Start call count = %d, want 2", got)
 	}
-	if !k.IsRunning() {
-		t.Fatal("failed in-place rebuild stopped the running kernel")
+	if k.IsRunning() || !s.userRefetch {
+		t.Fatal("failed revocation left a listener running or did not request a re-read")
 	}
-	if len(s.lastUsers) != 1 || s.lastUsers[0].UUID != "uuid-old" {
-		t.Fatalf("lastUsers = %#v, want restored old users", s.lastUsers)
+	if len(s.lastUsers) != 1 || s.lastUsers[0].UUID != "uuid-new" {
+		t.Fatalf("lastUsers = %#v, want accepted new users", s.lastUsers)
 	}
-	if s.lastUserHash != oldHash {
-		t.Fatalf("lastUserHash = %q, want %q", s.lastUserHash, oldHash)
+	if s.lastUserHash != computeUserHash(newUsers) {
+		t.Fatal("accepted user list lost after failed revocation")
 	}
-	if s.speedTracker.GetLimiter("uuid-old") == nil {
-		t.Fatal("expected old limiter to be restored after rollback")
-	}
-	if s.speedTracker.GetLimiter("uuid-new") != nil {
-		t.Fatal("expected new limiter to be removed after rollback")
+	if s.speedTracker.GetLimiter("uuid-old") != nil || s.speedTracker.GetLimiter("uuid-new") == nil {
+		t.Fatal("limiter state did not follow the accepted user list")
 	}
 }
 

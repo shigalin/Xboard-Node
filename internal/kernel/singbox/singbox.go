@@ -428,6 +428,11 @@ func (s *SingBox) CanReplaceInPlace(spec *model.NodeSpec) bool {
 	if s.exclusive || s.released || s.nodeConfig == nil {
 		return false
 	}
+	// The candidate may add a controller, cache lock or other exclusive
+	// resource even when the running box has none.
+	if keysOf(buildConfig(s.cfg, spec, s.users, s.tls)).exclusive {
+		return false
+	}
 	// Generated sing-box inbounds bind the wildcard address.
 	return spec.ServerPort != s.nodeConfig.ServerPort
 }

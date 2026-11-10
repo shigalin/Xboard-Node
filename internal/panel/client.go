@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -111,8 +112,7 @@ func (c *Client) handshake(requestSequence bool) (*HandshakeResponse, error) {
 		if reserveSequence {
 			c.sequenceHandshakeDone.Store(false)
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("handshake status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("handshake status %d", resp.StatusCode)
 	}
 
 	var hs HandshakeResponse
@@ -257,8 +257,7 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -314,8 +313,7 @@ func (c *Client) GetUsers() ([]User, error) {
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	var usersResp UsersResponse
@@ -341,8 +339,7 @@ func (c *Client) GetDevices() (map[int][]string, error) {
 		return nil, nil // panel version predates the REST global-device endpoint
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	var devices DevicesResponse
@@ -372,10 +369,6 @@ func (c *Client) SyncDeviceBans(ctx context.Context, reports map[int]int64) (map
 	}
 	resp, err := c.doRequestContext(ctx, method, "/api/v2/server/device-bans", body, "")
 	if err != nil {
-		// net/http includes the authenticated request URL in transport errors.
-		if requestErr, ok := err.(*url.Error); ok {
-			err = requestErr.Err
-		}
 		return nil, err
 	}
 	defer drainAndClose(resp.Body)
@@ -475,8 +468,7 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("machine nodes status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("machine nodes status %d", resp.StatusCode)
 	}
 
 	var out MachineNodesResponse
@@ -551,8 +543,7 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("status %d: %s", resp.StatusCode, respBody)
+		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	c.apiSuccess.Add(1)
 	return nil
@@ -560,6 +551,24 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 
 func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
 	return c.doRequestContext(context.Background(), method, path, body, ifNoneMatch)
+}
+
+// sanitizeTransportError strips net/http's authenticated URL while retaining
+// the underlying cause. Some transports also echo the URL in their own error.
+func sanitizeTransportError(err error, token string) error {
+	var requestErr *url.Error
+	if errors.As(err, &requestErr) {
+		err = requestErr.Err
+	}
+	if token == "" {
+		return err
+	}
+	message := strings.ReplaceAll(err.Error(), url.QueryEscape(token), "[REDACTED]")
+	message = strings.ReplaceAll(message, token, "[REDACTED]")
+	if message != err.Error() {
+		return errors.New(message)
+	}
+	return err
 }
 
 func (c *Client) doRequestContext(ctx context.Context, method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
@@ -579,7 +588,7 @@ func (c *Client) doRequestContext(ctx context.Context, method, path string, body
 
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeTransportError(err, c.token)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -593,7 +602,7 @@ func (c *Client) doRequestContext(ctx context.Context, method, path string, body
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.apiFailure.Add(1)
-		return nil, err
+		return nil, sanitizeTransportError(err, c.token)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {

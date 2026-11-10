@@ -109,11 +109,30 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		}
 	}()
 
-	for root := initialRoot; ; {
-		ctx, cancel := context.WithCancel(context.Background())
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	defer shutdownCancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		sig := <-sigCh
+		nlog.Core().Info(fmt.Sprintf("received %v, shutting down...", sig))
+		shutdownCancel()
+		select {
+		case sig = <-sigCh:
+			nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
+			os.Exit(1)
+		case <-time.After(120 * time.Second):
+			nlog.Core().Error("shutdown timed out after 120s, forcing exit")
+			os.Exit(2)
+		}
+	}()
 
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	for root := initialRoot; ; {
+		if shutdownCtx.Err() != nil {
+			return
+		}
+		ctx, cancel := context.WithCancel(shutdownCtx)
 
 		reloadCh := make(chan *config.RootConfig, 1)
 
@@ -126,24 +145,6 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		if err != nil {
 			nlog.Core().Warn("config watcher unavailable, hot-reload disabled", "error", err)
 		}
-
-		go func() {
-			select {
-			case sig := <-sigCh:
-				nlog.Core().Info(fmt.Sprintf("received %v, shutting down...", sig))
-				cancel()
-
-				select {
-				case sig = <-sigCh:
-					nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
-					os.Exit(1)
-				case <-time.After(15 * time.Second):
-					nlog.Core().Error("shutdown timed out after 15s, forcing exit")
-					os.Exit(2)
-				}
-			case <-ctx.Done():
-			}
-		}()
 
 		instances, err := root.NormalizeInstances()
 		if err != nil {
@@ -214,20 +215,33 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		go func() { wg.Wait(); close(doneCh) }()
 
 		var newRoot *config.RootConfig
-		select {
-		case newRoot = <-reloadCh:
-			nlog.Core().Info("config changed, restarting all services...")
-			cancel()
-			<-doneCh
-		case <-doneCh:
+		var newInstances []*config.Config
+	reloadLoop:
+		for {
+			select {
+			case candidate := <-reloadCh:
+				instances, err := preflightReload(candidate)
+				if err != nil {
+					nlog.Core().Error("invalid config reload; keeping current services running", "error", err)
+					continue
+				}
+				newInstances = instances
+				newRoot = candidate
+				nlog.Core().Info("config changed, restarting all services...")
+				cancel()
+				<-doneCh
+				break reloadLoop
+			case <-doneCh:
+				break reloadLoop
+			}
 		}
 
-		signal.Stop(sigCh)
 		if watcher != nil {
 			watcher.Stop()
 		}
 
-		if newRoot == nil {
+		if newRoot == nil || shutdownCtx.Err() != nil {
+			cancel()
 			close(errCh)
 			if err := <-errCh; err != nil {
 				os.Exit(1)
@@ -236,16 +250,23 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			return
 		}
 
-		newInstances, err := newRoot.NormalizeInstances()
-		if err != nil {
-			nlog.Core().Error("failed to normalize reloaded config", "error", err)
-			os.Exit(1)
-		}
 		config.InitLogger(newInstances[0].Log)
 		applyRuntimeConfig(newInstances[0].Runtime)
 		root = newRoot
+		cancel()
 		nlog.Core().Info("reload complete, services restarting with new config")
 	}
+}
+
+func preflightReload(root *config.RootConfig) ([]*config.Config, error) {
+	instances, err := root.NormalizeInstances()
+	if err != nil {
+		return nil, err
+	}
+	if err := config.ValidateStartupLayout(instances); err != nil {
+		return nil, err
+	}
+	return instances, nil
 }
 
 // applyRuntimeConfig wires up Go runtime memory limits from the config file.

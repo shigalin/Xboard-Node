@@ -391,6 +391,15 @@ func mergeCustomSingbox(cfg M, kcfg config.KernelConfig) {
 		}
 	}
 
+	// services and certificate_providers — append native entries
+	for _, key := range []string{"services", "certificate_providers"} {
+		if v, ok := custom[key]; ok {
+			if items := kernel.MergeAppendList(nil, v); len(items) > 0 {
+				cfg[key] = items
+			}
+		}
+	}
+
 	// route — merge sub-fields
 	if customRoute, ok := custom["route"]; ok {
 		if customRouteMap, ok := customRoute.(map[string]any); ok {
