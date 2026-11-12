@@ -144,8 +144,6 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	kernel.LogRealityTarget(nodeConfig, s.cfg.RealityTargets)
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = include.Context(ctx)
-	registry := service.FromContext[adapter.InboundRegistry](ctx)
-	service.MustRegister[adapter.InboundRegistry](ctx, reloadInboundRegistry{registry})
 
 	// Save old state before creating the new instance.
 	oldBox := s.box
@@ -534,20 +532,6 @@ func inboundTags(inbounds []option.Inbound) map[string]string {
 	return tags
 }
 
-type createdInboundKey struct{}
-
-// reloadInboundRegistry gives a hot-reload caller ownership of the candidate
-// if the inbound manager fails to start it before registering it.
-type reloadInboundRegistry struct{ adapter.InboundRegistry }
-
-func (r reloadInboundRegistry) Create(ctx context.Context, router adapter.Router, logger singLog.ContextLogger, tag, kind string, options any) (adapter.Inbound, error) {
-	inbound, err := r.InboundRegistry.Create(ctx, router, logger, tag, kind, options)
-	if created, ok := ctx.Value(createdInboundKey{}).(*adapter.Inbound); ok {
-		*created = inbound
-	}
-	return inbound, err
-}
-
 type inboundUpdateMode uint8
 
 const (
@@ -587,13 +571,8 @@ func (s *SingBox) applyInboundsLocked(next, prev []option.Inbound, mode inboundU
 		}
 		_ = im.Remove(inb.Tag) // ignore error when tag doesn't exist yet
 		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, inb.Tag))
-		var created adapter.Inbound
-		ctx := context.WithValue(s.ctx, createdInboundKey{}, &created)
-		err := im.Create(ctx, router, logger, inb.Tag, inb.Type, inb.Options)
-		if err != nil && created != nil {
-			_ = created.Close()
-		}
-		return err
+		// The inbound manager closes a candidate that fails to start.
+		return im.Create(s.ctx, router, logger, inb.Tag, inb.Type, inb.Options)
 	}
 	previous := make(map[string]option.Inbound, len(prev))
 	for _, inb := range prev {
@@ -743,6 +722,10 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 			if restoreErr := s.applyInboundsLocked(prevOpts.Inbounds, opts.Inbounds, mode, unchanged); restoreErr != nil {
 				s.releaseListenersLocked()
 				return fmt.Errorf("update route rules: %w; restore previous inbounds: %w", err, restoreErr)
+			}
+			if errors.Is(err, adapter.ErrRestartRequired) {
+				// The rules need a service the running box never set up.
+				return fmt.Errorf("%w: %v", errRestartRequired, err)
 			}
 			return fmt.Errorf("update route rules: %w", err)
 		}
