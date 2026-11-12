@@ -380,6 +380,70 @@ func TestBuildInbound_Hysteria2_WithObfs(t *testing.T) {
 	assertMapValue(t, obfs, "password", "secret")
 }
 
+func TestBuildInbound_Hysteria2_GeckoObfs(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:     "hysteria",
+		ServerPort:   444,
+		Version:      2,
+		Obfs:         "gecko",
+		ObfsPassword: "secret",
+	}
+	tc := kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")}
+	obfs := buildInbound(testNodeSpec(nc), testUsers, tc)["obfs"].(M)
+	assertMapValue(t, obfs, "type", "gecko")
+	assertMapValue(t, obfs, "password", "secret")
+	// The bundled sing-box must accept the obfs type, not only receive it.
+	data, err := json.Marshal(buildConfig(config.KernelConfig{}, testNodeSpec(nc), testUsers, tc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := singJSON.UnmarshalExtendedContext[option.Options](include.Context(context.Background()), data); err != nil {
+		t.Fatalf("sing-box rejected gecko obfs: %v", err)
+	}
+}
+
+func TestBuildInbound_Snell(t *testing.T) {
+	v5 := &panel.NodeConfig{Protocol: "snell", ServerPort: 6160, Version: 5, ServerKey: "0123456789abcdef", Obfs: "http", Mode: "unshaped"}
+	inbound := buildInbound(testNodeSpec(v5), testUsers, kernel.TLSCert{})
+	assertMapValue(t, inbound, "type", "snell")
+	assertMapValue(t, inbound, "version", 5)
+	assertMapValue(t, inbound, "psk", "0123456789abcdef")
+	assertMapValue(t, inbound, "obfs_mode", "http")
+	if _, ok := inbound["mode"]; ok {
+		t.Error("v5 inbound must not carry the v6 mode")
+	}
+	users := inbound["users"].([]M)
+	if len(users) != len(testUsers) {
+		t.Fatalf("users = %d, want %d", len(users), len(testUsers))
+	}
+	assertMapValue(t, users[0], "name", "aaaaaaaa-1111-2222-3333-444444444444")
+	assertMapValue(t, users[0], "userkey", "aaaaaaaa-1111-2222-3333-444444444444")
+
+	v6 := &panel.NodeConfig{Protocol: "snell", ServerPort: 6160, Version: 6, ServerKey: "0123456789abcdef", Obfs: "http", Mode: "unshaped"}
+	inbound = buildInbound(testNodeSpec(v6), testUsers, kernel.TLSCert{})
+	assertMapValue(t, inbound, "version", 6)
+	assertMapValue(t, inbound, "mode", "unshaped")
+	if _, ok := inbound["obfs_mode"]; ok {
+		t.Error("v6 inbound must not carry the v5 obfs mode")
+	}
+
+	for _, nc := range []*panel.NodeConfig{v5, v6} {
+		// Builds the inbound itself, which checks the PSK and user keys.
+		if err := New(config.KernelConfig{}).CheckConfig(testNodeSpec(nc), testUsers, kernel.TLSCert{}); err != nil {
+			t.Fatalf("sing-box rejected snell v%d: %v", nc.Version, err)
+		}
+	}
+}
+
+// Without users sing-box would accept the shared PSK alone.
+func TestBuildInbound_Snell_NoUsersStaysMultiUser(t *testing.T) {
+	nc := &panel.NodeConfig{Protocol: "snell", ServerPort: 6160, Version: 5, ServerKey: "0123456789abcdef"}
+	users := buildInbound(testNodeSpec(nc), nil, kernel.TLSCert{})["users"].([]M)
+	if len(users) != 1 || users[0]["userkey"] == "" || users[0]["userkey"] == nc.ServerKey {
+		t.Fatalf("placeholder user = %#v", users)
+	}
+}
+
 func TestBuildInbound_Hysteria1(t *testing.T) {
 	nc := &panel.NodeConfig{
 		Protocol:   "hysteria",

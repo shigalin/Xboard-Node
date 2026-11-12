@@ -84,6 +84,7 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		PaddingScheme:       sc.Node.PaddingScheme,
 		Transport:           sc.Node.Transport,
 		TrafficPattern:      sc.Node.TrafficPattern,
+		Mode:                sc.Node.Mode,
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: sc.Node.AcceptProxyProtocol,
 	}

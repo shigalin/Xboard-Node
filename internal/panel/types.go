@@ -143,6 +143,9 @@ type NodeConfig struct {
 	Transport      string `json:"transport,omitempty"`
 	TrafficPattern string `json:"traffic_pattern,omitempty"`
 
+	// Snell: Version is 5 or 6, ServerKey the PSK, Obfs the v5 obfs mode.
+	Mode string `json:"mode,omitempty"` // v6 traffic shaping mode
+
 	// Multiplex
 	Multiplex *MultiplexConfig `json:"multiplex,omitempty"`
 

@@ -42,6 +42,7 @@ type NodeSpec struct {
 	PaddingScheme     string
 	Transport         string
 	TrafficPattern    string
+	Mode              string
 
 	Multiplex           *MultiplexConfig
 	AcceptProxyProtocol bool

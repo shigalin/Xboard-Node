@@ -98,6 +98,7 @@ func TestNodeSpecFromPanelValidatedResolvesKernel(t *testing.T) {
 		{"compatible singbox", "singbox", panel.NodeConfig{Protocol: "vless", Network: "ws"}, "singbox"},
 		{"hysteria v1", "xray", panel.NodeConfig{Protocol: "hysteria", Version: 1}, "singbox"},
 		{"hysteria v1 on singbox", "singbox", panel.NodeConfig{Protocol: "hysteria", Version: 1}, "singbox"},
+		{"snell", "xray", panel.NodeConfig{Protocol: "snell", Version: 5}, "singbox"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			node, err := NodeSpecFromPanelValidated(&tc.node, config.KernelConfig{Type: tc.configured})

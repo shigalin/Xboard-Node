@@ -86,7 +86,7 @@ stop; existing containers must be recreated with the stop timeout or Compose
 grace period. Passing local tests or a synthetic-panel smoke test alone is
 not production acceptance.
 
-For panel-backed nodes, Hysteria (v1 and v2) always runs on `singbox` and XHTTP/SplitHTTP
+For panel-backed nodes, Hysteria (v1 and v2) and Snell always run on `singbox` and XHTTP/SplitHTTP
 always runs on `xray`, regardless of `kernel.type`. A switch restarts the
 listener. Use a `kernel.custom_config` file written for the selected kernel.
 When applying a config or starting a kernel, the node rejects recognized
@@ -96,6 +96,18 @@ Edits to the file take effect on the next config apply or kernel start.
 In machine mode, use `nodes[].node_id` and `nodes[].kernel.custom_config`
 to supply a separate native file for a discovered node. Entries override the
 matching node's settings. The panel still controls which nodes are discovered.
+
+Snell (v5 and v6) runs in multi-user mode: clients need the node PSK and
+their own user key (the user UUID), which sing-box 1.14+ clients send as
+`userkey`. Snell user changes are applied in place without rebuilding the
+kernel or listener; connections of retained users stay open. An empty user
+set still rejects PSK-only access. Hysteria2 accepts `gecko` as well as
+`salamander` obfuscation, with sing-box's default packet sizes.
+
+The Snell hot-update integration uses the sing-box fork and its patched
+`third_party/sing-snell` module, both pinned in `go.mod`. Keep both
+replacements when updating dependencies: the Snell service patch synchronizes
+authentication with user updates.
 
 Hysteria v1 uses the `hysteria` ALPN by default. Update clients that explicitly
 set `h3`. Credential changes on a Hysteria v1 node rebuild its inbound and

@@ -1,6 +1,7 @@
 package singbox
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -470,6 +471,8 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		return buildHTTP(base, nc, users, tc)
 	case "mieru":
 		return buildMieru(base, nc, users)
+	case "snell":
+		return buildSnell(base, nc, users)
 	default:
 		return nil
 	}
@@ -490,6 +493,41 @@ func buildMieru(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 			"name":     u.UUID,
 			"password": u.UUID,
 		})
+	}
+	base["users"] = userList
+	return base
+}
+
+// snellNoUserKey keeps a Snell inbound in multi-user mode while it has no
+// users. Without a users list sing-box accepts the PSK alone, and every
+// subscriber of the node knows the PSK. It is fixed for the process so that
+// rebuilding an unchanged config yields the same inbound.
+var snellNoUserKey = rand.Text()
+
+func buildSnell(base M, nc *model.NodeSpec, users []model.UserSpec) M {
+	base["type"] = "snell"
+	base["version"] = nc.Version
+	base["psk"] = nc.ServerKey
+	if nc.Version == 6 {
+		if nc.Mode != "" {
+			base["mode"] = nc.Mode
+		}
+	} else if nc.Obfs != "" {
+		base["obfs_mode"] = nc.Obfs
+	}
+
+	// Keep the generated config stable when the panel only reorders users.
+	users = slices.Clone(users)
+	slices.SortFunc(users, func(a, b model.UserSpec) int { return strings.Compare(a.UUID, b.UUID) })
+	userList := make([]M, 0, len(users)+1)
+	for _, u := range users {
+		userList = append(userList, M{
+			"name":    u.UUID,
+			"userkey": u.UUID,
+		})
+	}
+	if len(userList) == 0 {
+		userList = append(userList, M{"userkey": snellNoUserKey})
 	}
 	base["users"] = userList
 	return base

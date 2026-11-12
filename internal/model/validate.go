@@ -76,6 +76,10 @@ func ResolveKernelForNode(n *NodeSpec, configuredKernel string) string {
 	if configuredKernel == "xray" && (n.Protocol == "hysteria2" || n.Protocol == "hysteria") {
 		return "singbox"
 	}
+	// Xray has no Snell inbound.
+	if configuredKernel == "xray" && n.Protocol == "snell" {
+		return "singbox"
+	}
 	net := strings.ToLower(strings.TrimSpace(n.Network))
 	if configuredKernel == "singbox" && singboxUnsupportedTransports[net] {
 		return "xray"
