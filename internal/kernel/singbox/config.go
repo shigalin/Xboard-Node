@@ -56,9 +56,8 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		"outbounds": outbounds,
 	}
 
-	inbound := buildInbound(nc, users, tc)
-	if inbound != nil {
-		cfg["inbounds"] = []M{inbound}
+	if inbounds := buildInbounds(nc, users, tc); len(inbounds) > 0 {
+		cfg["inbounds"] = inbounds
 	}
 
 	// Merge panel routes and static config routes
@@ -441,6 +440,18 @@ func mergeCustomSingboxRoute(cfg M, customRoute map[string]any) {
 	}
 }
 
+// buildInbounds returns the inbounds of the panel node. Snell behind ShadowTLS
+// takes two, every other node one.
+func buildInbounds(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) []M {
+	if nc.Protocol == "snell" && nc.ShadowTLSServer != "" {
+		return buildSnellShadowTLS(nc, users)
+	}
+	if inbound := buildInbound(nc, users, tc); inbound != nil {
+		return []M{inbound}
+	}
+	return nil
+}
+
 func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	base := M{
 		"tag":         nc.Protocol + "-in",
@@ -516,9 +527,7 @@ func buildSnell(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 		base["obfs_mode"] = nc.Obfs
 	}
 
-	// Keep the generated config stable when the panel only reorders users.
-	users = slices.Clone(users)
-	slices.SortFunc(users, func(a, b model.UserSpec) int { return strings.Compare(a.UUID, b.UUID) })
+	users = sortedUsers(users)
 	userList := make([]M, 0, len(users)+1)
 	for _, u := range users {
 		userList = append(userList, M{
@@ -531,6 +540,77 @@ func buildSnell(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 	}
 	base["users"] = userList
 	return base
+}
+
+// Inbound tags of Snell behind ShadowTLS. snellDetourTag is also the tag of a
+// plain Snell node, so switching between the two rebuilds the instance.
+const (
+	shadowTLSInboundTag = "shadowtls-in"
+	snellDetourTag      = "snell-in"
+)
+
+// shadowTLSNoUserPassword keeps a ShadowTLS inbound valid while it has no
+// users: nobody knows it, so every client is treated as unauthenticated. It
+// is fixed for the process so that rebuilding an unchanged config yields the
+// same inbound.
+var shadowTLSNoUserPassword = rand.Text()
+
+// buildSnellShadowTLS puts ShadowTLS v3 in front of Snell for clients that
+// cannot send a Snell user key. ShadowTLS authenticates each user by their
+// own password and hands the connection to a Snell inbound without users,
+// whose requests carry the ShadowTLS user. That inbound accepts the shared
+// PSK alone, so it only listens on loopback and ConnTracker rejects whatever
+// reaches it without a user.
+func buildSnellShadowTLS(nc *model.NodeSpec, users []model.UserSpec) []M {
+	snell := M{
+		"type":    "snell",
+		"tag":     snellDetourTag,
+		"listen":  "127.0.0.1",
+		"version": nc.Version,
+		"psk":     nc.ServerKey,
+	}
+	if nc.Version == 6 && nc.Mode != "" {
+		snell["mode"] = nc.Mode
+	}
+
+	users = sortedUsers(users)
+	userList := make([]M, 0, len(users)+1)
+	for _, u := range users {
+		userList = append(userList, M{
+			"name":     u.UUID,
+			"password": u.UUID,
+		})
+	}
+	if len(userList) == 0 {
+		userList = append(userList, M{"password": shadowTLSNoUserPassword})
+	}
+	handshakePort := nc.ShadowTLSPort
+	if handshakePort == 0 {
+		handshakePort = 443
+	}
+	shadowTLS := M{
+		"type":        "shadowtls",
+		"tag":         shadowTLSInboundTag,
+		"listen":      "::",
+		"listen_port": nc.ServerPort,
+		"version":     3,
+		"users":       userList,
+		"handshake": M{
+			"server":      nc.ShadowTLSServer,
+			"server_port": handshakePort,
+		},
+		"strict_mode": true,
+		"detour":      snellDetourTag,
+	}
+	return []M{shadowTLS, snell}
+}
+
+// sortedUsers keeps the generated config stable when the panel only reorders
+// users.
+func sortedUsers(users []model.UserSpec) []model.UserSpec {
+	users = slices.Clone(users)
+	slices.SortFunc(users, func(a, b model.UserSpec) int { return strings.Compare(a.UUID, b.UUID) })
+	return users
 }
 
 type ss2022Config struct {

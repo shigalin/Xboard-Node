@@ -43,6 +43,8 @@ type NodeSpec struct {
 	Transport         string
 	TrafficPattern    string
 	Mode              string
+	ShadowTLSServer   string
+	ShadowTLSPort     int
 
 	Multiplex           *MultiplexConfig
 	AcceptProxyProtocol bool

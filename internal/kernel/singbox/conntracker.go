@@ -65,13 +65,16 @@ func (t *ConnTracker) UpdateGlobalDevices(users map[int][]string) {
 }
 func (t *ConnTracker) ClearGlobalDevices() { t.devices.ClearGlobalDevices() }
 
-func (t *ConnTracker) admit(uuid, ip string) (*userStats, *limiter.DeviceLease, bool) {
+func (t *ConnTracker) admit(inbound, uuid, ip string) (*userStats, *limiter.DeviceLease, bool) {
 	t.usersMu.RLock()
 	uid, known := t.uuidMap[uuid]
 	us := t.users[uid]
 	t.usersMu.RUnlock()
 	if !known {
-		return nil, nil, uuid == "" // only unauthenticated inbounds are untracked
+		// Only unauthenticated inbounds are untracked. The Snell inbound behind
+		// ShadowTLS is not one of them: a connection without a user reached it
+		// around ShadowTLS, with the PSK every subscriber knows.
+		return nil, nil, uuid == "" && inbound != snellDetourTag
 	}
 	limit := 0
 	if fn := t.deviceLimitFunc.Load(); fn != nil && *fn != nil {
@@ -86,7 +89,7 @@ func (t *ConnTracker) admit(uuid, ip string) (*userStats, *limiter.DeviceLease, 
 }
 
 func (t *ConnTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) net.Conn {
-	us, lease, ok := t.admit(metadata.User, metadata.Source.Addr.String())
+	us, lease, ok := t.admit(metadata.Inbound, metadata.User, metadata.Source.Addr.String())
 	if !ok {
 		conn.Close()
 		return conn
@@ -105,7 +108,7 @@ func (t *ConnTracker) RoutedConnection(ctx context.Context, conn net.Conn, metad
 }
 
 func (t *ConnTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) N.PacketConn {
-	us, lease, ok := t.admit(metadata.User, metadata.Source.Addr.String())
+	us, lease, ok := t.admit(metadata.Inbound, metadata.User, metadata.Source.Addr.String())
 	if !ok {
 		conn.Close()
 		return conn

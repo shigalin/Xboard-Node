@@ -126,6 +126,8 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		Transport:           nc.Transport,
 		TrafficPattern:      nc.TrafficPattern,
 		Mode:                nc.Mode,
+		ShadowTLSServer:     nc.ShadowTLSServer,
+		ShadowTLSPort:       nc.ShadowTLSPort,
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: nc.AcceptProxyProtocol,
 	}
@@ -288,6 +290,8 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 		Transport:           n.Transport,
 		TrafficPattern:      n.TrafficPattern,
 		Mode:                n.Mode,
+		ShadowTLSServer:     n.ShadowTLSServer,
+		ShadowTLSPort:       n.ShadowTLSPort,
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: n.AcceptProxyProtocol,
 	}

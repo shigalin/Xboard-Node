@@ -444,6 +444,78 @@ func TestBuildInbound_Snell_NoUsersStaysMultiUser(t *testing.T) {
 	}
 }
 
+// Behind ShadowTLS the users move to the ShadowTLS inbound; the Snell inbound
+// keeps none and is not reachable from outside.
+func TestBuildInbounds_SnellShadowTLS(t *testing.T) {
+	for _, version := range []int{5, 6} {
+		nc := &panel.NodeConfig{
+			Protocol: "snell", ServerPort: 6160, Version: version, ServerKey: "0123456789abcdef",
+			Obfs: "http", Mode: "unshaped", ShadowTLSServer: "www.example.com",
+		}
+		inbounds := buildInbounds(testNodeSpec(nc), testUsers, kernel.TLSCert{})
+		if len(inbounds) != 2 {
+			t.Fatalf("v%d: inbounds = %d, want 2", version, len(inbounds))
+		}
+		shadowTLS, snell := inbounds[0], inbounds[1]
+		assertMapValue(t, shadowTLS, "type", "shadowtls")
+		assertMapValue(t, shadowTLS, "listen", "::")
+		assertMapValue(t, shadowTLS, "listen_port", 6160)
+		assertMapValue(t, shadowTLS, "version", 3)
+		assertMapValue(t, shadowTLS, "strict_mode", true)
+		assertMapValue(t, shadowTLS, "detour", snell["tag"])
+		handshake := shadowTLS["handshake"].(M)
+		assertMapValue(t, handshake, "server", "www.example.com")
+		assertMapValue(t, handshake, "server_port", 443)
+		users := shadowTLS["users"].([]M)
+		if len(users) != len(testUsers) {
+			t.Fatalf("v%d: users = %d, want %d", version, len(users), len(testUsers))
+		}
+		assertMapValue(t, users[0], "name", "aaaaaaaa-1111-2222-3333-444444444444")
+		assertMapValue(t, users[0], "password", "aaaaaaaa-1111-2222-3333-444444444444")
+
+		assertMapValue(t, snell, "type", "snell")
+		assertMapValue(t, snell, "listen", "127.0.0.1")
+		assertMapValue(t, snell, "version", version)
+		assertMapValue(t, snell, "psk", "0123456789abcdef")
+		for _, key := range []string{"users", "listen_port", "obfs_mode"} {
+			if _, ok := snell[key]; ok {
+				t.Errorf("v%d: snell inbound must not carry %s", version, key)
+			}
+		}
+		if _, ok := snell["mode"]; ok != (version == 6) {
+			t.Errorf("v%d: snell inbound mode present = %v", version, ok)
+		}
+		if err := New(config.KernelConfig{}).CheckConfig(testNodeSpec(nc), testUsers, kernel.TLSCert{}); err != nil {
+			t.Fatalf("sing-box rejected snell v%d behind shadowtls: %v", version, err)
+		}
+	}
+}
+
+func TestBuildInbounds_SnellShadowTLS_HandshakePort(t *testing.T) {
+	nc := &panel.NodeConfig{Protocol: "snell", ServerPort: 6160, Version: 5, ServerKey: "0123456789abcdef", ShadowTLSServer: "www.example.com", ShadowTLSPort: 8443}
+	shadowTLS := buildInbounds(testNodeSpec(nc), testUsers, kernel.TLSCert{})[0]
+	assertMapValue(t, shadowTLS["handshake"].(M), "server_port", 8443)
+}
+
+// ShadowTLS v3 cannot start without users; the placeholder lets nobody in.
+func TestBuildInbounds_SnellShadowTLS_NoUsers(t *testing.T) {
+	nc := &panel.NodeConfig{Protocol: "snell", ServerPort: 6160, Version: 5, ServerKey: "0123456789abcdef", ShadowTLSServer: "www.example.com"}
+	spec := testNodeSpec(nc)
+	users := buildInbounds(spec, nil, kernel.TLSCert{})[0]["users"].([]M)
+	if len(users) != 1 || users[0]["password"] == "" || users[0]["password"] == nc.ServerKey {
+		t.Fatalf("placeholder user = %#v", users)
+	}
+	if _, named := users[0]["name"]; named {
+		t.Fatalf("placeholder user must not carry an identity: %#v", users)
+	}
+	if !reflect.DeepEqual(buildInbounds(spec, nil, kernel.TLSCert{}), buildInbounds(spec, nil, kernel.TLSCert{})) {
+		t.Fatal("rebuilding without users changed the inbounds")
+	}
+	if err := New(config.KernelConfig{}).CheckConfig(spec, nil, kernel.TLSCert{}); err != nil {
+		t.Fatalf("sing-box rejected shadowtls without users: %v", err)
+	}
+}
+
 func TestBuildInbound_Hysteria1(t *testing.T) {
 	nc := &panel.NodeConfig{
 		Protocol:   "hysteria",

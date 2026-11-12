@@ -515,6 +515,10 @@ func updateInboundUsers(existing adapter.Inbound, inb option.Inbound) (bool, err
 		if opts, ok := inb.Options.(*option.SnellInboundOptions); ok {
 			return true, v.UpdateUsers(opts.Users)
 		}
+	case adapter.UpdatableInbound[option.ShadowTLSUser]:
+		if opts, ok := inb.Options.(*option.ShadowTLSInboundOptions); ok {
+			return true, v.UpdateUsers(opts.Users)
+		}
 	case adapter.UpdatableInbound[auth.User]:
 		switch opts := inb.Options.(type) {
 		case *option.NaiveInboundOptions:

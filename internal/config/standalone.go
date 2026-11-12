@@ -47,6 +47,8 @@ type StandaloneNodeConfig struct {
 	Transport         string `yaml:"transport,omitempty"`
 	TrafficPattern    string `yaml:"traffic_pattern,omitempty"`
 	Mode              string `yaml:"mode,omitempty"`
+	ShadowTLSServer   string `yaml:"shadow_tls_server,omitempty"`
+	ShadowTLSPort     int    `yaml:"shadow_tls_port,omitempty"`
 
 	Multiplex           *StandaloneMultiplexConfig `yaml:"multiplex,omitempty"`
 	AcceptProxyProtocol bool                       `yaml:"accept_proxy_protocol,omitempty"`

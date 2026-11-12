@@ -104,6 +104,16 @@ kernel or listener; connections of retained users stay open. An empty user
 set still rejects PSK-only access. Hysteria2 accepts `gecko` as well as
 `salamander` obfuscation, with sing-box's default packet sizes.
 
+A Snell node with a ShadowTLS handshake server (`shadow_tls_server`, optional
+`shadow_tls_port`, default 443) serves clients that cannot send a user key,
+such as mihomo. ShadowTLS v3 listens on the node port and authenticates each
+user by their UUID as password; the Snell inbound behind it has no users,
+listens on loopback only and takes the user from ShadowTLS. Traffic, limits
+and in-place user changes work as for other protocols, and removing a user
+closes their ShadowTLS connections. Such a node no longer accepts Snell
+clients that connect with a user key. The handshake server must speak
+TLS 1.3 and be reachable from the node.
+
 The Snell hot-update integration uses the sing-box fork and its patched
 `third_party/sing-snell` module, both pinned in `go.mod`. Keep both
 replacements when updating dependencies: the Snell service patch synchronizes

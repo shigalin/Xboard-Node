@@ -145,6 +145,9 @@ type NodeConfig struct {
 
 	// Snell: Version is 5 or 6, ServerKey the PSK, Obfs the v5 obfs mode.
 	Mode string `json:"mode,omitempty"` // v6 traffic shaping mode
+	// ShadowTLS v3 in front of Snell, enabled by its handshake server.
+	ShadowTLSServer string `json:"shadow_tls_server,omitempty"`
+	ShadowTLSPort   int    `json:"shadow_tls_port,omitempty"`
 
 	// Multiplex
 	Multiplex *MultiplexConfig `json:"multiplex,omitempty"`
