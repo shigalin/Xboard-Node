@@ -112,13 +112,22 @@ User changes are applied in place; removing or rotating a user's credential
 closes their transports while retained users keep their connections and
 traffic identity. Empty user sets reject all Snell proxy requests.
 
-PSK lookup checks each candidate's authenticated first-record header once,
-ordered by required header length, with a 15-second handshake deadline and
-at most 16 pending lookups per inbound. This applies to both plain Snell and
-the shared-password ShadowTLS gateway. Its worst-case CPU cost is linear in
-the active user count; use connection reuse and benchmark the expected user
-count on the deployment machine. v5 users share bounded replay-cache storage,
-keyed by derived cipher key so distinct PSKs can safely use the same salt.
+PSK lookup checks each candidate's authenticated first-record header at most
+once, with a 15-second handshake deadline. Up to 16 fallback candidate groups
+run concurrently per inbound; idle sockets hold no probe slot. Up to four
+recent users per source (4096 sources) are tried as cryptographically verified
+hints outside these slots. When a hinted v6 header is fragmented, one bounded
+read-ahead can receive its remaining bytes while lookup waits for a slot. A
+shorter valid candidate can use an available slot immediately without waiting
+for the longer hint; its protocol inherits any pending read and preread bytes.
+Closing the inbound interrupts queued reads and lookups.
+
+Hints are a performance optimization, not guaranteed admission under overload.
+Cold and wrong-PSK lookups remain linear in user count; source churn or several
+users behind one address can reduce the benefit. Use connection reuse and
+benchmark the expected population on the deployment machine. v5 users share
+bounded replay-cache storage keyed by derived cipher key, so distinct PSKs can
+safely use the same salt.
 
 Hysteria2 accepts `gecko` and `salamander` obfuscation with default packet sizes.
 The current development dependency replacements use the sibling `../singbox`

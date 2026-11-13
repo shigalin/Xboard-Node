@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -39,10 +40,23 @@ func runningInbound(t *testing.T, s *SingBox, tag string) adapter.Inbound {
 }
 
 func TestReloadRefusesChangesOutsideInbounds(t *testing.T) {
+	// Keep a port occupied to reproduce another listener taking a probed port
+	// before the kernel binds it.
+	busy, err := net.Listen("tcp", "[::]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
 	users := []model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}}
 	s := New(config.KernelConfig{Type: "singbox", ConfigDir: t.TempDir(), LogLevel: "error", CustomConfigData: map[string]any{}})
 	defer s.Stop()
-	spec := &model.NodeSpec{Protocol: "socks", ListenIP: "127.0.0.1", ServerPort: freePort(t)}
+	spec := &model.NodeSpec{Protocol: "socks", ListenIP: "127.0.0.1", ServerPort: busy.Addr().(*net.TCPAddr).Port}
+	if err := s.Start(spec, users, kernel.TLSCert{}); !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("expected occupied port to reject startup, got %v", err)
+	}
+	// This test never dials the inbound. Let the kernel allocate and bind its
+	// port atomically instead of closing a probe listener before Start.
+	spec.ServerPort = 0
 	if err := s.Start(spec, users, kernel.TLSCert{}); err != nil {
 		t.Fatal(err)
 	}
