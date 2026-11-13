@@ -42,9 +42,11 @@ type NodeSpec struct {
 	PaddingScheme     string
 	Transport         string
 	TrafficPattern    string
+	PSKMode           string
 	Mode              string
 	ShadowTLSServer   string
 	ShadowTLSPort     int
+	ShadowTLSPassword string
 
 	Multiplex           *MultiplexConfig
 	AcceptProxyProtocol bool

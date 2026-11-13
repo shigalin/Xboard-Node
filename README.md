@@ -97,27 +97,33 @@ In machine mode, use `nodes[].node_id` and `nodes[].kernel.custom_config`
 to supply a separate native file for a discovered node. Entries override the
 matching node's settings. The panel still controls which nodes are discovered.
 
-Snell (v5 and v6) runs in multi-user mode: clients need the node PSK and
-their own user key (the user UUID), which sing-box 1.14+ clients send as
-`userkey`. Snell user changes are applied in place without rebuilding the
-kernel or listener; connections of retained users stay open. An empty user
-set still rejects PSK-only access. Hysteria2 accepts `gecko` as well as
-`salamander` obfuscation, with sing-box's default packet sizes.
+Snell v5/v6 supports `psk_mode: user`: each user's UUID is their Snell
+PSK, with no `userkey` needed. Plain Snell accepts these users on one port.
+With `shadow_tls_server` set, ShadowTLS v3 uses the node-wide
+`shadow_tls_password`; it forwards to an injection-only Snell inbound that
+selects the user by their PSK. `shadow_tls_port` defaults to 443 and the
+handshake site must support TLS 1.3. The internal inbound opens no socket.
+`unsafe-raw` is rejected for independent PSKs.
 
-A Snell node with a ShadowTLS handshake server (`shadow_tls_server`, optional
-`shadow_tls_port`, default 443) serves clients that cannot send a user key,
-such as mihomo. ShadowTLS v3 listens on the node port and authenticates each
-user by their UUID as password; the Snell inbound behind it has no users,
-listens on loopback only and takes the user from ShadowTLS. Traffic, limits
-and in-place user changes work as for other protocols, and removing a user
-closes their ShadowTLS connections. Such a node no longer accepts Snell
-clients that connect with a user key. The handshake server must speak
-TLS 1.3 and be reachable from the node.
+The default/legacy `psk_mode: shared` still uses a node PSK plus UUID userkeys
+for plain Snell, or per-user UUID ShadowTLS passwords when wrapped. Upgrade
+the node before changing the panel mode and refresh client subscriptions.
+User changes are applied in place; removing or rotating a user's credential
+closes their transports while retained users keep their connections and
+traffic identity. Empty user sets reject all Snell proxy requests.
 
-The Snell hot-update integration uses the sing-box fork and its patched
-`third_party/sing-snell` module, both pinned in `go.mod`. Keep both
-replacements when updating dependencies: the Snell service patch synchronizes
-authentication with user updates.
+PSK lookup checks each candidate's authenticated first-record header once,
+ordered by required header length, with a 15-second handshake deadline and
+at most 16 pending lookups per inbound. This applies to both plain Snell and
+the shared-password ShadowTLS gateway. Its worst-case CPU cost is linear in
+the active user count; use connection reuse and benchmark the expected user
+count on the deployment machine. v5 users share bounded replay-cache storage,
+keyed by derived cipher key so distinct PSKs can safely use the same salt.
+
+Hysteria2 accepts `gecko` and `salamander` obfuscation with default packet sizes.
+The current development dependency replacements use the sibling `../singbox`
+and `../singbox/third_party/sing-snell` checkouts. Publish and pin both updated
+modules before standalone CI/Docker builds or deployment.
 
 Hysteria v1 uses the `hysteria` ALPN by default. Update clients that explicitly
 set `h3`. Credential changes on a Hysteria v1 node rebuild its inbound and

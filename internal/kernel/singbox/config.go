@@ -538,6 +538,14 @@ func buildSnell(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 	if len(userList) == 0 {
 		userList = append(userList, M{"userkey": snellNoUserKey})
 	}
+	if nc.PSKMode == "user" {
+		delete(base, "psk")
+		base["user_psk"] = true
+		userList = make([]M, 0, len(users))
+		for _, u := range users {
+			userList = append(userList, M{"name": u.UUID, "psk": u.UUID})
+		}
+	}
 	base["users"] = userList
 	return base
 }
@@ -557,10 +565,10 @@ var shadowTLSNoUserPassword = rand.Text()
 
 // buildSnellShadowTLS puts ShadowTLS v3 in front of Snell for clients that
 // cannot send a Snell user key. ShadowTLS authenticates each user by their
-// own password and hands the connection to a Snell inbound without users,
-// whose requests carry the ShadowTLS user. That inbound accepts the shared
-// PSK alone, so it only listens on loopback and ConnTracker rejects whatever
-// reaches it without a user.
+// own password in legacy mode. The legacy inner inbound only listens on
+// loopback and relies on the inherited identity. Independent PSK mode uses a
+// shared ShadowTLS gateway password and an injection-only Snell inbound,
+// which selects and verifies the actual user by their UUID PSK.
 func buildSnellShadowTLS(nc *model.NodeSpec, users []model.UserSpec) []M {
 	snell := M{
 		"type":    "snell",
@@ -601,6 +609,18 @@ func buildSnellShadowTLS(nc *model.NodeSpec, users []model.UserSpec) []M {
 		},
 		"strict_mode": true,
 		"detour":      snellDetourTag,
+	}
+	if nc.PSKMode == "user" {
+		delete(snell, "psk")
+		delete(snell, "listen")
+		snell["user_psk"] = true
+		snell["auth_detour"] = shadowTLSInboundTag
+		shadowTLS["users"] = []M{{"name": "snell-gateway", "password": nc.ShadowTLSPassword}}
+		pskUsers := make([]M, 0, len(users))
+		for _, u := range users {
+			pskUsers = append(pskUsers, M{"name": u.UUID, "psk": u.UUID})
+		}
+		snell["users"] = pskUsers
 	}
 	return []M{shadowTLS, snell}
 }

@@ -85,8 +85,10 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		Transport:           sc.Node.Transport,
 		TrafficPattern:      sc.Node.TrafficPattern,
 		Mode:                sc.Node.Mode,
+		PSKMode:             sc.Node.PSKMode,
 		ShadowTLSServer:     sc.Node.ShadowTLSServer,
 		ShadowTLSPort:       sc.Node.ShadowTLSPort,
+		ShadowTLSPassword:   sc.Node.ShadowTLSPassword,
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: sc.Node.AcceptProxyProtocol,
 	}

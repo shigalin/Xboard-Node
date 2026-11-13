@@ -1115,3 +1115,17 @@ func TestMergeCustomSingbox_UsesServiceSnapshotOverFile(t *testing.T) {
 		t.Fatalf("expected the service snapshot to be merged instead of the file, got %s", data)
 	}
 }
+
+func TestSnellUserPSKContract(t *testing.T) {
+	const uuid = "11111111-1111-4111-8111-111111111111"
+	const expected = uuid
+
+	spec := &model.NodeSpec{Protocol: "snell", Version: 6, PSKMode: "user", ServerKey: "0123456789abcdef", ShadowTLSServer: "handshake.example"}
+	in := buildInbounds(spec, []model.UserSpec{{UUID: uuid}}, kernel.TLSCert{})[1]
+	if in["psk"] != nil || in["user_psk"] != true || in["auth_detour"] != shadowTLSInboundTag {
+		t.Fatalf("invalid independent PSK config: %v", in)
+	}
+	if got := in["users"].([]M)[0]["psk"]; got != expected {
+		t.Fatal("wrong user key")
+	}
+}

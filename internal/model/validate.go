@@ -12,6 +12,17 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 		return nil
 	}
 
+	if n.Protocol == "snell" {
+		if n.PSKMode != "" && n.PSKMode != "shared" && n.PSKMode != "user" {
+			return fmt.Errorf("unknown Snell psk_mode")
+		}
+		if n.PSKMode == "user" && n.ShadowTLSServer != "" && n.ShadowTLSPassword == "" {
+			return fmt.Errorf("ShadowTLS password is required for independent Snell PSKs")
+		}
+		if n.PSKMode == "user" && n.Mode == "unsafe-raw" {
+			return fmt.Errorf("Snell independent PSKs require an encrypted mode")
+		}
+	}
 	effectiveKernelType := strings.TrimSpace(kcfg.Type)
 	if effectiveKernelType == "" {
 		effectiveKernelType = strings.TrimSpace(n.KernelType)
