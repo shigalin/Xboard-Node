@@ -130,9 +130,9 @@ bounded replay-cache storage keyed by derived cipher key, so distinct PSKs can
 safely use the same salt.
 
 Hysteria2 accepts `gecko` and `salamander` obfuscation with default packet sizes.
-The current development dependency replacements use the sibling `../singbox`
-and `../singbox/third_party/sing-snell` checkouts. Publish and pin both updated
-modules before standalone CI/Docker builds or deployment.
+The sing-box and patched sing-snell modules are pinned to published revisions
+in `go.mod`, so standalone CI and Docker builds do not need sibling checkouts.
+Keep both replacements when updating the Snell integration.
 
 Hysteria v1 uses the `hysteria` ALPN by default. Update clients that explicitly
 set `h3`. Credential changes on a Hysteria v1 node rebuild its inbound and

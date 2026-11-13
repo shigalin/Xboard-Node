@@ -294,9 +294,9 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing-box => ../singbox
+replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20261113083500-b320a4570226
 
-replace github.com/sagernet/sing-snell => ../singbox/third_party/sing-snell
+replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261113083500-b320a4570226
 
 replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261109121004-43f211987b80
 
