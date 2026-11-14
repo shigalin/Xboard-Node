@@ -30,6 +30,7 @@ require (
 	github.com/libdns/vultr/v2 v2.0.4
 	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
 	github.com/sagernet/sing-box v1.13.2
+	github.com/sagernet/sing-snell v0.0.0-20260904135315-bc5a12ac736f
 	github.com/sagernet/sing-tun v0.9.7-0.20261023115432-040db71fcd33
 	github.com/shirou/gopsutil/v4 v4.26.2
 	github.com/xtls/xray-core v1.260327.0
@@ -229,7 +230,6 @@ require (
 	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e // indirect
 	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20260929152114-a69d1086332b // indirect
 	github.com/sagernet/sing-shadowtls v0.2.2-0.20261110092247-ce8a3b8474bb // indirect
-	github.com/sagernet/sing-snell v0.0.0-20260904135315-bc5a12ac736f // indirect
 	github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca // indirect
 	github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d // indirect
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1 // indirect
@@ -294,9 +294,9 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20261113083500-b320a4570226
+replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20261114084038-10e54c0de6b1
 
-replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261113083500-b320a4570226
+replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261114084038-10e54c0de6b1
 
 replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261109121004-43f211987b80
 
