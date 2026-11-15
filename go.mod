@@ -221,7 +221,7 @@ require (
 	github.com/sagernet/gvisor v0.0.0-20241123041152-536d05261cff // indirect
 	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf // indirect
 	github.com/sagernet/nftables v0.3.0-mod.4 // indirect
-	github.com/sagernet/quic-go v0.61.0-sing-box-mod.12 // indirect
+	github.com/sagernet/quic-go v0.61.0-sing-box-mod.14 // indirect
 	github.com/sagernet/sing-cloudflared v0.1.4-0.20261021152903-2d40d788fcf6 // indirect
 	github.com/sagernet/sing-mux v0.3.10-0.20260929204512-caf09fe32475 // indirect
 	github.com/sagernet/sing-openconnect v0.1.1-0.20260929151225-cbd68c45de58 // indirect
@@ -229,7 +229,7 @@ require (
 	github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4 // indirect
 	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e // indirect
 	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20260929152114-a69d1086332b // indirect
-	github.com/sagernet/sing-shadowtls v0.2.2-0.20261110092247-ce8a3b8474bb // indirect
+	github.com/sagernet/sing-shadowtls v0.2.2-0.20261114073233-97863830a3b3 // indirect
 	github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca // indirect
 	github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d // indirect
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1 // indirect
@@ -294,12 +294,12 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20261114084038-10e54c0de6b1
+replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20261115070049-67d824998181
 
-replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261114084038-10e54c0de6b1
+replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261115070049-67d824998181
 
 replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261109121004-43f211987b80
 
-replace github.com/sagernet/sing-vmess => github.com/shigalin/sing-box/third_party/sing-vmess v0.0.0-20261112121610-6d0a4352b3b9
+replace github.com/sagernet/sing-vmess => github.com/shigalin/sing-box/third_party/sing-vmess v0.0.0-20261115070049-67d824998181
 
-replace github.com/sagernet/sing-quic => github.com/shigalin/sing-box/third_party/sing-quic v0.0.0-20261112121610-6d0a4352b3b9
+replace github.com/sagernet/sing-quic => github.com/shigalin/sing-box/third_party/sing-quic v0.0.0-20261115070049-67d824998181
