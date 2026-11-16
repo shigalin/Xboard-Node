@@ -100,13 +100,13 @@ func TestNodeSpecFromPanelValidated_RejectsCustomConfigForOtherKernel(t *testing
 		config.KernelConfig{Type: "xray", CustomConfig: singboxPath}); err != nil {
 		t.Fatalf("sing-box custom config rejected for a node selected onto sing-box: %v", err)
 	}
-	// XHTTP moves a sing-box-configured node to Xray, which would ignore route.rules.
+	// XHTTP selects Xray, which must reject sing-box route.rules instead of ignoring them.
 	_, err := NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "vless", Network: "xhttp", ServerPort: 443},
 		config.KernelConfig{Type: "singbox", CustomConfig: singboxPath})
 	if err == nil || !strings.Contains(err.Error(), `sing-box-only keys [route]`) {
 		t.Fatalf("expected Xray to reject sing-box route rules, got %v", err)
 	}
-	// Hysteria moves an xray-configured node to sing-box, which would ignore routing.rules.
+	// Hysteria v2 moves an xray-configured node to sing-box, which would ignore routing.rules.
 	_, err = NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "hysteria", Version: 2, ServerPort: 443},
 		config.KernelConfig{Type: "xray", CustomConfig: xrayPath})
 	if err == nil || !strings.Contains(err.Error(), `xray-only keys [routing]`) {

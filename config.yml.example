@@ -1,7 +1,7 @@
 # Xboard Node Configuration
 # Top-level settings are inherited by all instances. Instance overrides take precedence.
-# For panel nodes, kernel.type is a preference: Hysteria v1/v2 switches xray -> singbox;
-# XHTTP/SplitHTTP switches singbox -> xray, including REST/WebSocket updates.
+# For panel nodes, Hysteria v1/v2 and Snell select singbox; VLESS always selects xray.
+# Other protocols respect kernel.type; transport settings do not select a different kernel.
 # The YAML file is not rewritten; native custom configs must match the selected kernel.
 
 # ── Single node (simplest) ──
@@ -12,7 +12,7 @@
 
 # ── Multiple instances ──
 # kernel:
-#   type: "singbox"
+#   type: "xray" # Default when omitted
 # log:
 #   level: "info"
 # instances:

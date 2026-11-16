@@ -29,13 +29,13 @@ var kernelSwitchRetryDelays = []time.Duration{time.Minute, 5 * time.Minute, 15 *
 
 func newKernel(cfg config.KernelConfig, devices *limiter.DeviceManager) kernel.Kernel {
 	switch cfg.Type {
-	case "xray":
+	case "", "xray":
 		return xray.NewWithDeviceManager(cfg, devices)
 	case "singbox":
 		return singbox.NewWithDeviceManager(cfg, devices)
 	default:
-		nlog.Core().Warn("unsupported kernel type, defaulting to sing-box", "type", cfg.Type)
-		return singbox.NewWithDeviceManager(cfg, devices)
+		nlog.Core().Warn("unsupported kernel type, defaulting to xray", "type", cfg.Type)
+		return xray.NewWithDeviceManager(cfg, devices)
 	}
 }
 

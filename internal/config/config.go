@@ -621,7 +621,7 @@ func (c *Config) inheritFrom(parent *Config) {
 
 func (c *Config) setDefaultsFrom(baseDir string) {
 	if c.Kernel.Type == "" {
-		c.Kernel.Type = "singbox"
+		c.Kernel.Type = "xray"
 	}
 	if c.Kernel.ConfigDir == "" {
 		c.Kernel.ConfigDir = baseDir

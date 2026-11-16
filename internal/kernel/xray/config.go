@@ -421,7 +421,7 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 			"email": userEmail(u.ID),
 		})
 	}
-	base["settings"] = M{"clients": clients}
+	base["settings"] = M{"version": 2, "clients": clients}
 
 	ss := M{
 		"network": "hysteria",
@@ -431,6 +431,7 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 		},
 	}
 
+	finalMask := M{}
 	if nc.UpMbps > 0 || nc.DownMbps > 0 {
 		quicParams := M{}
 		if nc.UpMbps > 0 {
@@ -439,9 +440,17 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 		if nc.DownMbps > 0 {
 			quicParams["brutalDown"] = fmt.Sprintf("%d mbps", nc.DownMbps)
 		}
-		ss["finalMask"] = M{
-			"quicParams": quicParams,
+		finalMask["quicParams"] = quicParams
+	}
+	if nc.Obfs == "salamander" || nc.Obfs == "gecko" {
+		settings := M{"password": nc.ObfsPassword}
+		if nc.Obfs == "gecko" {
+			settings["packetSize"] = "512-1200"
 		}
+		finalMask["udp"] = []M{{"type": "salamander", "settings": settings}}
+	}
+	if len(finalMask) > 0 {
+		ss["finalMask"] = finalMask
 	}
 
 	if tc.HasCert() {

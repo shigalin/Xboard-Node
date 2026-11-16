@@ -143,12 +143,12 @@ func TestApplyNodeConfigRechecksCustomConfigAgainstSelectedKernel(t *testing.T) 
 	s := NewWithControlPlane(cfg, &kernelTestControlPlane{})
 	old := &fakeKernel{running: true}
 	s.kernel = old
-	previous := &model.NodeSpec{Protocol: "vless", ServerPort: 12345}
+	previous := &model.NodeSpec{Protocol: "vmess", ServerPort: 12345}
 	s.lastConfig = previous
 	s.appliedState.Config = previous
 	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}})
 	// Translated while the file was sing-box native...
-	next, err := model.NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "vless", Network: "tcp", ServerPort: 12346}, cfg.Kernel)
+	next, err := model.NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "vmess", Network: "tcp", ServerPort: 12346}, cfg.Kernel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestUserUpdateDoesNotStartKernelWithForeignCustomConfig(t *testing.T) {
 	stopped := &fakeKernel{}
 	s.kernel = stopped
 	// The node idles without users on a config translated while the file was native.
-	spec, err := model.NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "vless", Network: "tcp", ServerPort: 12345}, cfg.Kernel)
+	spec, err := model.NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "vmess", Network: "tcp", ServerPort: 12345}, cfg.Kernel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestStoppedUserUpdateSurvivesRefusedStart(t *testing.T) {
 	s := NewWithControlPlane(cfg, &kernelTestControlPlane{})
 	stopped := &fakeKernel{}
 	s.kernel = stopped
-	spec, err := model.NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "vless", Network: "tcp", ServerPort: 12345}, cfg.Kernel)
+	spec, err := model.NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "vmess", Network: "tcp", ServerPort: 12345}, cfg.Kernel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestStoppedUserUpdateSurvivesRefusedStart(t *testing.T) {
 func restUserNode(t *testing.T) (*Service, *fakeKernel, *panelConfigServer, func()) {
 	t.Helper()
 	panelServer := &panelConfigServer{
-		config: map[string]any{"protocol": "vless", "network": "tcp", "server_port": 20001},
+		config: map[string]any{"protocol": "vmess", "network": "tcp", "server_port": 20001},
 		users: []map[string]any{
 			{"id": 1, "uuid": "11111111-1111-4111-8111-111111111111"},
 			{"id": 2, "uuid": "22222222-2222-4222-8222-222222222222"},
@@ -434,7 +434,7 @@ func TestRejectedSameKernelUpdateRestoresCustomConfigSnapshot(t *testing.T) {
 	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox", CustomConfig: path}}
 	s := NewWithControlPlane(cfg, &kernelTestControlPlane{})
 	runningSnapshot := map[string]any{"route": "running snapshot"}
-	previous := &model.NodeSpec{Protocol: "vless", ServerPort: 12345}
+	previous := &model.NodeSpec{Protocol: "vmess", ServerPort: 12345}
 	running := &fakeKernel{running: true, reloadErr: errors.New("reload rejected"), customConfig: runningSnapshot,
 		startHook: func(spec *model.NodeSpec, _ []model.UserSpec) error {
 			if spec != previous {
@@ -449,7 +449,7 @@ func TestRejectedSameKernelUpdateRestoresCustomConfigSnapshot(t *testing.T) {
 	s.lastConfigHash = computeConfigHash(previous)
 	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}})
 
-	next := &model.NodeSpec{Protocol: "vless", ServerPort: 12346}
+	next := &model.NodeSpec{Protocol: "vmess", ServerPort: 12346}
 	if err := s.applyNodeConfig(ctx, next); err == nil {
 		t.Fatal("expected the rejected update to fail")
 	}
@@ -473,7 +473,7 @@ func TestCustomConfigChangeRebuildsInsteadOfHotReload(t *testing.T) {
 	s := NewWithControlPlane(cfg, &kernelTestControlPlane{})
 	running := &fakeKernel{running: true}
 	s.kernel = running
-	spec := &model.NodeSpec{Protocol: "vless", ServerPort: 12345}
+	spec := &model.NodeSpec{Protocol: "vmess", ServerPort: 12345}
 	s.appliedState.CustomConfig = map[string]any{"route": "older snapshot"}
 	s.lastConfig = spec
 	s.appliedState.Config = spec
@@ -532,6 +532,20 @@ func (*kernelTestControlPlane) SupportsReporting() bool          { return false 
 func (*kernelTestControlPlane) SupportsDeviceReports() bool      { return false }
 func (*kernelTestControlPlane) Metrics() controlplane.APIMetrics { return controlplane.APIMetrics{} }
 
+func TestNewKernelDefaultAndExplicitPreference(t *testing.T) {
+	for _, tc := range []struct{ kind, want string }{
+		{"", "xray"}, {"xray", "xray"}, {"singbox", "sing-box"},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			k := newKernel(config.KernelConfig{Type: tc.kind}, nil)
+			defer k.Stop()
+			if k.Name() != tc.want {
+				t.Fatalf("kernel = %q, want %q", k.Name(), tc.want)
+			}
+		})
+	}
+}
+
 func TestInitialSetupSelectsKernelWithoutUsers(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -566,7 +580,7 @@ func TestConfigUpdatesSelectKernelAndRejectInvalidConfig(t *testing.T) {
 	for _, transport := range []string{"ws", "rest"} {
 		t.Run(transport, func(t *testing.T) {
 			cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox", ConfigDir: t.TempDir()}, Cert: config.CertConfig{CertDir: t.TempDir()}}
-			s := NewWithControlPlane(cfg, &kernelTestControlPlane{kcfg: cfg.Kernel, node: panel.NodeConfig{Protocol: "vless", Network: "tcp"}})
+			s := NewWithControlPlane(cfg, &kernelTestControlPlane{kcfg: cfg.Kernel, node: panel.NodeConfig{Protocol: "vmess", Network: "tcp"}})
 			defer func() { s.kernel.Stop() }()
 			if err := s.initialSetup(context.Background()); err != nil {
 				t.Fatal(err)
@@ -584,10 +598,14 @@ func TestConfigUpdatesSelectKernelAndRejectInvalidConfig(t *testing.T) {
 			if s.kernel.Name() != "sing-box" || s.lastConfig != original {
 				t.Fatal("invalid config replaced the active kernel or config")
 			}
-			xhttp := &model.NodeSpec{Protocol: "vless", Network: "xhttp"}
-			apply(xhttp)
-			if s.kernel.Name() != "xray" || s.lastConfig != xhttp {
-				t.Fatal("xhttp update did not select Xray")
+			apply(&model.NodeSpec{Protocol: "vless", Network: "tcp", Multiplex: &model.MultiplexConfig{Enabled: true}})
+			if s.kernel.Name() != "sing-box" || s.lastConfig != original {
+				t.Fatal("VLESS multiplex update replaced the active kernel or config")
+			}
+			vless := &model.NodeSpec{Protocol: "vless", Network: "tcp"}
+			apply(vless)
+			if s.kernel.Name() != "xray" || s.lastConfig != vless {
+				t.Fatal("vless TCP update did not select Xray")
 			}
 			hy2 := &model.NodeSpec{Protocol: "hysteria", Version: 2, CertConfig: &config.CertConfig{CertMode: "self", CertDir: t.TempDir()}}
 			apply(hy2)
@@ -602,7 +620,7 @@ func TestConfigRetriedAfterKernelStartFailure(t *testing.T) {
 	for _, transport := range []string{"ws", "rest"} {
 		t.Run(transport, func(t *testing.T) {
 			cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox", ConfigDir: t.TempDir(), LogLevel: "error"}}
-			cp := &kernelTestControlPlane{kcfg: cfg.Kernel, node: panel.NodeConfig{Protocol: "vless", Network: "tcp"}}
+			cp := &kernelTestControlPlane{kcfg: cfg.Kernel, node: panel.NodeConfig{Protocol: "vmess", Network: "tcp"}}
 			s := NewWithControlPlane(cfg, cp)
 			defer func() { s.kernel.Stop() }()
 			if err := s.initialSetup(context.Background()); err != nil {
@@ -951,10 +969,10 @@ func (p *panelConfigServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func TestREST304ResolvesPendingConfigAgainstPanelConfig(t *testing.T) {
-	configA := map[string]any{"protocol": "vless", "network": "tcp", "server_port": 20001}
+	configA := map[string]any{"protocol": "vmess", "network": "tcp", "server_port": 20001}
 	// The fake kernel cannot serve trojan, so B stays pending.
 	configB := map[string]any{"protocol": "trojan", "network": "tcp", "server_port": 20002}
-	configC := map[string]any{"protocol": "vless", "network": "tcp", "server_port": 20003}
+	configC := map[string]any{"protocol": "vmess", "network": "tcp", "server_port": 20003}
 
 	singbox := config.KernelConfig{Type: "singbox"}
 	setup := func(t *testing.T, kcfg config.KernelConfig) (*Service, *panelConfigServer, func() bool) {
@@ -1073,7 +1091,7 @@ func TestREST304ResolvesPendingConfigAgainstPanelConfig(t *testing.T) {
 		active := computeConfigHash(s.lastConfig)
 		pushB(t, s)
 		// The panel replaces B with C, which references an unknown outbound.
-		invalidC := map[string]any{"protocol": "vless", "network": "tcp", "server_port": 20004,
+		invalidC := map[string]any{"protocol": "vmess", "network": "tcp", "server_port": 20004,
 			"custom_outbounds": []map[string]any{{"tag": "proxy", "protocol": "socks", "proxy_tag": "missing",
 				"settings": map[string]any{"server": "2.2.2.2", "server_port": 1080}}}}
 		panelServer.set(invalidC, false)
@@ -1100,7 +1118,7 @@ func TestREST304ResolvesPendingConfigAgainstPanelConfig(t *testing.T) {
 		s, panelServer, poll := setup(t, singbox)
 		active := computeConfigHash(s.lastConfig)
 		pushB(t, s)
-		invalidC := map[string]any{"protocol": "vless", "network": "tcp", "server_port": 20004,
+		invalidC := map[string]any{"protocol": "vmess", "network": "tcp", "server_port": 20004,
 			"custom_outbounds": []map[string]any{{"tag": "proxy", "protocol": "socks", "proxy_tag": "missing",
 				"settings": map[string]any{"server": "2.2.2.2", "server_port": 1080}}}}
 		panelServer.mu.Lock()
@@ -1175,7 +1193,7 @@ func TestREST304ResolvesPendingConfigAgainstPanelConfig(t *testing.T) {
 		s, _, _ := setup(t, singbox)
 		active := s.lastConfig
 		s.wsConfigRevision++
-		stale := &model.NodeSpec{Protocol: "vless", ServerPort: 20003}
+		stale := &model.NodeSpec{Protocol: "vmess", ServerPort: 20003}
 		s.applyPullResult(context.Background(), pullResult{config: stale, configHash: computeConfigHash(stale)})
 		if s.pendingConfig != nil || s.lastConfig != active {
 			t.Fatal("a poll older than the latest WS config was applied")

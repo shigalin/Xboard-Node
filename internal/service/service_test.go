@@ -48,7 +48,7 @@ func (f *fakeKernel) SetCustomConfig(data map[string]any) {
 }
 
 func (f *fakeKernel) Name() string                      { return "fake" }
-func (f *fakeKernel) Protocols() []string               { return []string{"vless"} }
+func (f *fakeKernel) Protocols() []string               { return []string{"vless", "vmess"} }
 func (f *fakeKernel) Capabilities() kernel.Capabilities { return kernel.Capabilities{} }
 func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls

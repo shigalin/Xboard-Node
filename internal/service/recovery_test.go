@@ -345,7 +345,7 @@ func TestMachineBootstrapDoesNotAcceptUnconfirmedQueuedAdd(t *testing.T) {
 				mb.Apply(controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{user}})
 			}
 			cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
-				Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: []model.UserSpec{}, Mailbox: mb,
+				Config: &model.NodeSpec{Protocol: "vmess", ServerPort: 20001}, Users: []model.UserSpec{}, Mailbox: mb,
 			}}
 			s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
 			k := &fakeKernel{startHook: func(_ *model.NodeSpec, users []model.UserSpec) error {
@@ -371,7 +371,7 @@ func TestMachineBootstrapDoesNotResurrectStaleFullSnapshot(t *testing.T) {
 	mb := controlplane.NewNodeMailbox()
 	mb.Apply(controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{valid, revoked}})
 	cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
-		Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: []model.UserSpec{valid}, Mailbox: mb,
+		Config: &model.NodeSpec{Protocol: "vmess", ServerPort: 20001}, Users: []model.UserSpec{valid}, Mailbox: mb,
 	}}
 	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
 	k := &fakeKernel{startHook: func(_ *model.NodeSpec, users []model.UserSpec) error {
@@ -392,7 +392,7 @@ func TestMachineBootstrapDoesNotResurrectStaleFullSnapshot(t *testing.T) {
 func TestMachineBootstrapFiltersWSAddDuringKernelStart(t *testing.T) {
 	mb := controlplane.NewNodeMailbox()
 	cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
-		Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: []model.UserSpec{}, Mailbox: mb,
+		Config: &model.NodeSpec{Protocol: "vmess", ServerPort: 20001}, Users: []model.UserSpec{}, Mailbox: mb,
 	}}
 	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
 	starting, release := make(chan struct{}), make(chan struct{})
@@ -439,7 +439,7 @@ func TestMachineBootstrapUsesRestrictiveLimitsUntilReconciled(t *testing.T) {
 		mb := controlplane.NewNodeMailbox()
 		mb.Apply(controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{tc.ws}})
 		cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
-			Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: []model.UserSpec{tc.rest}, Mailbox: mb,
+			Config: &model.NodeSpec{Protocol: "vmess", ServerPort: 20001}, Users: []model.UserSpec{tc.rest}, Mailbox: mb,
 		}}
 		s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
 		s.kernel = &fakeKernel{startHook: func(_ *model.NodeSpec, users []model.UserSpec) error {
@@ -469,7 +469,7 @@ func TestMachineBootstrapStagesQueuedRevocationBeforeStart(t *testing.T) {
 				mb.Apply(controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: users[1:]})
 			}
 			cp := &queuedMailboxBootstrap{bootstrap: controlplane.Bootstrap{
-				Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}, Users: users, Mailbox: mb,
+				Config: &model.NodeSpec{Protocol: "vmess", ServerPort: 20001}, Users: users, Mailbox: mb,
 			}}
 			s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, cp)
 			startedWithRevoked := false
@@ -506,7 +506,7 @@ func TestMachineMailboxStartsWithCoalescedUsers(t *testing.T) {
 	s.machineMailbox = controlplane.NewNodeMailbox()
 	s.machineMailbox.MarkReady()
 	s.machineMailbox.Apply(controlplane.Event{Type: controlplane.EventSyncConfig,
-		Config: &model.NodeSpec{Protocol: "vless", ServerPort: 20001}})
+		Config: &model.NodeSpec{Protocol: "vmess", ServerPort: 20001}})
 	s.machineMailbox.Apply(controlplane.Event{Type: controlplane.EventSyncUserDelta,
 		DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 2}}})
 	s.drainMachineMailbox(ctx)

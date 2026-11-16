@@ -95,7 +95,8 @@ func TestNodeSpecFromPanelValidatedResolvesKernel(t *testing.T) {
 		{"xhttp", "singbox", panel.NodeConfig{Protocol: "vless", Network: "xhttp"}, "xray"},
 		{"splithttp", "singbox", panel.NodeConfig{Protocol: "vless", Network: "splithttp"}, "xray"},
 		{"compatible xray", "xray", panel.NodeConfig{Protocol: "vless", Network: "tcp"}, "xray"},
-		{"compatible singbox", "singbox", panel.NodeConfig{Protocol: "vless", Network: "ws"}, "singbox"},
+		{"vless ws", "singbox", panel.NodeConfig{Protocol: "vless", Network: "ws"}, "xray"},
+		{"compatible singbox", "singbox", panel.NodeConfig{Protocol: "vmess", Network: "ws"}, "singbox"},
 		{"hysteria v1", "xray", panel.NodeConfig{Protocol: "hysteria", Version: 1}, "singbox"},
 		{"hysteria v1 on singbox", "singbox", panel.NodeConfig{Protocol: "hysteria", Version: 1}, "singbox"},
 		{"snell", "xray", panel.NodeConfig{Protocol: "snell", Version: 5}, "singbox"},
@@ -156,5 +157,47 @@ func TestNodeSpecFromPanelMultiplexBrutalIsServerSide(t *testing.T) {
 	}
 	if back := spec.ToPanel().Multiplex.Brutal; back.UpMbps != 20 || back.DownMbps != 100 {
 		t.Fatalf("ToPanel did not restore the client's side: up %d / down %d", back.UpMbps, back.DownMbps)
+	}
+}
+
+func TestVLESSAlwaysSelectsXray(t *testing.T) {
+	for _, network := range []string{"tcp", "ws", "grpc", "xhttp", "splithttp"} {
+		for _, kind := range []string{"xray", "singbox"} {
+			t.Run(kind+"/"+network, func(t *testing.T) {
+				nc := &panel.NodeConfig{Protocol: "vless", Network: network}
+				resolved, _ := NodeSpecFromPanelResolved(nc, config.KernelConfig{Type: kind})
+				if resolved.KernelType != "xray" {
+					t.Fatalf("kernel = %s, want xray", resolved.KernelType)
+				}
+				_, err := NodeSpecFromPanelValidated(nc, config.KernelConfig{Type: kind})
+				if err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestOtherProtocolsDoNotSwitchKernelForTransport(t *testing.T) {
+	for _, proto := range []string{"vmess", "trojan"} {
+		for _, network := range []string{"xhttp", "splithttp"} {
+			for _, kind := range []string{"singbox", "xray"} {
+				t.Run(proto+"/"+network+"/"+kind, func(t *testing.T) {
+					nc := &panel.NodeConfig{Protocol: proto, Network: network}
+					resolved, _ := NodeSpecFromPanelResolved(nc, config.KernelConfig{Type: kind})
+					if resolved.KernelType != kind {
+						t.Fatalf("kernel = %q, want %q", resolved.KernelType, kind)
+					}
+					_, err := NodeSpecFromPanelValidated(nc, config.KernelConfig{Type: kind})
+					if kind == "singbox" {
+						if err == nil || !strings.Contains(err.Error(), "not supported by sing-box kernel") {
+							t.Fatalf("expected unsupported transport error, got %v", err)
+						}
+					} else if err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		}
 	}
 }

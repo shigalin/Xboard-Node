@@ -61,7 +61,7 @@ require (
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/anthropics/anthropic-sdk-go v1.26.0 // indirect
 	github.com/anytls/sing-anytls v0.0.11 // indirect
-	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e // indirect
+	github.com/apernet/quic-go v0.63.1-0.20261004180939-a10df75c260c // indirect
 	github.com/asaskevich/govalidator v0.0.0-20200907205600-7a23bdc65eef // indirect
 	github.com/aws/aws-sdk-go-v2 v1.39.1 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.31.10 // indirect
@@ -298,7 +298,7 @@ replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.2
 
 replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261115070049-67d824998181
 
-replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261109121004-43f211987b80
+replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261116054501-5181ae02bed9
 
 replace github.com/sagernet/sing-vmess => github.com/shigalin/sing-box/third_party/sing-vmess v0.0.0-20261115070049-67d824998181
 

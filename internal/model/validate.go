@@ -32,6 +32,23 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 		return fmt.Errorf("normalize kernel type: %w", err)
 	}
 
+	if kernelType == "xray" {
+		if n.Protocol == "vless" && n.Multiplex != nil && n.Multiplex.Enabled {
+			return fmt.Errorf("VLESS multiplex is not supported by xray kernel; disable multiplex before applying this node")
+		}
+		if n.Protocol == "hysteria" && n.Version != 2 {
+			return fmt.Errorf("xray kernel requires Hysteria version 2; use singbox kernel for Hysteria v1")
+		}
+	}
+	if n.Protocol == "hysteria" && n.Version == 2 && n.Obfs != "" {
+		if n.Obfs != "salamander" && n.Obfs != "gecko" {
+			return fmt.Errorf("unsupported Hysteria2 obfuscation type; use salamander or gecko")
+		}
+		if n.ObfsPassword == "" {
+			return fmt.Errorf("Hysteria2 obfs password is required when obfuscation is enabled")
+		}
+	}
+
 	customConfig := kcfg.CustomConfigData
 	if customConfig == nil {
 		customConfig, err = decodeCustomConfig(kcfg.CustomConfig)
@@ -74,7 +91,7 @@ func validateTransportKernel(network, kernelType string) error {
 	return nil
 }
 
-// ResolveKernelForNode applies the panel node's protocol and transport policy
+// ResolveKernelForNode applies the panel node's protocol policy
 // without changing the configured preference for other nodes.
 func ResolveKernelForNode(n *NodeSpec, configuredKernel string) string {
 	if n == nil {
@@ -83,16 +100,12 @@ func ResolveKernelForNode(n *NodeSpec, configuredKernel string) string {
 	if normalized, err := normalizeKernelType(configuredKernel); err == nil {
 		configuredKernel = normalized
 	}
-	// Hysteria v2 is policy; v1 has no Xray inbound at all.
-	if configuredKernel == "xray" && (n.Protocol == "hysteria2" || n.Protocol == "hysteria") {
+	// Panel-managed Hysteria and Snell nodes use sing-box.
+	if n.Protocol == "hysteria" || n.Protocol == "hysteria2" || n.Protocol == "snell" {
 		return "singbox"
 	}
-	// Xray has no Snell inbound.
-	if configuredKernel == "xray" && n.Protocol == "snell" {
-		return "singbox"
-	}
-	net := strings.ToLower(strings.TrimSpace(n.Network))
-	if configuredKernel == "singbox" && singboxUnsupportedTransports[net] {
+	// VLESS uses Xray regardless of the selected transport.
+	if n.Protocol == "vless" {
 		return "xray"
 	}
 	return configuredKernel

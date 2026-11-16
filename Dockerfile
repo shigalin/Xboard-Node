@@ -40,7 +40,7 @@ WORKDIR /etc/xboard-node
 #   apiKey   / API_KEY     → server token
 #   nodeID   / NODE_ID     → node ID
 #   nodeType / NODE_TYPE   → node type (optional)
-#   kernel   / KERNEL_TYPE → singbox (default) or xray
+#   kernel   / KERNEL_TYPE → xray (default) or singbox
 #   domain   / DOMAIN      → TLS domain (enables auto_tls)
 #   certFile / CERT_FILE   → TLS cert path
 #   keyFile  / KEY_FILE    → TLS key path

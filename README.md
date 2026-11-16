@@ -86,9 +86,25 @@ stop; existing containers must be recreated with the stop timeout or Compose
 grace period. Passing local tests or a synthetic-panel smoke test alone is
 not production acceptance.
 
-For panel-backed nodes, Hysteria (v1 and v2) and Snell always run on `singbox` and XHTTP/SplitHTTP
-always runs on `xray`, regardless of `kernel.type`. A switch restarts the
-listener. Use a `kernel.custom_config` file written for the selected kernel.
+**Upgrade compatibility:** Configurations that omit `kernel.type` (or Docker's
+`KERNEL_TYPE`) now default to `xray` instead of `singbox`. Set `kernel.type: singbox`
+explicitly to retain the previous preference. Panel VLESS nodes still
+select Xray regardless of that preference: enabled `multiplex` (including
+padding and brutal) is rejected, and sing-box-native `custom_config` must be
+converted to Xray format. Disable multiplex and update clients accordingly
+before upgrading these nodes. Other nodes that change kernels restart their
+listeners and also require matching custom configuration.
+
+Standalone mode keeps the configured kernel and does not apply panel protocol
+selection. Set `kernel.type: singbox` for sing-box-only protocols such as TUIC,
+AnyTLS, Snell, and Hysteria v1; Xray requires Hysteria version 2.
+
+The default kernel is `xray`. For panel-backed nodes, Hysteria v1/v2 and Snell
+always run on `singbox`; VLESS always runs on `xray`, regardless of transport
+or `kernel.type`. Remaining protocols respect `kernel.type`.
+In standalone mode, Hysteria2 supports Salamander and Gecko obfuscation on both
+kernels; panel-backed Hysteria2 nodes use `singbox`. Obfuscation requires a
+non-empty password. A switch restarts the listener. Use a `kernel.custom_config` file written for the selected kernel.
 When applying a config or starting a kernel, the node rejects recognized
 foreign options such as `route`, `routing`, and kernel-specific DNS fields.
 Edits to the file take effect on the next config apply or kernel start.

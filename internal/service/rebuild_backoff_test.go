@@ -175,7 +175,7 @@ func TestNoOpReapplyKeepsRebuildBackoff(t *testing.T) {
 	s := NewWithControlPlane(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}}, &kernelTestControlPlane{})
 	k := &fakeKernel{running: true}
 	s.kernel = k
-	spec := &model.NodeSpec{Protocol: "vless", ServerPort: 12345}
+	spec := &model.NodeSpec{Protocol: "vmess", ServerPort: 12345}
 	s.lastConfig, s.appliedState.Config, s.lastConfigHash = spec, spec, computeConfigHash(spec)
 	s.appliedState.CustomConfig = map[string]any{}
 	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}})
