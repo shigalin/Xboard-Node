@@ -121,12 +121,24 @@ selects the user by their PSK. `shadow_tls_port` defaults to 443 and the
 handshake site must support TLS 1.3. The internal inbound opens no socket.
 `unsafe-raw` is rejected for independent PSKs.
 
+Use `psk_mode: shared_userkey` for a shared Snell `server_key`, with each
+user's UUID as their Snell `userkey`. The node requires a non-empty PSK for
+v5 and a 12–255 byte PSK for v6. As a policy, xboard-node requires encrypted
+Snell v6 in this mode. With `shadow_tls_server` set, `shadow_tls_password`
+is optional. Omitting it uses each user's UUID as their ShadowTLS password.
+Snell verifies the userkey and supplies the user identity for traffic and
+limits. Replacing the Snell inbound during a reload closes its direct and
+ShadowTLS connections, including idle reusable sessions.
+
 The default/legacy `psk_mode: shared` still uses a node PSK plus UUID userkeys
 for plain Snell, or per-user UUID ShadowTLS passwords when wrapped. Upgrade
 the node before changing the panel mode and refresh client subscriptions.
-User changes are applied in place; removing or rotating a user's credential
-closes their transports while retained users keep their connections and
-traffic identity. Empty user sets reject all Snell proxy requests.
+User changes are applied in place. Removing a user or rotating their
+credential closes their active proxy requests. With `shared_userkey` and a
+shared ShadowTLS password, an idle transport may stay open after removal.
+Snell rejects subsequent proxy requests that use the revoked userkey.
+Retained users keep their connections and traffic identity. Empty user sets
+reject all Snell proxy requests.
 
 PSK lookup checks each candidate's authenticated first-record header at most
 once, with a 15-second handshake deadline. Up to 16 fallback candidate groups

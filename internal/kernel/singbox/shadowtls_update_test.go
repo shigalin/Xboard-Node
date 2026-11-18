@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,7 +24,12 @@ import (
 	"github.com/cedar2025/xboard-node/internal/model"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-shadowtls"
+	"github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/snellv4"
+	"github.com/sagernet/sing-snell/snellv6"
 	singJSON "github.com/sagernet/sing/common/json"
 	singM "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -104,29 +110,91 @@ func startTLSServer(t *testing.T) int {
 	return listener.Addr().(*net.TCPAddr).Port
 }
 
+const testSharedShadowTLSPassword = "node-shared-shadowtls-test-password"
+
+func startSnellTestNode(t *testing.T, s *SingBox, spec *model.NodeSpec, users []model.UserSpec) {
+	t.Helper()
+	var err error
+	// The probe cannot reserve the port for sing-box. Retry only if another
+	// socket took it before sing-box bound the listener.
+	for range 5 {
+		probe, listenErr := net.Listen("tcp4", "0.0.0.0:0")
+		if listenErr != nil {
+			t.Fatal(listenErr)
+		}
+		spec.ServerPort = probe.Addr().(*net.TCPAddr).Port
+		probe.Close()
+		err = s.Start(spec, users, kernel.TLSCert{})
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatal(err)
+		}
+	}
+	t.Fatalf("bind Snell test listener: %v", err)
+}
+
+func newTestShadowTLSClient(t *testing.T, port int, password string) *shadowtls.Client {
+	t.Helper()
+	outer, err := shadowtls.NewClient(shadowtls.ClientConfig{
+		Version: 3, Server: singM.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), Password: password, StrictMode: true,
+		TLSHandshake: shadowtls.DefaultTLSHandshakeFunc(password, &tls.Config{ServerName: "handshake.test", InsecureSkipVerify: true}),
+		Logger:       log.NewNOPFactory().NewLogger("shadowtls-test"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return outer
+}
+
+func newTestSnellMethod(t *testing.T, version int, psk, userkey string) snell.Method {
+	t.Helper()
+	var method snell.Method
+	var err error
+	if version == 5 {
+		method, err = snellv4.NewClient(snellv4.ClientOptions{PSK: []byte(psk), UserKey: []byte(userkey)})
+	} else {
+		method, err = snellv6.NewClient(snellv6.ClientOptions{PSK: []byte(psk), UserKey: []byte(userkey)})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return method
+}
+
+func testSnellPeerClosed(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
+}
+
 // startShadowTLSClients runs a sing-box client with one SOCKS port per user,
 // each reaching the node through ShadowTLS v3 with that user's password.
 func startShadowTLSClients(t *testing.T, serverPort int, snellVersion int, psk string, users ...model.UserSpec) []int {
-	return startSnellClients(t, serverPort, snellVersion, psk, "shared", true, users...)
+	return startSnellClients(t, serverPort, snellVersion, psk, "shared", true, "", users...)
 }
 
-func startSnellClients(t *testing.T, serverPort int, snellVersion int, psk, pskMode string, shadow bool, users ...model.UserSpec) []int {
+func startSnellClients(t *testing.T, serverPort int, snellVersion int, psk, pskMode string, shadow bool, sharedShadowPassword string, users ...model.UserSpec) []int {
 	t.Helper()
 	var inbounds, outbounds, rules []M
 	ports := make([]int, 0, len(users))
 	for index, user := range users {
 		userPSK := psk
 		shadowPassword := user.UUID
+		var userKey string
 		if pskMode == "user" {
 			userPSK = user.UUID
-			shadowPassword = "node-shared-shadowtls-test-password"
+		} else if pskMode == "shared_userkey" {
+			userKey = user.UUID
+		}
+		if sharedShadowPassword != "" {
+			shadowPassword = sharedShadowPassword
 		}
 		port := freePort(t)
 		ports = append(ports, port)
 		mixed, snell, shadowTLS := fmt.Sprint("mixed-", index), fmt.Sprint("snell-", index), fmt.Sprint("shadowtls-", index)
 		inbounds = append(inbounds, M{"type": "mixed", "tag": mixed, "listen": "127.0.0.1", "listen_port": port})
 		outbounds = append(outbounds,
-			M{"type": "snell", "tag": snell, "server": "127.0.0.1", "server_port": serverPort, "version": snellVersion, "psk": userPSK, "reuse": true, "detour": shadowTLS},
+			M{"type": "snell", "tag": snell, "server": "127.0.0.1", "server_port": serverPort, "version": snellVersion, "psk": userPSK, "userkey": userKey, "reuse": true, "detour": shadowTLS},
 			M{"type": "shadowtls", "tag": shadowTLS, "server": "127.0.0.1", "server_port": serverPort, "version": 3, "password": shadowPassword,
 				"tls": M{"enabled": true, "server_name": "handshake.test", "insecure": true}},
 		)
@@ -157,13 +225,20 @@ func startSnellClients(t *testing.T, serverPort int, snellVersion int, psk, pskM
 	return ports
 }
 
-// Exercise the node's user operations over real connections: ShadowTLS
-// authenticates the user and Snell requests are accounted to that user.
+// Exercise authentication, accounting and user updates over real connections.
 func TestSnellShadowTLSUserHotUpdate(t *testing.T) {
 	for _, scheme := range []struct {
 		name, pskMode string
 		shadow        bool
-	}{{"shared-shadowtls", "shared", true}, {"user-shadowtls", "user", true}, {"user-plain", "user", false}} {
+		password      string
+	}{
+		{"shared-shadowtls", "shared", true, ""},
+		{"user-shadowtls", "user", true, testSharedShadowTLSPassword},
+		{"user-plain", "user", false, ""},
+		{"shared-userkey-shadowtls", "shared_userkey", true, testSharedShadowTLSPassword},
+		{"shared-userkey-per-user-shadowtls", "shared_userkey", true, ""},
+		{"shared-userkey-plain", "shared_userkey", false, ""},
+	} {
 		t.Run(scheme.name, func(t *testing.T) {
 			for _, version := range []int{5, 6} {
 				t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
@@ -192,16 +267,16 @@ func TestSnellShadowTLSUserHotUpdate(t *testing.T) {
 						CustomRoute: []map[string]any{{"ip_cidr": []string{"127.0.0.1/32"}, "outbound": "direct"}},
 					})
 					defer s.Stop()
+					var handshakeServer string
+					var handshakePort int
+					if scheme.shadow {
+						handshakeServer, handshakePort = "127.0.0.1", startTLSServer(t)
+					}
 					spec := &model.NodeSpec{
-						Protocol: "snell", ServerPort: freePort(t), Version: version, ServerKey: psk, PSKMode: scheme.pskMode, ShadowTLSPassword: "node-shared-shadowtls-test-password",
-						ShadowTLSServer: "127.0.0.1", ShadowTLSPort: startTLSServer(t),
+						Protocol: "snell", Version: version, ServerKey: psk, PSKMode: scheme.pskMode, ShadowTLSPassword: scheme.password,
+						ShadowTLSServer: handshakeServer, ShadowTLSPort: handshakePort,
 					}
-					if !scheme.shadow {
-						spec.ShadowTLSServer = ""
-					}
-					if err := s.Start(spec, nil, kernel.TLSCert{}); err != nil {
-						t.Fatal(err)
-					}
+					startSnellTestNode(t, s, spec, nil)
 					primaryTag := snellDetourTag
 					if scheme.shadow {
 						primaryTag = shadowTLSInboundTag
@@ -212,7 +287,7 @@ func TestSnellShadowTLSUserHotUpdate(t *testing.T) {
 					if version == 5 {
 						clientVersion = 4 // a v5 server speaks the v4 wire protocol
 					}
-					ports := startSnellClients(t, spec.ServerPort, clientVersion, psk, scheme.pskMode, scheme.shadow, alice, bob)
+					ports := startSnellClients(t, spec.ServerPort, clientVersion, psk, scheme.pskMode, scheme.shadow, scheme.password, alice, bob)
 					alicePort, bobPort := ports[0], ports[1]
 
 					dial := func(port int) (net.Conn, error) {
@@ -267,6 +342,14 @@ func TestSnellShadowTLSUserHotUpdate(t *testing.T) {
 					if err := exchange(held); err != nil {
 						t.Fatal(err)
 					}
+					if scheme.pskMode == "shared_userkey" && scheme.shadow {
+						password := scheme.password
+						if password == "" {
+							password = alice.UUID
+						}
+						targetAddr := singM.ParseSocksaddr(target.Addr().String())
+						checkSnellShadowTLSUserKeyRejection(t, spec, targetAddr, password, bob.UUID)
+					}
 					if n, err := s.AddUsers([]model.UserSpec{bob}); err != nil || n != 1 {
 						t.Fatalf("add Bob: n=%d err=%v", n, err)
 					}
@@ -305,4 +388,43 @@ func TestSnellShadowTLSUserHotUpdate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func checkSnellShadowTLSUserKeyRejection(t *testing.T, spec *model.NodeSpec, target singM.Socksaddr, password, unknownKey string) {
+	t.Helper()
+	for _, tc := range []struct{ name, key string }{{"missing userkey", ""}, {"unknown userkey", unknownKey}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			shadow := newTestShadowTLSClient(t, spec.ServerPort, password)
+			raw, err := shadow.DialContext(ctx)
+			if err != nil {
+				t.Fatalf("ShadowTLS must authenticate before testing the Snell userkey: %v", err)
+			}
+			defer raw.Close()
+			raw.SetDeadline(time.Now().Add(3 * time.Second))
+			method := newTestSnellMethod(t, spec.Version, spec.ServerKey, tc.key)
+			conn := method.DialEarlyConn(raw, target)
+			if _, err := io.WriteString(conn, "hello"); err != nil {
+				t.Fatalf("sending the Snell request after ShadowTLS authentication: %v", err)
+			}
+			if _, err := conn.Read(make([]byte, 1)); !testSnellPeerClosed(err) {
+				t.Fatalf("expected Snell to close the authenticated transport after the invalid userkey, got %v", err)
+			}
+		})
+	}
+	t.Run("wrong ShadowTLS password", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		shadow := newTestShadowTLSClient(t, spec.ServerPort, "wrong-shadowtls-test-password")
+		conn, err := shadow.DialContext(ctx)
+		if err == nil {
+			conn.Close()
+			t.Fatal("wrong password passed ShadowTLS authentication")
+		}
+		var networkError net.Error
+		if errors.As(err, &networkError) && networkError.Timeout() {
+			t.Fatalf("ShadowTLS authentication stalled: %v", err)
+		}
+	})
 }

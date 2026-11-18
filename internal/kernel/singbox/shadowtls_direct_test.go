@@ -3,9 +3,11 @@ package singbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -13,7 +15,10 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-snell/snellv4"
 	"github.com/sagernet/sing-snell/snellv6"
@@ -185,6 +190,140 @@ func TestSnellShadowTLSRejectsDirectInnerPort(t *testing.T) {
 			pc.Close()
 			if err != nil {
 				t.Fatalf("authenticated UDP failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestSnellUserKeyDetourRequiresAuthenticatedShadowTLS(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	logger := log.NewNOPFactory().NewLogger("snell-test")
+	opts := option.SnellInboundOptions{Version: 6, AbstractSnellInboundOptions: option.AbstractSnellInboundOptions{
+		PSK:        "snell-detour-test-psk",
+		AuthDetour: shadowTLSInboundTag,
+		Users:      []option.SnellUser{{Name: "alice", UserKey: "alice-test-userkey"}},
+		ListenOptions: option.ListenOptions{
+			ListenPort: uint16(occupied.Addr().(*net.TCPAddr).Port),
+		},
+	}}
+	inbound, err := newSnellInbound(context.Background(), nil, logger, snellDetourTag, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := adapter.NewScope(context.Background(), logger)
+	defer scope.Close()
+	if err := scope.Start(snellDetourTag, inbound, adapter.StartStateStart); err != nil {
+		t.Fatalf("injectable inbound tried to bind a TCP port: %v", err)
+	}
+	for _, tc := range []struct {
+		name, source, kind, user string
+	}{
+		{"other detour", "other-in", C.TypeShadowTLS, "alice"},
+		{"other type", shadowTLSInboundTag, C.TypeSOCKS, "alice"},
+		{"no authenticated user", shadowTLSInboundTag, C.TypeShadowTLS, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, client := net.Pipe()
+			defer server.Close()
+			defer client.Close()
+			server.SetReadDeadline(time.Now().Add(time.Second))
+			var rejected error
+			metadata := adapter.InboundContext{LastInbound: tc.source, InboundType: tc.kind, User: tc.user}
+			inbound.(adapter.TCPInjectableInbound).NewConnection(context.Background(), server, metadata, func(err error) { rejected = err })
+			if !errors.Is(rejected, os.ErrPermission) {
+				t.Fatalf("wanted rejection before the Snell handshake, got %v", rejected)
+			}
+			client.SetReadDeadline(time.Now().Add(time.Second))
+			if _, err := client.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+				t.Fatalf("rejected connection was not closed: %v", err)
+			}
+		})
+	}
+	if err := scope.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := inbound.(*trackedSnellInbound).closeConnections(); err != nil {
+		t.Fatalf("repeated detour cleanup failed: %v", err)
+	}
+}
+
+func TestSnellShadowTLSUserKeyUDP(t *testing.T) {
+	target, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			n, addr, err := target.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			target.WriteTo(buf[:n], addr)
+		}
+	}()
+	for _, version := range []int{5, 6} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			psk := "snell-udp-test-psk"
+			if version == 5 {
+				psk = "v5-key"
+			}
+			user := model.UserSpec{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}
+			handshakePort := startTLSServer(t)
+			spec := &model.NodeSpec{Protocol: "snell", Version: version, PSKMode: "shared_userkey", ServerKey: psk,
+				ShadowTLSServer: "127.0.0.1", ShadowTLSPort: handshakePort, ShadowTLSPassword: testSharedShadowTLSPassword}
+			s := New(config.KernelConfig{LogLevel: "error", ConfigDir: t.TempDir(),
+				CustomRoute: []map[string]any{{"ip_cidr": []string{"127.0.0.1/32"}, "outbound": "direct"}},
+			})
+			defer s.Stop()
+			startSnellTestNode(t, s, spec, []model.UserSpec{user})
+			clientVersion := version
+			if version == 5 {
+				clientVersion = 4
+			}
+			port := startSnellClients(t, spec.ServerPort, clientVersion, psk, spec.PSKMode, true, spec.ShadowTLSPassword, user)[0]
+			client := socks.NewClient(N.SystemDialer, Mtd.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), socks.Version5, "", "")
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			pc, err := client.ListenPacket(ctx, Mtd.ParseSocksaddr(target.LocalAddr().String()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pc.Close()
+			pc.SetDeadline(time.Now().Add(3 * time.Second))
+			const payload = "snell udp echo"
+			if _, err := pc.WriteTo([]byte(payload), target.LocalAddr()); err != nil {
+				t.Fatal(err)
+			}
+			reply := make([]byte, 64)
+			n, _, err := pc.ReadFrom(reply)
+			if err != nil || string(reply[:n]) != payload {
+				t.Fatalf("did not receive UDP echo: %v", err)
+			}
+			traffic, _, _, err := s.GetUserTraffic(ctx)
+			if err != nil || traffic[user.ID] != [2]int64{int64(len(payload)), int64(len(payload))} {
+				t.Fatalf("UDP traffic was not attributed to the Snell user: %v, err=%v", traffic, err)
+			}
+			shadow := newTestShadowTLSClient(t, spec.ServerPort, spec.ShadowTLSPassword)
+			raw, err := shadow.DialContext(ctx)
+			if err != nil {
+				t.Fatalf("ShadowTLS must authenticate before testing UDP userkey rejection: %v", err)
+			}
+			defer raw.Close()
+			raw.SetDeadline(time.Now().Add(3 * time.Second))
+			method := newTestSnellMethod(t, version, psk, "unknown-test-userkey")
+			rejected, err := method.DialPacketConn(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rejected.Close()
+			if _, err := rejected.WriteTo([]byte(payload), target.LocalAddr()); !testSnellPeerClosed(err) {
+				t.Fatalf("expected Snell to close the UDP transport with an unknown userkey, got %v", err)
 			}
 		})
 	}

@@ -13,7 +13,6 @@ import (
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
-	"github.com/sagernet/sing-box/include"
 	singLog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/auth"
@@ -143,7 +142,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 
 	kernel.LogRealityTarget(nodeConfig, s.cfg.RealityTargets)
 	ctx, cancel := context.WithCancel(context.Background())
-	ctx = include.Context(ctx)
+	ctx = boxContext(ctx)
 
 	// Save old state before creating the new instance.
 	oldBox := s.box
@@ -406,7 +405,7 @@ func (s *SingBox) SetCustomConfig(data map[string]any) {
 func (s *SingBox) CheckConfig(spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	instance, _, err := s.buildBox(include.Context(ctx), spec, users, tls)
+	instance, _, err := s.buildBox(boxContext(ctx), spec, users, tls)
 	if err != nil {
 		return err
 	}
@@ -704,7 +703,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	// Validate the complete config before touching the running box, so a
 	// rejected candidate leaves the running listeners exactly as they were.
 	checkCtx, checkCancel := context.WithCancel(context.Background())
-	check, _, err := s.buildBox(include.Context(checkCtx), nodeConfig, users, tls)
+	check, _, err := s.buildBox(boxContext(checkCtx), nodeConfig, users, tls)
 	if err != nil {
 		checkCancel()
 		return err

@@ -13,8 +13,21 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 	}
 
 	if n.Protocol == "snell" {
-		if n.PSKMode != "" && n.PSKMode != "shared" && n.PSKMode != "user" {
+		if n.PSKMode != "" && n.PSKMode != "shared" && n.PSKMode != "user" && n.PSKMode != "shared_userkey" {
 			return fmt.Errorf("unknown Snell psk_mode")
+		}
+		if n.PSKMode == "shared_userkey" {
+			if n.Version == 5 && n.ServerKey == "" {
+				return fmt.Errorf("Snell v5 shared_userkey requires a PSK")
+			}
+			if n.Version == 6 {
+				if len(n.ServerKey) < 12 || len(n.ServerKey) > 255 {
+					return fmt.Errorf("Snell v6 shared_userkey PSK must be 12 to 255 bytes")
+				}
+				if n.Mode == "unsafe-raw" {
+					return fmt.Errorf("Snell shared_userkey requires an encrypted mode")
+				}
+			}
 		}
 		if n.PSKMode == "user" && n.ShadowTLSServer != "" && n.ShadowTLSPassword == "" {
 			return fmt.Errorf("ShadowTLS password is required for independent Snell PSKs")

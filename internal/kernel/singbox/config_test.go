@@ -1129,3 +1129,36 @@ func TestSnellUserPSKContract(t *testing.T) {
 		t.Fatal("wrong user key")
 	}
 }
+
+func TestBuildInbounds_SnellSharedUserKeyShadowTLS(t *testing.T) {
+	const uuid = "11111111-1111-4111-8111-111111111111"
+	const psk = "snell-test-key"
+	for _, sharedPassword := range []string{"", testSharedShadowTLSPassword} {
+		for _, users := range [][]model.UserSpec{nil, {{ID: 1, UUID: uuid}}} {
+			spec := &model.NodeSpec{Protocol: "snell", Version: 5, PSKMode: "shared_userkey", ServerKey: psk,
+				Obfs: "http", ShadowTLSServer: "handshake.example", ShadowTLSPassword: sharedPassword}
+			inbounds := buildInbounds(spec, users, kernel.TLSCert{})
+			shadow, snell := inbounds[0], inbounds[1]
+			assertMapValue(t, shadow, "detour", snell["tag"])
+			assertMapValue(t, snell, "auth_detour", shadow["tag"])
+			assertMapValue(t, snell, "psk", psk)
+			for _, field := range []string{"user_psk", "listen", "listen_port", "obfs_mode"} {
+				if _, exists := snell[field]; exists {
+					t.Errorf("inner shared-PSK inbound included %s", field)
+				}
+			}
+			userkey := M{"name": uuid, "userkey": uuid}
+			outerUser := M{"name": uuid, "password": uuid}
+			if len(users) == 0 {
+				userkey = M{"userkey": snellNoUserKey}
+				outerUser = M{"password": shadowTLSNoUserPassword}
+			}
+			if sharedPassword != "" {
+				outerUser = M{"name": "snell-gateway", "password": sharedPassword}
+			}
+			if !reflect.DeepEqual(snell["users"], []M{userkey}) || !reflect.DeepEqual(shadow["users"], []M{outerUser}) {
+				t.Fatal("unexpected Snell userkeys or ShadowTLS users")
+			}
+		}
+	}
+}

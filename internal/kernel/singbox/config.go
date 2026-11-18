@@ -527,24 +527,18 @@ func buildSnell(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 		base["obfs_mode"] = nc.Obfs
 	}
 
-	users = sortedUsers(users)
-	userList := make([]M, 0, len(users)+1)
-	for _, u := range users {
-		userList = append(userList, M{
-			"name":    u.UUID,
-			"userkey": u.UUID,
-		})
-	}
-	if len(userList) == 0 {
-		userList = append(userList, M{"userkey": snellNoUserKey})
-	}
+	credentialField := "userkey"
 	if nc.PSKMode == "user" {
 		delete(base, "psk")
 		base["user_psk"] = true
-		userList = make([]M, 0, len(users))
-		for _, u := range users {
-			userList = append(userList, M{"name": u.UUID, "psk": u.UUID})
-		}
+		credentialField = "psk"
+	}
+	userList := make([]M, 0, len(users))
+	for _, u := range sortedUsers(users) {
+		userList = append(userList, M{"name": u.UUID, credentialField: u.UUID})
+	}
+	if credentialField == "userkey" && len(userList) == 0 {
+		userList = append(userList, M{"userkey": snellNoUserKey})
 	}
 	base["users"] = userList
 	return base
@@ -563,34 +557,36 @@ const (
 // same inbound.
 var shadowTLSNoUserPassword = rand.Text()
 
-// buildSnellShadowTLS puts ShadowTLS v3 in front of Snell for clients that
-// cannot send a Snell user key. ShadowTLS authenticates each user by their
-// own password in legacy mode. The legacy inner inbound only listens on
-// loopback and relies on the inherited identity. Independent PSK mode uses a
-// shared ShadowTLS gateway password and an injection-only Snell inbound,
-// which selects and verifies the actual user by their UUID PSK.
+// buildSnellShadowTLS puts ShadowTLS v3 in front of Snell. In user and
+// shared_userkey modes Snell determines the identity after ShadowTLS admits the connection.
 func buildSnellShadowTLS(nc *model.NodeSpec, users []model.UserSpec) []M {
-	snell := M{
-		"type":    "snell",
-		"tag":     snellDetourTag,
-		"listen":  "127.0.0.1",
-		"version": nc.Version,
-		"psk":     nc.ServerKey,
-	}
-	if nc.Version == 6 && nc.Mode != "" {
-		snell["mode"] = nc.Mode
+	var snell M
+	if nc.PSKMode == "user" || nc.PSKMode == "shared_userkey" {
+		snell = buildSnell(M{"tag": snellDetourTag, "auth_detour": shadowTLSInboundTag}, nc, users)
+		delete(snell, "obfs_mode")
+	} else {
+		snell = M{
+			"type":    "snell",
+			"tag":     snellDetourTag,
+			"listen":  "127.0.0.1",
+			"version": nc.Version,
+			"psk":     nc.ServerKey,
+		}
+		if nc.Version == 6 && nc.Mode != "" {
+			snell["mode"] = nc.Mode
+		}
 	}
 
-	users = sortedUsers(users)
-	userList := make([]M, 0, len(users)+1)
-	for _, u := range users {
-		userList = append(userList, M{
-			"name":     u.UUID,
-			"password": u.UUID,
-		})
-	}
-	if len(userList) == 0 {
-		userList = append(userList, M{"password": shadowTLSNoUserPassword})
+	var shadowUsers []M
+	if nc.PSKMode == "user" || (nc.PSKMode == "shared_userkey" && nc.ShadowTLSPassword != "") {
+		shadowUsers = []M{{"name": "snell-gateway", "password": nc.ShadowTLSPassword}}
+	} else {
+		for _, u := range sortedUsers(users) {
+			shadowUsers = append(shadowUsers, M{"name": u.UUID, "password": u.UUID})
+		}
+		if len(shadowUsers) == 0 {
+			shadowUsers = []M{{"password": shadowTLSNoUserPassword}}
+		}
 	}
 	handshakePort := nc.ShadowTLSPort
 	if handshakePort == 0 {
@@ -602,25 +598,13 @@ func buildSnellShadowTLS(nc *model.NodeSpec, users []model.UserSpec) []M {
 		"listen":      "::",
 		"listen_port": nc.ServerPort,
 		"version":     3,
-		"users":       userList,
+		"users":       shadowUsers,
 		"handshake": M{
 			"server":      nc.ShadowTLSServer,
 			"server_port": handshakePort,
 		},
 		"strict_mode": true,
 		"detour":      snellDetourTag,
-	}
-	if nc.PSKMode == "user" {
-		delete(snell, "psk")
-		delete(snell, "listen")
-		snell["user_psk"] = true
-		snell["auth_detour"] = shadowTLSInboundTag
-		shadowTLS["users"] = []M{{"name": "snell-gateway", "password": nc.ShadowTLSPassword}}
-		pskUsers := make([]M, 0, len(users))
-		for _, u := range users {
-			pskUsers = append(pskUsers, M{"name": u.UUID, "psk": u.UUID})
-		}
-		snell["users"] = pskUsers
 	}
 	return []M{shadowTLS, snell}
 }
