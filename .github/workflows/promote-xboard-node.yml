@@ -1,0 +1,57 @@
+name: Promote Xboard-Node a60e89b image
+
+on:
+  push:
+    branches: [codex/promote-xboard-node-a60e89b]
+    paths: [.github/workflows/promote-xboard-node.yml]
+
+permissions:
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote the existing manifest
+        shell: bash
+        env:
+          IMAGE: ghcr.io/shigalin/xboard-node
+          BUILD_SHA: a60e89b6a5d38d2cbe37804a2a4818207b47b8e5
+          BUILD_DIGEST: sha256:56aa04f9a08faa816b2a326f21ba2af332373738877bc70ebfc045c9049f26e7
+          PREVIOUS_LATEST: sha256:975a7c73b1a12f2f96d4818a65f929ec5353f02a0ca9e9e101cc0347be4b9e06
+        run: |
+          set -euo pipefail
+
+          manifest_digest() {
+            docker buildx imagetools inspect --raw "$1" | sha256sum | awk '{print "sha256:" $1}'
+          }
+
+          source="$(manifest_digest "$IMAGE:$BUILD_SHA")"
+          if [[ "$source" != "$BUILD_DIGEST" ]]; then
+            echo "::error::Source tag digest is $source, expected $BUILD_DIGEST."
+            exit 1
+          fi
+
+          latest="$(manifest_digest "$IMAGE:latest")"
+          if [[ "$latest" != "$BUILD_DIGEST" ]]; then
+            if [[ "$latest" != "$PREVIOUS_LATEST" ]]; then
+              echo "::error::The latest tag changed to $latest after approval."
+              exit 1
+            fi
+            docker buildx imagetools create --prefer-index=false --progress plain \
+              --tag "$IMAGE:latest" "$IMAGE@$BUILD_DIGEST"
+          fi
+
+          latest="$(manifest_digest "$IMAGE:latest")"
+          if [[ "$latest" != "$source" ]]; then
+            echo "::error::The latest tag resolved to $latest, expected $source."
+            exit 1
+          fi
+          printf 'Both tags resolve to `%s`.\n' "$latest" >> "$GITHUB_STEP_SUMMARY"
