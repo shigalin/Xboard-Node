@@ -612,14 +612,14 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 		ss["realitySettings"] = buildRealitySettings(nc)
 	}
 
-	// Proxy Protocol
 	if nc.GetProxyProtocol() {
-		sockopt, ok := base["streamSettings"].(M)["sockopt"].(M)
-		if !ok {
-			sockopt = M{}
+		ss["sockopt"] = M{"acceptProxyProtocol": true}
+	} else if nc.Protocol == "vless" {
+		// Scope this to the VLESS CDN use case because source IPs also affect device admission.
+		switch network {
+		case "ws", "xhttp", "splithttp", "httpupgrade", "grpc":
+			ss["sockopt"] = M{"cloudflareRealIP": true}
 		}
-		sockopt["acceptProxyProtocol"] = true
-		ss["sockopt"] = sockopt
 	}
 
 	base["streamSettings"] = ss

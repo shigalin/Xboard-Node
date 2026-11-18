@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/xtls/xray-core/app/proxyman"
+
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -28,6 +30,50 @@ var testUsersPanel = []panel.User{
 var testUsers = model.UserSpecsFromPanel(testUsersPanel)
 
 func testNodeSpec(nc *panel.NodeConfig) *model.NodeSpec { return model.NodeSpecFromPanel(nc) }
+
+func TestBuildConfigCloudflareRealIP(t *testing.T) {
+	for _, tt := range []struct {
+		protocol, network string
+		proxyProtocol     bool
+		want              bool
+	}{
+		{protocol: "vless", network: "ws", want: true},
+		{protocol: "vless", network: "xhttp", want: true},
+		{protocol: "vless", network: "splithttp", want: true},
+		{protocol: "vless", network: "httpupgrade", want: true},
+		{protocol: "vless", network: "grpc", want: true},
+		{protocol: "vless", network: "tcp"},
+		{protocol: "vless", network: "ws", proxyProtocol: true},
+		{protocol: "vmess", network: "ws"},
+		{protocol: "trojan", network: "ws"},
+	} {
+		name := tt.protocol + "/" + tt.network
+		if tt.proxyProtocol {
+			name += "/proxy-protocol"
+		}
+		t.Run(name, func(t *testing.T) {
+			spec := testNodeSpec(&panel.NodeConfig{
+				Protocol: tt.protocol, Network: tt.network, ServerPort: 8080,
+				AcceptProxyProtocol: tt.proxyProtocol,
+			})
+			cfg, err := parseConfig(buildConfig(testKernelCfg, spec, testUsers, kernel.TLSCert{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings, err := cfg.Inbound[0].GetReceiverSettings().GetInstance()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sockopt := settings.(*proxyman.ReceiverConfig).GetStreamSettings().GetSocketSettings()
+			if got := sockopt.GetCloudflareRealIp(); got != tt.want {
+				t.Errorf("parsed cloudflareRealIP = %v, want %v", got, tt.want)
+			}
+			if got := sockopt.GetAcceptProxyProtocol(); got != tt.proxyProtocol {
+				t.Errorf("parsed acceptProxyProtocol = %v, want %v", got, tt.proxyProtocol)
+			}
+		})
+	}
+}
 
 func testRouteRules(r []panel.RouteRule) []model.RouteRule {
 	if r == nil {

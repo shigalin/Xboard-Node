@@ -298,7 +298,7 @@ replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.2
 
 replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261115070049-67d824998181
 
-replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261116054501-5181ae02bed9
+replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261118163159-45732c06648c
 
 replace github.com/sagernet/sing-vmess => github.com/shigalin/sing-box/third_party/sing-vmess v0.0.0-20261115070049-67d824998181
 
