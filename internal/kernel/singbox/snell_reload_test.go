@@ -149,10 +149,16 @@ func TestSnellSharedPSKDrainsActiveConnections(t *testing.T) {
 					if errors.Is(err, syscall.ECONNREFUSED) {
 						break
 					}
-					if err != nil || time.Now().After(deadline) {
-						t.Fatalf("listener failed to close before draining: %v", err)
+					if err == nil {
+						probe.Close()
+					} else if !errors.Is(err, syscall.ECONNRESET) {
+						t.Fatalf("probing listener during drain: %v", err)
 					}
-					probe.Close()
+					// A dial racing listener shutdown can be reset. Only refusal
+					// on a subsequent dial confirms the listener is closed.
+					if time.Now().After(deadline) {
+						t.Fatal("listener did not refuse new connections before draining")
+					}
 					time.Sleep(10 * time.Millisecond)
 				}
 			}
