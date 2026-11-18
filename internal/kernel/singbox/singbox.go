@@ -62,6 +62,8 @@ type SingBox struct {
 	// released is set once ReleaseListeners closed the inbound manager. The
 	// box must not be changed in place after that; only Start or Stop.
 	released bool
+	// A released manager stops referencing these inbounds before the box drains.
+	releasedSnell []*trackedSnellInbound
 
 	// connTracker is our lightweight in-process byte/IP tracker.
 	// Created fresh on every Start (full restart).
@@ -87,6 +89,7 @@ type SingBox struct {
 
 type drainingBox struct {
 	tracker *ConnTracker
+	snell   []*trackedSnellInbound
 	done    chan struct{}
 }
 
@@ -454,10 +457,24 @@ func (s *SingBox) releaseListenersLocked() {
 	if s.released {
 		return
 	}
-	if im := service.FromContext[adapter.InboundManager](s.ctx); im != nil {
-		_ = im.Close()
-	}
+	s.releasedSnell = releaseInboundListeners(s.ctx)
 	s.released = true
+}
+
+func releaseInboundListeners(ctx context.Context) []*trackedSnellInbound {
+	im := service.FromContext[adapter.InboundManager](ctx)
+	if im == nil {
+		return nil
+	}
+	var snell []*trackedSnellInbound
+	for _, inbound := range im.Inbounds() {
+		if tracked, ok := inbound.(*trackedSnellInbound); ok {
+			tracked.draining.Store(true)
+			snell = append(snell, tracked)
+		}
+	}
+	_ = im.Close()
+	return snell
 }
 
 // parseOptionsLocked builds and parses the config for spec in the running
@@ -562,19 +579,28 @@ func (s *SingBox) applyInboundsLocked(next, prev []option.Inbound, mode inboundU
 	}
 	nopFactory := singLog.NewNOPFactory()
 	apply := func(inb option.Inbound) error {
-		if mode != recreateInbound {
-			if existing, ok := im.Get(inb.Tag); ok && existing.Type() == inb.Type {
-				handled, err := updateInboundUsers(existing, inb)
-				if handled && (err == nil || mode == updateUsersOnly) {
-					return err
-				}
-				if err != nil {
-					nlog.Core().Warn("incremental update failed, recreating inbound", "tag", inb.Tag, "error", err)
-				}
+		existing, found := im.Get(inb.Tag)
+		if mode != recreateInbound && found && existing.Type() == inb.Type {
+			handled, err := updateInboundUsers(existing, inb)
+			if handled && (err == nil || mode == updateUsersOnly) {
+				return err
+			}
+			if err != nil {
+				nlog.Core().Warn("incremental update failed, recreating inbound", "tag", inb.Tag, "error", err)
 			}
 		}
 		if mode == updateUsersOnly {
 			return errInboundUserUpdateUnsupported
+		}
+		if inb.Tag == shadowTLSInboundTag {
+			// Once the listener is replaced, user updates only reach the new
+			// ShadowTLS inbound. Retire the old credentials and their transports
+			// even when the inner Snell inbound stays in place.
+			if shadow, ok := existing.(adapter.UpdatableInbound[option.ShadowTLSUser]); ok {
+				if err := shadow.UpdateUsers(nil); err != nil {
+					return fmt.Errorf("retire ShadowTLS credentials: %w", err)
+				}
+			}
 		}
 		_ = im.Remove(inb.Tag) // ignore error when tag doesn't exist yet
 		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, inb.Tag))
@@ -624,7 +650,8 @@ func (s *SingBox) retireBoxLocked(oldBox *box.Box, oldCancel context.CancelFunc,
 	if oldBox == nil {
 		return
 	}
-	state := &drainingBox{tracker: oldTracker, done: make(chan struct{})}
+	state := &drainingBox{tracker: oldTracker, snell: s.releasedSnell, done: make(chan struct{})}
+	s.releasedSnell = nil
 	s.draining[oldBox] = state
 	go s.recycleOldBox(oldBox, oldCancel, oldCtx, state)
 }
@@ -636,9 +663,7 @@ func (s *SingBox) recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, o
 	defer close(state.done)
 	oldTracker := state.tracker
 	// Step 1: close listen sockets so no new connections arrive on old ports.
-	if im := service.FromContext[adapter.InboundManager](oldCtx); im != nil {
-		_ = im.Close()
-	}
+	snell := append(state.snell, releaseInboundListeners(oldCtx)...)
 
 	// Step 2: drain in-flight connections (best-effort).
 	if oldTracker != nil {
@@ -652,6 +677,9 @@ func (s *SingBox) recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, o
 	}
 
 	// Step 3: hard-close everything.
+	for _, inbound := range snell {
+		inbound.closeConnections()
+	}
 	oldBox.Close()
 	if oldCancel != nil {
 		oldCancel()

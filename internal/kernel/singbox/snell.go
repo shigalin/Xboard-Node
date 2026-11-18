@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
@@ -55,15 +56,23 @@ type trackedSnellInbound struct {
 	*snell.Inbound
 	listener *listener.Listener
 	source   string
+	draining atomic.Bool
 	access   sync.Mutex
-	conns    *interrupt.Group // nil after the inbound has stopped
+	conns    *interrupt.Group // nil after the inbound's connections have been closed
 }
 
 func (h *trackedSnellInbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
-	scope.Add(h.closeConnections)
+	scope.Add(func() error {
+		// The retiring box owns these connections once it releases listeners
+		// for graceful drain. A hot replacement closes them with this scope.
+		if !h.draining.Load() {
+			h.closeConnections()
+		}
+		return nil
+	})
 	if h.listener != nil {
 		if err := h.listener.Start(); err != nil {
 			return err
@@ -73,7 +82,7 @@ func (h *trackedSnellInbound) Start(stage adapter.StartStage, scope *adapter.Sco
 	return nil
 }
 
-func (h *trackedSnellInbound) closeConnections() error {
+func (h *trackedSnellInbound) closeConnections() {
 	h.access.Lock()
 	conns := h.conns
 	h.conns = nil
@@ -82,7 +91,6 @@ func (h *trackedSnellInbound) closeConnections() error {
 	if conns != nil {
 		conns.Interrupt(true)
 	}
-	return nil
 }
 
 func (h *trackedSnellInbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -95,7 +103,7 @@ func (h *trackedSnellInbound) NewConnection(ctx context.Context, conn net.Conn, 
 		metadata.User = ""
 	}
 	h.access.Lock()
-	if h.conns == nil {
+	if h.conns == nil || h.draining.Load() {
 		h.access.Unlock()
 		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
 		return

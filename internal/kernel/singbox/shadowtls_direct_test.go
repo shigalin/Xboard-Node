@@ -246,9 +246,7 @@ func TestSnellUserKeyDetourRequiresAuthenticatedShadowTLS(t *testing.T) {
 	if err := scope.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := inbound.(*trackedSnellInbound).closeConnections(); err != nil {
-		t.Fatalf("repeated detour cleanup failed: %v", err)
-	}
+	inbound.(*trackedSnellInbound).closeConnections()
 }
 
 func TestSnellShadowTLSUserKeyUDP(t *testing.T) {

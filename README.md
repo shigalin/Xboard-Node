@@ -127,8 +127,9 @@ v5 and a 12–255 byte PSK for v6. As a policy, xboard-node requires encrypted
 Snell v6 in this mode. With `shadow_tls_server` set, `shadow_tls_password`
 is optional. Omitting it uses each user's UUID as their ShadowTLS password.
 Snell verifies the userkey and supplies the user identity for traffic and
-limits. Replacing the Snell inbound during a reload closes its direct and
-ShadowTLS connections, including idle reusable sessions.
+limits. Replacing a Snell or ShadowTLS inbound during a hot reload closes its
+old sessions, including idle reusable sessions. During graceful shutdown,
+active shared-PSK Snell connections get time to finish.
 
 The default/legacy `psk_mode: shared` still uses a node PSK plus UUID userkeys
 for plain Snell, or per-user UUID ShadowTLS passwords when wrapped. Upgrade
