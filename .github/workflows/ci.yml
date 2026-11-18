@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, dev]
+    branches: [main, master, dev, xray-v26.10.21]
     tags: ["v*"]
   pull_request:
     branches: [main, master, dev]
@@ -102,7 +102,7 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/shigalin/xboard-node:latest
+            ${{ github.ref != 'refs/heads/xray-v26.10.21' && 'ghcr.io/shigalin/xboard-node:latest' || '' }}
             ghcr.io/shigalin/xboard-node:${{ github.sha }}
             ${{ startsWith(github.ref, 'refs/tags/') && format('ghcr.io/shigalin/xboard-node:{0}', github.ref_name) || '' }}
 
