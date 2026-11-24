@@ -177,6 +177,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	if sniRouter == nil {
 		kernel.LogRealityTarget(nodeConfig, x.cfg.RealityTargets)
 	}
+	logTLSWebsiteFallback(cfgMap, nodeConfig, x.cfg.TLSWebsiteTargets)
 
 	pbConfig, err := parseConfig(cfgMap)
 	if err != nil {

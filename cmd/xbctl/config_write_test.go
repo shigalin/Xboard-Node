@@ -246,12 +246,14 @@ func TestWriteRootConfigRoundTripsEverySetting(t *testing.T) {
 	}
 }
 
-// assertKernelEqual compares every stored kernel setting. RealityTargets is a
-// load product rather than a stored field, and the test above already covers
-// that it is reloaded, so it is cleared before comparing.
+// assertKernelEqual compares every stored kernel setting. RealityTargets and
+// TLSWebsiteTargets are load products rather than stored fields, and the test
+// above already covers that RealityTargets is reloaded, so they are cleared
+// before comparing.
 func assertKernelEqual(t *testing.T, label string, want, got config.KernelConfig) {
 	t.Helper()
 	want.RealityTargets, got.RealityTargets = nil, nil
+	want.TLSWebsiteTargets, got.TLSWebsiteTargets = nil, nil
 	if !reflect.DeepEqual(want, got) {
 		t.Errorf("%s: got %+v, want %+v", label, got, want)
 	}

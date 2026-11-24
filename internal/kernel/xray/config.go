@@ -71,6 +71,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 
 	inbound := buildInbound(nc, users, tc)
 	if inbound != nil {
+		applyTLSWebsiteFallback(inbound, nc, kcfg.TLSWebsiteTargets)
 		cfg["inbounds"] = []M{inbound}
 	} else {
 		nlog.Core().Warn("xray: unsupported protocol, no inbound configured — node will not accept connections",
@@ -479,7 +480,8 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 	ss := M{}
 
 	// Network / transport
-	network := nc.Network
+	// Xray accepts transport names in any case; the switches below do not.
+	network := strings.ToLower(nc.Network)
 	if network == "" {
 		network = "tcp"
 	}

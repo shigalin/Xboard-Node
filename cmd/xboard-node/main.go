@@ -18,6 +18,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/service"
+	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
 
 var (
@@ -30,7 +31,16 @@ func main() {
 	showVersion := flag.Bool("v", false, "show version")
 	realitySupport := flag.Bool("supports-reality-targets", false, "print local REALITY target mapping capability")
 	realityCheck := flag.String("check-reality-targets", "", "validate a local REALITY target mapping file and exit")
+	websiteSupport := flag.Bool("supports-website-fallbacks", false, "print local REALITY and TLS website fallback capability")
 	flag.Parse()
+	patchedXray := (&splithttp.Config{}).ProtoReflect().Descriptor().Fields().ByName("httpFallback") != nil
+	if *websiteSupport {
+		if !patchedXray {
+			os.Exit(1)
+		}
+		fmt.Println("website-fallbacks-v1")
+		return
+	}
 	if *realitySupport {
 		fmt.Println("reality-targets-v1")
 		return
@@ -47,6 +57,10 @@ func main() {
 	if *showVersion {
 		fmt.Printf("xboard-node %s (built %s)\n", version, buildTime)
 		os.Exit(0)
+	}
+	if !patchedXray && os.Getenv("TLS_WEBSITE_TARGETS_FILE") != "" {
+		fmt.Fprintln(os.Stderr, "TLS_WEBSITE_TARGETS_FILE requires an Xray build with XHTTP website fallback support")
+		os.Exit(1)
 	}
 
 	rootCfg, err := config.LoadRoot(*configPath)

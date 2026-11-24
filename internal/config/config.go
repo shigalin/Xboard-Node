@@ -170,6 +170,9 @@ type KernelConfig struct {
 	// only the handshake destination for matching SNI names; panel listeners
 	// stay intact.
 	RealityTargets map[string]string `yaml:"-"`
+
+	// TLSWebsiteTargets contains local HTTP targets loaded from TLS_WEBSITE_TARGETS_FILE.
+	TLSWebsiteTargets map[string]string `yaml:"-"`
 }
 
 type CertConfig struct {
@@ -252,7 +255,7 @@ func LoadRoot(path string) (*RootConfig, error) {
 
 	rc.applyEnvOverrides()
 	rc.resolveEnvRefs()
-	if err := rc.loadRealityTargets(); err != nil {
+	if err := rc.loadWebsiteTargets(); err != nil {
 		return nil, err
 	}
 
@@ -401,7 +404,7 @@ func Load(path string) (*Config, error) {
 
 	cfg.applyEnvOverrides()
 	cfg.resolveEnvRefs()
-	if err := cfg.loadRealityTargets(); err != nil {
+	if err := cfg.loadWebsiteTargets(); err != nil {
 		return nil, err
 	}
 	cfg.setDefaultsFrom(baseDir)
@@ -413,26 +416,31 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// loadRealityTargets resolves each instance's local REALITY destination map.
+// loadWebsiteTargets resolves each instance's local website destination maps.
 // Instances are independent, so a per-instance file is honoured as-is.
-func (rc *RootConfig) loadRealityTargets() error {
+func (rc *RootConfig) loadWebsiteTargets() error {
 	if len(rc.Instances) == 0 {
-		return rc.Config.loadRealityTargets()
+		return rc.Config.loadWebsiteTargets()
 	}
 	for i := range rc.Instances {
-		if err := rc.Instances[i].loadRealityTargets(); err != nil {
+		if err := rc.Instances[i].loadWebsiteTargets(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Config) loadRealityTargets() error {
+func (c *Config) loadWebsiteTargets() error {
 	targets, err := LoadRealityTargets(c.Kernel.RealityTargetsFile)
 	if err != nil {
 		return fmt.Errorf("kernel.reality_targets_file (REALITY_TARGETS_FILE): %w", err)
 	}
 	c.Kernel.RealityTargets = targets
+	targets, err = LoadRealityTargets(os.Getenv("TLS_WEBSITE_TARGETS_FILE"))
+	if err != nil {
+		return fmt.Errorf("TLS_WEBSITE_TARGETS_FILE: %w", err)
+	}
+	c.Kernel.TLSWebsiteTargets = targets
 	return nil
 }
 
