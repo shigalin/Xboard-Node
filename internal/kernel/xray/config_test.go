@@ -690,3 +690,40 @@ func TestMergeCustomXray_UsesServiceSnapshotOverFile(t *testing.T) {
 		t.Fatalf("empty snapshot still merged the file: %s", data)
 	}
 }
+
+func TestBuildConfig_CustomOutboundProxyTagAndBlockParseCleanly(t *testing.T) {
+	spec := testNodeSpec(&panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 8080,
+		CustomOutbounds: []panel.OutboundConfig{{
+			Tag:      "chained-socks",
+			Protocol: "socks",
+			ProxyTag: "direct",
+			Settings: map[string]any{"address": "2.2.2.2", "port": 1080},
+		}},
+	})
+	cfg, err := parseConfig(buildConfig(testKernelCfg, spec, testUsers, kernel.TLSCert{}))
+	if err != nil {
+		t.Fatalf("parseConfig failed with chained custom outbound: %v", err)
+	}
+	var dialerProxy string
+	var foundBlock bool
+	for _, ob := range cfg.Outbound {
+		switch ob.Tag {
+		case "chained-socks":
+			sender, err := ob.GetSenderSettings().GetInstance()
+			if err != nil {
+				t.Fatal(err)
+			}
+			dialerProxy = sender.(*proxyman.SenderConfig).GetStreamSettings().GetSocketSettings().GetDialerProxy()
+		case "block":
+			foundBlock = true
+		}
+	}
+	if dialerProxy != "direct" {
+		t.Fatalf("chained outbound dialerProxy = %q, want direct", dialerProxy)
+	}
+	if !foundBlock {
+		t.Fatal("default block outbound missing from parsed config")
+	}
+}

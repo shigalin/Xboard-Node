@@ -245,8 +245,11 @@ func TestLimitDispatcherRebindChecksIPUserAndOwner(t *testing.T) {
 	if count != 1 || !ips[1]["2.2.2.2"] || ips[1]["1.1.1.1"] {
 		t.Fatalf("bad rebind state: %v", ips)
 	}
-	if err := ld.RebindSession(userContext(2, "2.2.2.2"), link); err == nil || errors.Is(err, routing.ErrSessionNotOwned) {
-		t.Fatalf("other user reused session: %v", err)
+	if err := ld.RebindSession(userContext(2, "2.2.2.2"), link); !errors.Is(err, routing.ErrForeignSession) || errors.Is(err, routing.ErrSessionNotOwned) {
+		t.Fatalf("other user reused session or dropped owner marker: %v", err)
+	}
+	if err := ld.RebindSession(userContext(9, "2.2.2.2"), link); !errors.Is(err, limiter.ErrUserRevoked) || !errors.Is(err, routing.ErrForeignSession) {
+		t.Fatalf("revoked foreign caller did not preserve active owner: %v", err)
 	}
 	if err := newTestDispatcher().RebindSession(userContext(1, "2.2.2.2"), link); !errors.Is(err, routing.ErrSessionNotOwned) {
 		t.Fatalf("other node instance must report the session as not owned: %v", err)

@@ -42,7 +42,17 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	}
 	if !tags["block"] {
 		// block is often added after direct but before others for safety
-		outbounds = append(outbounds, M{"protocol": "blackhole", "tag": "block"})
+		outbounds = append(outbounds, M{
+			"protocol": "freedom",
+			"tag":      "block",
+			"settings": M{
+				"firewall": []M{{
+					"action":   "block",
+					"delay":    0,
+					"logLevel": "none",
+				}},
+			},
+		})
 	}
 
 	cfg := M{
@@ -87,7 +97,8 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 
 // outboundConfigToXray converts a structured OutboundConfig (from the panel)
 // into an Xray outbound object. Xray uses a nested layout where protocol-
-// specific fields go inside a "settings" key, and chain proxying uses "proxySettings".
+// specific fields go inside a "settings" key, and chain proxying uses
+// "streamSettings.sockopt.dialerProxy".
 func outboundConfigToXray(oc model.OutboundConfig) M {
 	m := M{
 		"protocol": oc.Protocol,
@@ -97,7 +108,11 @@ func outboundConfigToXray(oc model.OutboundConfig) M {
 		m["settings"] = oc.Settings
 	}
 	if oc.ProxyTag != "" {
-		m["proxySettings"] = M{"tag": oc.ProxyTag}
+		m["streamSettings"] = M{
+			"sockopt": M{
+				"dialerProxy": oc.ProxyTag,
+			},
+		}
 	}
 	return m
 }
@@ -235,10 +250,12 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 	}
 }
 
+const userEmailPrefix = "user@"
+
 // userEmail returns the stats-tracking email for a user.
 // Format: "user@<id>" so we can parse back the user ID from stats counters.
 func userEmail(userID int) string {
-	return fmt.Sprintf("user@%d", userID)
+	return fmt.Sprintf("%s%d", userEmailPrefix, userID)
 }
 
 func buildVMess(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {

@@ -443,7 +443,7 @@ func TestXrayCountsDrainingInstanceTraffic(t *testing.T) {
 	if err := old.AddFeature(oldMgr); err != nil {
 		t.Fatal(err)
 	}
-	x.draining[old] = newDrainingInstance([]model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}})
+	x.draining[old] = newDrainingInstance()
 	mustRegisterCounter(t, oldMgr, counterName(1, "uplink")).Add(5)
 	removed := mustRegisterCounter(t, oldMgr, counterName(2, "downlink"))
 	removed.Add(7)
@@ -474,6 +474,22 @@ func TestXrayCountsDrainingInstanceTraffic(t *testing.T) {
 	traffic, _, _, _ = x.GetUserTraffic(context.Background())
 	if traffic[2] != [2]int64{0, 10} {
 		t.Fatalf("final traffic of the closed instance = %v, want down 10", traffic[2])
+	}
+}
+
+func TestXrayCollectsLateTrafficForRemovedUser(t *testing.T) {
+	x, mgr := newStatsBackedXray(t, []model.UserSpec{{ID: 1, UUID: "current"}}, nil)
+	removed := mustRegisterCounter(t, mgr, counterName(2, "downlink"))
+	removed.Add(3)
+	mustRegisterCounter(t, mgr, "user>>>other>>>traffic>>>uplink").Add(9)
+	for _, want := range []int64{3, 5, 5} {
+		traffic, _, _, err := x.GetUserTraffic(context.Background())
+		if err != nil || len(traffic) != 1 || traffic[2] != [2]int64{0, want} {
+			t.Fatalf("traffic=%v err=%v, want only removed user downlink %d", traffic, err, want)
+		}
+		if want == 3 {
+			removed.Add(2) // a counter write that completed after the first report
+		}
 	}
 }
 
@@ -508,7 +524,7 @@ func TestXrayStopFinalizesCurrentAndDrainingTraffic(t *testing.T) {
 		previous.Add(11)
 		oldLease.Release()
 	})
-	state := newDrainingInstance(users)
+	state := newDrainingInstance()
 	x.draining[old] = state
 	x.closeOld(old, oldLD)
 

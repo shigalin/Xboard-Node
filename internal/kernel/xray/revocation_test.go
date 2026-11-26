@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	stdnet "net"
 	"strings"
@@ -12,11 +13,10 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	xrayCore "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/proxy/vless/multiplex"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -49,17 +49,23 @@ func TestMuxWorkerRejectsRevokedOuterIdentity(t *testing.T) {
 			si.User = user
 			ctx = session.ContextWithInbound(ctx, &si)
 			reader, writer := pipe.New()
-			worker, err := mux.NewServerWorker(ctx, ld, &transport.Link{Reader: reader, Writer: buf.Discard})
-			if err != nil {
-				t.Fatal(err)
-			}
+			worker := multiplex.NewServerWorker(ctx, ld.DispatchLink, &transport.Link{Reader: reader, Writer: buf.Discard}, ld)
 			t.Cleanup(func() { worker.Close(); writer.Close() })
 			listener := testTCPListener(t)
 			listener.(*stdnet.TCPListener).SetDeadline(time.Now().Add(3 * time.Second))
 			dest := net.DestinationFromAddr(listener.Addr())
 			send := func(id uint16) {
-				w := mux.NewWriter(id, dest, writer, protocol.TransferTypeStream, [8]byte{}, &session.Inbound{})
-				if err := w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("hello"))}); err != nil {
+				const payload = "hello"
+				meta := multiplex.FrameMetadata{SessionID: id, Target: dest, SessionStatus: multiplex.SessionStatusNew}
+				meta.Option.Set(multiplex.OptionData)
+				frame := buf.New()
+				if err := meta.WriteTo(frame); err != nil {
+					frame.Release()
+					t.Fatal(err)
+				}
+				binary.BigEndian.PutUint16(frame.Extend(2), uint16(len(payload)))
+				frame.WriteString(payload)
+				if err := writer.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -146,11 +152,11 @@ func TestXrayRekeyUpdatesRealAuthenticator(t *testing.T) {
 			ctx := userContext(1, "1.1.1.1")
 			si := session.InboundFromContext(ctx)
 			si.User = oldAccount
-			if _, _, err := x.limitDispatcher.acquire(ctx); err == nil {
+			if _, _, _, err := x.limitDispatcher.acquire(ctx); err == nil {
 				t.Fatal("old authenticated account still admitted")
 			}
 			si.User = current
-			lease, _, err := x.limitDispatcher.acquire(ctx)
+			lease, _, _, err := x.limitDispatcher.acquire(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -187,5 +193,130 @@ func TestRemoveLastUserRevokesAllScopesBeforeReturning(t *testing.T) {
 	}
 	if time.Since(start) >= drainTimeout {
 		t.Fatal("user revocation waited for graceful drain")
+	}
+}
+
+func TestXUDPCrossUserReusePreservesOwnerSessionAndLease(t *testing.T) {
+	u1 := model.UserSpec{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}
+	u2 := model.UserSpec{ID: 2, UUID: "22222222-2222-4222-8222-222222222222"}
+	ld, baseCtx := liveTestDispatcher(t)
+	ld.UpdateLimits(
+		map[string]int{userEmail(u1.ID): u1.ID, userEmail(u2.ID): u2.ID},
+		map[string]int{userEmail(u1.ID): 1, userEmail(u2.ID): 1},
+		nil,
+	)
+	ld.SetDeviceLimitFunc(nil, map[int]string{u1.ID: u1.UUID, u2.ID: u2.UUID})
+	ld.devices.UpdateUsers([]model.UserSpec{u1, u2})
+	t.Cleanup(func() { ld.devices.UpdateUsers(nil) })
+
+	pc, err := stdnet.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	_ = pc.SetDeadline(time.Now().Add(5 * time.Second))
+	dest := net.DestinationFromAddr(pc.LocalAddr())
+	gid := [8]byte{0xca, 0xfe, 0xba, 0xbe, 1, 2, 3, 4}
+
+	startWorker := func(u model.UserSpec, ip string) (*multiplex.ServerWorker, *pipe.Writer, *pipe.Reader) {
+		memUser, err := toMemoryUser("vless", &model.NodeSpec{}, u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		si := *session.InboundFromContext(baseCtx)
+		si.User = memUser
+		si.Source = net.TCPDestination(net.ParseAddress(ip), 12345)
+		wctx := session.ContextWithInbound(baseCtx, &si)
+		inR, inW := pipe.New()
+		outR, outW := pipe.New()
+		worker := multiplex.NewServerWorker(wctx, ld.DispatchLink, &transport.Link{Reader: inR, Writer: outW}, ld)
+		t.Cleanup(func() {
+			worker.Close()
+			_ = inW.Close()
+			outR.Interrupt()
+		})
+		return worker, inW, outR
+	}
+
+	sendXUDP := func(inW *pipe.Writer, payload string) {
+		meta := multiplex.FrameMetadata{
+			SessionID:     1,
+			Target:        dest,
+			SessionStatus: multiplex.SessionStatusNew,
+			GlobalID:      gid,
+		}
+		meta.Option.Set(multiplex.OptionData)
+		frame := buf.New()
+		frame.UDP = &dest
+		if err := meta.WriteTo(frame); err != nil {
+			frame.Release()
+			t.Fatal(err)
+		}
+		binary.BigEndian.PutUint16(frame.Extend(2), uint16(len(payload)))
+		_, _ = frame.WriteString(payload)
+		if err := inW.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w1, inW1, _ := startWorker(u1, "1.1.1.1")
+	sendXUDP(inW1, "ping1")
+
+	recvBuf := make([]byte, 64)
+	n, firstNATAddr, err := pc.ReadFrom(recvBuf)
+	if err != nil || string(recvBuf[:n]) != "ping1" {
+		t.Fatalf("backend read 1 = %q, %v", recvBuf[:n], err)
+	}
+
+	// Detach u1's outer Mux carrier while keeping u1's XUDP flow cached, then buffer a reply.
+	_ = inW1.Close()
+	awaitSignal(t, w1.WaitClosed(), "u1 initial outer Mux did not close")
+	if _, err := pc.WriteTo([]byte("secret-reply"), firstNATAddr); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	// u2 attempts to hijack u1's GlobalID: u2 must be rejected with zero downlink, and u1's session must survive.
+	w2, inW2, outR2 := startWorker(u2, "2.2.2.2")
+	sendXUDP(inW2, "forged")
+	awaitSignal(t, w2.WaitClosed(), "foreign user Mux worker did not close on XUDP hijack")
+	if mb, err := outR2.ReadMultiBuffer(); !mb.IsEmpty() {
+		defer buf.ReleaseMulti(mb)
+		t.Fatalf("foreign user received %d bytes of buffered downlink (err=%v)", mb.Len(), err)
+	}
+
+	ips, count := ld.GetConnectionState()
+	if count != 1 || !ips[u1.ID]["1.1.1.1"] || len(ips[u2.ID]) != 0 {
+		t.Fatalf("connection state corrupted by foreign XUDP attempt: count=%d, ips=%v", count, ips)
+	}
+
+	// u1 reconnects from a new IP and reuses the intact XUDP socket + receives the buffered downlink.
+	_, inW1b, outR1b := startWorker(u1, "1.1.1.2")
+	sendXUDP(inW1b, "ping2")
+
+	n, secondNATAddr, err := pc.ReadFrom(recvBuf)
+	if err != nil || string(recvBuf[:n]) != "ping2" {
+		t.Fatalf("backend read 2 = %q, %v", recvBuf[:n], err)
+	}
+	if secondNATAddr.String() != firstNATAddr.String() {
+		t.Fatalf("owner XUDP backend socket was replaced: %v -> %v", firstNATAddr, secondNATAddr)
+	}
+
+	downMB, err := outR1b.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("owner did not receive buffered downlink after rebind: %v", err)
+	}
+	var rawDown strings.Builder
+	for _, b := range downMB {
+		rawDown.Write(b.Bytes())
+	}
+	buf.ReleaseMulti(downMB)
+	if !strings.Contains(rawDown.String(), "secret-reply") {
+		t.Fatalf("owner downlink frame missing buffered reply: %q", rawDown.String())
+	}
+
+	ips, count = ld.GetConnectionState()
+	if count != 1 || !ips[u1.ID]["1.1.1.2"] || ips[u1.ID]["1.1.1.1"] {
+		t.Fatalf("owner lease did not rebind cleanly to 1.1.1.2: count=%d, ips=%v", count, ips)
 	}
 }

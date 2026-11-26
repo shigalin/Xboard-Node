@@ -15,6 +15,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 
 	"github.com/cedar2025/xboard-node/internal/limiter"
@@ -59,8 +60,7 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 	return ld, nil
 }
 
-// LimitDispatcher adapts Xray links to the shared online-IP policy. It never
-// wraps link.Reader: Mux/XUDP rely on its concrete pipe reader type.
+// LimitDispatcher adapts Xray links to the shared online-IP policy.
 type LimitDispatcher struct {
 	inner           interface{}
 	innerDisp       routing.Dispatcher
@@ -96,20 +96,20 @@ func (d *LimitDispatcher) identity(ctx context.Context) (uid int, credential, ip
 	return
 }
 
-func (d *LimitDispatcher) acquire(ctx context.Context) (*limiter.DeviceLease, int, error) {
+func (d *LimitDispatcher) acquire(ctx context.Context) (*limiter.DeviceLease, int, string, error) {
 	uid, credential, ip, limit, err := d.identity(ctx)
 	if err != nil {
-		return nil, uid, err
+		return nil, uid, "", err
 	}
 	if uid == 0 {
-		return nil, 0, nil
+		return nil, 0, "", nil
 	}
 	lease, err := d.devices.Acquire(uid, credential, ip, limit)
-	return lease, uid, err
+	return lease, uid, credential, err
 }
 
 func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-	lease, uid, err := d.acquire(ctx)
+	lease, uid, credential, err := d.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -125,13 +125,13 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		return nil, err
 	}
 	if tracked != nil {
-		d.trackLink(link, uid, tracked, tracked.uplinkClosed)
+		d.trackLink(link, uid, credential, tracked, tracked.uplinkClosed)
 	}
 	return link, nil
 }
 
 func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
-	lease, uid, err := d.acquire(ctx)
+	lease, uid, credential, err := d.acquire(ctx)
 	if err != nil {
 		return err
 	}
@@ -141,7 +141,10 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 		// outbound consumes, so it counts as finished only when the outbound
 		// returns; cancellation also ends raw protocol readers/writers.
 		ctx, tracked = newTrackedSession(ctx, lease, true)
-		d.trackLink(link, uid, tracked, tracked.DownlinkClosed)
+		d.trackLink(link, uid, credential, tracked, tracked.DownlinkClosed)
+	}
+	if flow, ok := link.Reader.(interface{ SetSessionLink(transport.Link) }); ok {
+		flow.SetSessionLink(*link)
 	}
 	err = d.innerDisp.DispatchLink(ctx, dest, link)
 	if err != nil && tracked != nil {
@@ -150,11 +153,11 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	return err
 }
 
-func (d *LimitDispatcher) trackLink(link *transport.Link, uid int, tracked *trackedSession, onClose func()) {
+func (d *LimitDispatcher) trackLink(link *transport.Link, uid int, credential string, tracked *trackedSession, onClose func()) {
 	tracked.bind(link)
 	link.Writer = &closeTrackingWriter{
-		Writer: link.Writer, dispatcher: d, userID: uid, lease: tracked.lease,
-		onClose: onClose,
+		Writer: link.Writer, dispatcher: d, userID: uid, credential: credential,
+		lease: tracked.lease, tracked: tracked, onClose: onClose, terminate: tracked.terminate,
 	}
 }
 
@@ -229,6 +232,13 @@ func (s *trackedSession) settle(mark func()) {
 	}
 }
 
+func (s *trackedSession) active() bool {
+	s.mu.Lock()
+	active := !s.released && !s.closed
+	s.mu.Unlock()
+	return active
+}
+
 func (s *trackedSession) terminate() {
 	s.mu.Lock()
 	if s.closed {
@@ -244,6 +254,17 @@ func (s *trackedSession) terminate() {
 	common.Interrupt(writer)
 }
 
+func (d *LimitDispatcher) leaseOwnerActive(w *closeTrackingWriter) bool {
+	if w == nil || w.tracked == nil || w.closed.Load() || !w.tracked.active() {
+		return false
+	}
+	d.mu.RLock()
+	uid := d.emailToUID[userEmail(w.userID)]
+	uuid := d.uuidByUID[w.userID]
+	d.mu.RUnlock()
+	return uid == w.userID && uuid == w.credential
+}
+
 // RebindSession is called by Xray-core before reusing an XUDP link. A link
 // belongs to one dispatcher and user, and its source IP is re-admitted before
 // any packet is written through the reused session. A link this dispatcher
@@ -256,6 +277,9 @@ func (d *LimitDispatcher) RebindSession(ctx context.Context, link *transport.Lin
 	}
 	uid, credential, ip, limit, err := d.identity(ctx)
 	if err != nil {
+		if ok && d.leaseOwnerActive(writer) {
+			return fmt.Errorf("%w: %w", routing.ErrForeignSession, err)
+		}
 		return err
 	}
 	if !ok && uid == 0 {
@@ -265,6 +289,9 @@ func (d *LimitDispatcher) RebindSession(ctx context.Context, link *transport.Lin
 		return routing.ErrSessionNotOwned
 	}
 	if uid == 0 || writer.userID != uid {
+		if d.leaseOwnerActive(writer) {
+			return fmt.Errorf("XUDP session user mismatch: %w", routing.ErrForeignSession)
+		}
 		return errors.New("XUDP session user mismatch")
 	}
 	if err := writer.lease.Rebind(credential, ip, limit); err != nil {
@@ -315,9 +342,24 @@ type closeTrackingWriter struct {
 	buf.Writer
 	dispatcher *LimitDispatcher
 	userID     int
+	credential string
 	lease      *limiter.DeviceLease
+	tracked    *trackedSession
 	onClose    func()
+	terminate  func()
 	closed     atomic.Bool
+}
+
+func (w *closeTrackingWriter) SetDownlinkCounter(counter stats.Counter) bool {
+	writer, ok := w.Writer.(interface{ SetDownlinkCounter(stats.Counter) bool })
+	return ok && writer.SetDownlinkCounter(counter)
+}
+
+// RetireSession drops this exact cached XUDP lease before its replacement
+// tries admission on a different dispatcher.
+func (w *closeTrackingWriter) RetireSession() {
+	w.terminate()
+	w.lease.Release()
 }
 
 func (w *closeTrackingWriter) Close() error {

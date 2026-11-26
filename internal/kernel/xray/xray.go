@@ -94,14 +94,13 @@ type Xray struct {
 }
 
 type drainingInstance struct {
-	users    []model.UserSpec
 	done     chan struct{}
 	stop     chan struct{}
 	stopOnce sync.Once
 }
 
-func newDrainingInstance(users []model.UserSpec) *drainingInstance {
-	return &drainingInstance{users: users, done: make(chan struct{}), stop: make(chan struct{})}
+func newDrainingInstance() *drainingInstance {
+	return &drainingInstance{done: make(chan struct{}), stop: make(chan struct{})}
 }
 
 func New(cfg config.KernelConfig) *Xray {
@@ -214,9 +213,8 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.mu.Lock()
 	old := x.instance
 	oldLD := x.limitDispatcher
-	oldUsers := x.users
 	if old != nil {
-		x.draining[old] = newDrainingInstance(oldUsers)
+		x.draining[old] = newDrainingInstance()
 	}
 	x.instance = inst
 	x.limitDispatcher = ld
@@ -363,7 +361,7 @@ func (x *Xray) Stop() {
 	inst := x.instance
 	ld := x.limitDispatcher
 	if inst != nil {
-		x.draining[inst] = newDrainingInstance(x.users)
+		x.draining[inst] = newDrainingInstance()
 	}
 	x.instance = nil
 	x.limitDispatcher = nil
@@ -932,7 +930,7 @@ func (x *Xray) closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 			ld.ResetConns()
 		}
 		x.mu.Lock()
-		x.collectStats(inst, state.users)
+		x.collectStats(inst)
 		delete(x.draining, inst)
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: old instance recycled")
@@ -961,9 +959,9 @@ func drainConns(ld *LimitDispatcher, timeout time.Duration, stop <-chan struct{}
 // traffic. Users no longer configured keep their totals, so traffic their
 // draining connections carry is still reported. Must be called with x.mu held.
 func (x *Xray) aggregateStats() (map[int][2]int64, error) {
-	x.collectStats(x.instance, x.users)
-	for inst, state := range x.draining {
-		x.collectStats(inst, state.users)
+	x.collectStats(x.instance)
+	for inst := range x.draining {
+		x.collectStats(inst)
 	}
 	traffic := make(map[int][2]int64, len(x.cumTraffic))
 	for uid, cum := range x.cumTraffic {
@@ -976,7 +974,7 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 
 // collectStats moves inst's per-user counters into cumTraffic. Must be called
 // with x.mu held.
-func (x *Xray) collectStats(inst *xrayCore.Instance, users []model.UserSpec) {
+func (x *Xray) collectStats(inst *xrayCore.Instance) {
 	if inst == nil {
 		return
 	}
@@ -984,24 +982,36 @@ func (x *Xray) collectStats(inst *xrayCore.Instance, users []model.UserSpec) {
 	if !ok {
 		return
 	}
-	for _, u := range users {
-		email := userEmail(u.ID)
-
-		var dUp, dDown int64
-		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>uplink", email)); c != nil {
-			dUp = c.Set(0)
+	// Counters can outlive the account that created them. Read the kernel's
+	// registered counters so revocation cannot hide the account's last bytes.
+	mgr.VisitCounters(func(name string, counter stats.Counter) bool {
+		encoded, managed := strings.CutPrefix(name, "user>>>"+userEmailPrefix)
+		if !managed {
+			return true
 		}
-		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>downlink", email)); c != nil {
-			dDown = c.Set(0)
+		id, direction, found := strings.Cut(encoded, ">>>traffic>>>")
+		if !found {
+			return true
 		}
-
-		if dUp > 0 || dDown > 0 {
-			cum := x.cumTraffic[u.ID]
-			cum[0] += dUp
-			cum[1] += dDown
-			x.cumTraffic[u.ID] = cum
+		uid, err := strconv.Atoi(id)
+		if err != nil || strconv.Itoa(uid) != id {
+			return true
 		}
-	}
+		var index int
+		switch direction {
+		case "uplink":
+		case "downlink":
+			index = 1
+		default:
+			return true
+		}
+		if delta := counter.Set(0); delta > 0 {
+			cum := x.cumTraffic[uid]
+			cum[index] += delta
+			x.cumTraffic[uid] = cum
+		}
+		return true
+	})
 }
 
 // updateBandwidthLimits configures the patched xray-core bandwidth feature of
