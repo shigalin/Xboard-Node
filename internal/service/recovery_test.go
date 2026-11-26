@@ -162,7 +162,7 @@ func TestInvalidDependenciesAreRejectedBeforeListenerRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct{ config, failure string }{
-		{`{"outbounds":[{"type":"socks","tag":"exit","server":"127.0.0.1","server_port":1080,"detour":"missing"}]}`, "missing outbound"},
+		{`{"outbounds":[{"type":"socks","tag":"exit","server":"127.0.0.1","server_port":1080,"detour":"missing"}]}`, "dependency[missing] not found"},
 		{`{"outbounds":[{"type":"socks","tag":"exit","server":"127.0.0.1","server_port":1080,"detour":"exit"}]}`, "circular outbound"},
 		{`{"dns":{"final":"missing"}}`, "default DNS server"},
 		{`{"dns":{"servers":[{"type":"udp","tag":"resolver","server":"127.0.0.1","detour":"missing"}]}}`, "outbound detour not found"},

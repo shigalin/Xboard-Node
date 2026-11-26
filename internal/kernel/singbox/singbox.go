@@ -251,7 +251,8 @@ func checkDependencies(ctx context.Context, opts option.Options) error {
 		// DNS transport dependencies name resolvers. Its detour references
 		// the separate outbound graph and is also resolved at startup.
 		if referrer, ok := transport.(adapter.Referrer); ok {
-			for _, tag := range referrer.References() {
+			outboundTags, _ := referrer.References()
+			for _, tag := range outboundTags {
 				if err := dialer.InitializeDetour(dialer.NewDetour(outbounds, tag, false)); err != nil {
 					return fmt.Errorf("DNS server %q: %w", transport.Tag(), err)
 				}
