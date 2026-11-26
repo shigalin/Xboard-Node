@@ -359,6 +359,9 @@ func (w *closeTrackingWriter) SetDownlinkCounter(counter stats.Counter) bool {
 // tries admission on a different dispatcher.
 func (w *closeTrackingWriter) RetireSession() {
 	w.terminate()
+	// terminate returns early once settle has marked the session closed, which
+	// settle does before it releases the lease. Release again so the lease is
+	// gone when this returns.
 	w.lease.Release()
 }
 
