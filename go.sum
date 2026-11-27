@@ -817,8 +817,8 @@ github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854 h1:6uUiZcDRnZSAegryaUG
 github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854/go.mod h1:LtfoSK3+NG57tvnVEHgcuBW9ujgE8enPSgzgwStwCAA=
 github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529/go.mod h1:DxrIzT+xaE7yg65j358z/aeFdxmN0P9QXhEzd20vsDc=
 github.com/sergi/go-diff v1.0.0/go.mod h1:0CfEIISq7TuYL3j771MWULgwwjU+GofnZX9QAmXWZgo=
-github.com/shigalin/Xray-core v0.0.0-20261126142202-216797fcd965 h1:jYDxPu+atuIvxieYQcRH6WqPeno3BGE5L8+zS6iWwsY=
-github.com/shigalin/Xray-core v0.0.0-20261126142202-216797fcd965/go.mod h1:u2cBfwrS5amBzVN2ZeOqFK1A2Qi0pK9ZS998OVSltOk=
+github.com/shigalin/Xray-core v0.0.0-20261127233323-ad3f1311e807 h1:JUUnL3v3jnYA7ZPMoYS71q1W31hewHbeZc0Ord7PEmw=
+github.com/shigalin/Xray-core v0.0.0-20261127233323-ad3f1311e807/go.mod h1:u2cBfwrS5amBzVN2ZeOqFK1A2Qi0pK9ZS998OVSltOk=
 github.com/shigalin/sing-box v1.13.2-0.20261126190922-6bb4b2452edb h1:KPekKlTXANDT//o1yVZHAr+9V41FMYF9teIdWjNmiWE=
 github.com/shigalin/sing-box v1.13.2-0.20261126190922-6bb4b2452edb/go.mod h1:uDysHgTLTAvEJc4w23boAPFQsFUfKnTHD8fM/YiiOH0=
 github.com/shigalin/sing-box/third_party/sing-quic v0.0.0-20261126190922-6bb4b2452edb h1:dd/fu5GioKZWrxbTW/0DsoHpQqty6KGa8c+CZmEi2TI=
