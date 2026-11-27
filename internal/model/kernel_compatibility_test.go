@@ -135,3 +135,47 @@ func TestSnellPSKModeConfigMapping(t *testing.T) {
 		})
 	}
 }
+
+func TestProxyProtocolTrustedIPsValidation(t *testing.T) {
+	trusted := []any{"203.0.113.10", "198.51.100.0/24"}
+	for _, tc := range []struct {
+		name, kernel, protocol string
+		value                  any
+		wantErr                string
+	}{
+		{name: "xray vless list", kernel: "xray", protocol: "vless", value: trusted},
+		{name: "xray trojan list", kernel: "xray", protocol: "trojan", value: trusted},
+		{name: "omitted", kernel: "singbox", protocol: "vmess"},
+		{name: "empty list on singbox", kernel: "singbox", protocol: "vmess", value: []any{}},
+		{name: "string", kernel: "xray", protocol: "vmess", value: "203.0.113.10", wantErr: "array of IP or CIDR strings"},
+		{name: "non-string item", kernel: "xray", protocol: "vmess", value: []any{"203.0.113.10", 1}, wantErr: "array of IP or CIDR strings"},
+		{name: "singbox", kernel: "singbox", protocol: "vmess", value: trusted, wantErr: "not supported by singbox kernel"},
+		{name: "xray shadowsocks", kernel: "xray", protocol: "shadowsocks", value: trusted, wantErr: "only supported on VLESS, VMess and Trojan"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			settings := map[string]any{"path": "/"}
+			if tc.value != nil {
+				settings["proxyProtocolTrustedIPs"] = tc.value
+			}
+			panelSpec, panelErr := NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: tc.protocol, Network: "tcp", NetworkSettings: settings}, config.KernelConfig{Type: tc.kernel})
+			_, standaloneErr := NodeSpecFromStandaloneValidated(&config.Config{Kernel: config.KernelConfig{Type: tc.kernel}, Standalone: &config.StandaloneConfig{
+				Enabled: true, Node: config.StandaloneNodeConfig{Protocol: tc.protocol, Network: "tcp", NetworkSettings: settings},
+			}})
+			for source, err := range map[string]error{"panel": panelErr, "standalone": standaloneErr} {
+				if tc.wantErr == "" {
+					if err != nil {
+						t.Fatalf("%s: unexpected error: %v", source, err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("%s: error = %v, want %q", source, err, tc.wantErr)
+				}
+			}
+			if tc.wantErr == "" && tc.value != nil {
+				ips, err := panelSpec.ProxyProtocolTrustedIPs()
+				if err != nil || len(ips) != len(tc.value.([]any)) {
+					t.Fatalf("ProxyProtocolTrustedIPs() = %v, %v", ips, err)
+				}
+			}
+		})
+	}
+}

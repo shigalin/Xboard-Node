@@ -1,6 +1,10 @@
 package model
 
-import "github.com/cedar2025/xboard-node/internal/config"
+import (
+	"fmt"
+
+	"github.com/cedar2025/xboard-node/internal/config"
+)
 
 type NodeSpec struct {
 	Protocol        string
@@ -104,6 +108,36 @@ func (n *NodeSpec) GetProxyProtocol() bool {
 		}
 	}
 	return false
+}
+
+// ProxyProtocolTrustedIPs returns networkSettings.proxyProtocolTrustedIPs.
+// An omitted or null value returns nil.
+func (n *NodeSpec) ProxyProtocolTrustedIPs() ([]string, error) {
+	if n == nil || n.NetworkSettings == nil {
+		return nil, nil
+	}
+	raw, ok := n.NetworkSettings["proxyProtocolTrustedIPs"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	var items []any
+	switch v := raw.(type) {
+	case []any:
+		items = v
+	case []string:
+		return append([]string(nil), v...), nil
+	default:
+		return nil, fmt.Errorf("network_settings.proxyProtocolTrustedIPs must be an array of IP or CIDR strings")
+	}
+	ips := make([]string, 0, len(items))
+	for _, item := range items {
+		ip, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("network_settings.proxyProtocolTrustedIPs must be an array of IP or CIDR strings")
+		}
+		ips = append(ips, ip)
+	}
+	return ips, nil
 }
 
 func cloneAnyMap(src map[string]any) map[string]any {

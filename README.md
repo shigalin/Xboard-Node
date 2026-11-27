@@ -173,6 +173,73 @@ for server sends when the client advertises a nonzero receive rate. The
 server's upload limit caps that rate. A client advertising zero still uses
 the server's BBR path.
 
+### Client IPs through an Nginx stream relay
+
+On the relay server, put `stream` at the top level of `nginx.conf`.
+
+```nginx
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+```
+
+Put the forwarding rule in `/etc/nginx/stream.d/xboard-node.conf`.
+
+```nginx
+server {
+    listen 443;
+    # listen [::]:443;  # If clients also connect over IPv6
+    proxy_pass 192.0.2.10:8443;  # Node address and actual listener port
+    proxy_protocol on;
+}
+```
+
+Use a regular TCP `listen` for clients that connect directly to Nginx.
+`proxy_protocol on` sends the client address on the upstream connection.
+TLS and REALITY can terminate at xboard-node as usual. Run `nginx -t` to
+validate the relay configuration.
+[Nginx stream proxy documentation](https://nginx.org/en/docs/stream/ngx_stream_proxy_module.html#proxy_protocol)
+
+For a panel-managed VLESS, VMess or Trojan node with an Xray TCP listener,
+open **节点管理** (Node Management) in XBoard and choose **编辑** (Edit) in
+the row for the node. Set these fields for the relay above.
+
+| XBoard field | Value | Purpose |
+| --- | --- | --- |
+| 节点地址 | `relay.example.com` | Domain or IP of the Nginx relay |
+| 连接端口 | `443` | Public TCP port from Nginx `listen` |
+| 服务端口 | `8443` | Node's actual TCP port from Nginx `proxy_pass` |
+
+Beside **传输协议** (Transport), click **编辑协议** (Edit Protocol). In
+the **编辑协议配置** dialog, add `proxyProtocolTrustedIPs` at the top level
+of the JSON. Use the Nginx source IP as seen by the node, and preserve
+existing fields such as `path`, `host` and `mode`.
+
+```json
+{
+  "proxyProtocolTrustedIPs": ["203.0.113.10"]
+}
+```
+
+Use an xboard-node build that includes Xray support for this setting. The
+node rejects the setting on sing-box and on protocols other than VLESS,
+VMess and Trojan. The value must be a JSON array of IP or CIDR strings. Click
+**确定** in the JSON dialog, then **提交** in the node form. Refresh client
+subscriptions if the advertised address or connection port changed. In
+standalone mode, put the same list under `standalone.node.network_settings`.
+
+Direct clients connect to the node's own address and **服务端口** (`8443`
+in the example). Relayed clients connect to Nginx. Both paths reach the
+same node listener. Xray requires a PROXY header from the listed peers and
+uses the source IP in it. For direct connections, it uses the TCP peer IP.
+The node firewall must allow both Nginx and the intended direct clients on
+that TCP port.
+
+An omitted or empty list uses the existing `acceptProxyProtocol` setting.
+With only `acceptProxyProtocol: true` (or `standalone.node.accept_proxy_protocol:
+true`), every new connection needs a PROXY header. For that relay-only mode,
+restrict the backend TCP port to Nginx's source IP.
+
 ### REALITY destinations selected by panel SNI list (Xray)
 
 In the panel's existing REALITY **伪装站点(dest)** / SNI field, enter DNS names

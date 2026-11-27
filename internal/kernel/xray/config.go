@@ -638,6 +638,15 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 			ss["sockopt"] = M{"cloudflareRealIP": true}
 		}
 	}
+	// ValidateNodeSpec rejects malformed lists before the builder runs.
+	if trustedIPs, _ := nc.ProxyProtocolTrustedIPs(); len(trustedIPs) > 0 {
+		sockopt, _ := ss["sockopt"].(M)
+		if sockopt == nil {
+			sockopt = M{}
+			ss["sockopt"] = sockopt
+		}
+		sockopt["proxyProtocolTrustedIPs"] = trustedIPs
+	}
 
 	base["streamSettings"] = ss
 }

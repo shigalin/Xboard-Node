@@ -87,7 +87,25 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 	if err := validateTransportKernel(n.Network, kernelType); err != nil {
 		return err
 	}
+	if err := validateProxyProtocolTrustedIPs(n, kernelType); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateProxyProtocolTrustedIPs(n *NodeSpec, kernelType string) error {
+	ips, err := n.ProxyProtocolTrustedIPs()
+	if err != nil || len(ips) == 0 {
+		return err
+	}
+	if kernelType != "xray" {
+		return fmt.Errorf("proxyProtocolTrustedIPs is not supported by %s kernel; use xray kernel instead", kernelType)
+	}
+	switch n.Protocol {
+	case "vless", "vmess", "trojan":
+		return nil
+	}
+	return fmt.Errorf("proxyProtocolTrustedIPs is only supported on VLESS, VMess and Trojan nodes")
 }
 
 // singboxUnsupportedTransports lists transport types that sing-box does not support.

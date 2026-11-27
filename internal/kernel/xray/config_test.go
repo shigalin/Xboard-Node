@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -70,6 +71,51 @@ func TestBuildConfigCloudflareRealIP(t *testing.T) {
 			}
 			if got := sockopt.GetAcceptProxyProtocol(); got != tt.proxyProtocol {
 				t.Errorf("parsed acceptProxyProtocol = %v, want %v", got, tt.proxyProtocol)
+			}
+		})
+	}
+}
+
+func TestBuildConfigProxyProtocolTrustedIPs(t *testing.T) {
+	trusted := []any{"203.0.113.10", "198.51.100.0/24"}
+	for _, tt := range []struct {
+		name, protocol, network string
+		value                   any
+		proxyProtocol           bool
+		want                    M
+	}{
+		{name: "vmess tcp", protocol: "vmess", network: "tcp", value: trusted,
+			want: M{"proxyProtocolTrustedIPs": []string{"203.0.113.10", "198.51.100.0/24"}}},
+		{name: "with acceptProxyProtocol", protocol: "trojan", network: "tcp", value: trusted, proxyProtocol: true,
+			want: M{"acceptProxyProtocol": true, "proxyProtocolTrustedIPs": []string{"203.0.113.10", "198.51.100.0/24"}}},
+		{name: "vless ws keeps cloudflareRealIP", protocol: "vless", network: "ws", value: trusted,
+			want: M{"cloudflareRealIP": true, "proxyProtocolTrustedIPs": []string{"203.0.113.10", "198.51.100.0/24"}}},
+		{name: "empty list", protocol: "vmess", network: "tcp", value: []any{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := testNodeSpec(&panel.NodeConfig{
+				Protocol: tt.protocol, Network: tt.network, ServerPort: 8080,
+				AcceptProxyProtocol: tt.proxyProtocol,
+				NetworkSettings:     map[string]any{"proxyProtocolTrustedIPs": tt.value},
+			})
+			cfg := buildConfig(testKernelCfg, spec, testUsers, kernel.TLSCert{})
+			parsed, err := parseConfig(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inbound := cfg["inbounds"].([]M)[0]
+			sockopt, _ := inbound["streamSettings"].(M)["sockopt"].(M)
+			if !reflect.DeepEqual(sockopt, tt.want) && !(len(sockopt) == 0 && len(tt.want) == 0) {
+				t.Fatalf("sockopt = %#v, want %#v", sockopt, tt.want)
+			}
+			settings, err := parsed.Inbound[0].GetReceiverSettings().GetInstance()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := settings.(*proxyman.ReceiverConfig).GetStreamSettings().GetSocketSettings().GetProxyProtocolTrustedIps()
+			want, _ := tt.want["proxyProtocolTrustedIPs"].([]string)
+			if !reflect.DeepEqual(got, want) && !(len(got) == 0 && len(want) == 0) {
+				t.Fatalf("parsed proxyProtocolTrustedIps = %v, want %v", got, want)
 			}
 		})
 	}
