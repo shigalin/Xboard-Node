@@ -295,12 +295,12 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20261126173204-815f8040de26
+replace github.com/sagernet/sing-box => github.com/shigalin/sing-box v1.13.2-0.20261126190922-6bb4b2452edb
 
-replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261126173204-815f8040de26
+replace github.com/sagernet/sing-snell => github.com/shigalin/sing-box/third_party/sing-snell v0.0.0-20261126190922-6bb4b2452edb
 
 replace github.com/xtls/xray-core => github.com/shigalin/Xray-core v0.0.0-20261126142202-216797fcd965
 
-replace github.com/sagernet/sing-vmess => github.com/shigalin/sing-box/third_party/sing-vmess v0.0.0-20261126173204-815f8040de26
+replace github.com/sagernet/sing-vmess => github.com/shigalin/sing-box/third_party/sing-vmess v0.0.0-20261126190922-6bb4b2452edb
 
-replace github.com/sagernet/sing-quic => github.com/shigalin/sing-box/third_party/sing-quic v0.0.0-20261126173204-815f8040de26
+replace github.com/sagernet/sing-quic => github.com/shigalin/sing-box/third_party/sing-quic v0.0.0-20261126190922-6bb4b2452edb
